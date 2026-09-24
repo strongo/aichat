@@ -11,7 +11,7 @@ status: Draft
 
 ## Summary
 
-The shared, product-neutral AI provider layer under `github.com/strongo/aichat`: the streaming event model and `LLMProvider` contract (`ai`), a decision chain of pluggable `decision.Provider`s including a deterministic rule engine (`ai/decision/rules`) and a single-inference LLM decider (`ai/decision/llmdecider`), three concrete providers (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`), a context manager that keeps a provider-cacheable prompt prefix stable (`ai/ctxmgr`), product-facing config that wires cloud vs. BYOK independently for chat and decision (`ai/aiconfig`), and diagnostics (`ai/diag`). It is consumed first by Sneat's chat MVP and by DataTug.
+The shared, product-neutral AI provider layer under `github.com/strongo/aichat`: the streaming event model and `LLMProvider` contract (`ai`), tool calling and extended-reasoning support across the adapters plus a tool-calling agent loop (`ai/agent`), a decision chain of pluggable `decision.Provider`s including a deterministic rule engine (`ai/decision/rules`) and a single-inference LLM decider (`ai/decision/llmdecider`), three concrete providers (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`), a context manager that keeps a provider-cacheable prompt prefix stable (`ai/ctxmgr`), product-facing config that wires cloud vs. BYOK independently for chat and decision (`ai/aiconfig`), and diagnostics (`ai/diag`). It is consumed first by Sneat's chat MVP and by DataTug (whose chat agent and tool-calling migrated onto `ai/agent` and the adapters' tool support).
 
 ## Problem
 
@@ -68,6 +68,36 @@ Adapters (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`) MUST bound retries with
 #### REQ: http-error-mapping
 
 Every HTTP-backed adapter (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`) MUST map HTTP 401/403 to `ai.ErrCodeAuth`, 429 to `ai.ErrCodeRateLimited` (retryable), 5xx to `ai.ErrCodeUpstream` (retryable), and other non-2xx to `ai.ErrCodeInvalid`. `ai/cloud` additionally treats 429/5xx as retryable from the STATUS CODE even when a decoded `cloudproto.ErrorResponse` body left its own `retryable` field false/absent.
+
+### Tool calling, reasoning and the agent loop
+
+#### REQ: tool-calling-additive-contract
+
+`ai.Tool`/`ai.ToolCall`/`ai.ToolResult`, `ai.RoleTool`, `Message.ToolCalls`/`Message.ToolResults`, `ChatRequest.Tools`/`ChatRequest.ToolChoice`/`ChatRequest.Reasoning`, `EventToolCall`/`EventToolResult`, `Event.StopReason`, and `Usage.ReasoningTokens` MUST be additive to the existing `ai` contract: every field is new or `omitempty`, so a caller that never sets `Tools` sees byte-identical request/event shapes to before this feature. `EventToolCall` MUST carry one FULLY ASSEMBLED `ai.ToolCall` (an adapter never emits a partial call); a response that ends with tool calls MUST still end with a single `EventCompleted`, additionally carrying `StopReason: "tool_calls"`.
+
+#### REQ: tool-call-streaming-assembly
+
+`ai/openaicompat` MUST assemble `delta.tool_calls` chunks by array `index` (id/name arrive on the first chunk for that index, `arguments` arrive concatenated across subsequent chunks) into one `EventToolCall` per call, emitted after the last content chunk and before the terminal `EventCompleted`. `ai/anthropic` MUST assemble `content_block_start` (`type: tool_use`, carrying `id`/`name`) plus `input_json_delta` chunks on `content_block_delta` the same way, by block `index`.
+
+#### REQ: tool-messages-on-the-wire
+
+`ai/openaicompat` MUST render an assistant `Message.ToolCalls` as `tool_calls` on an `assistant` wire message and a `RoleTool` message's `ToolResults` as one `role:"tool"` wire message PER result (`tool_call_id` set, content prefixed `"Error: "` when `IsError`). `ai/anthropic` MUST render `Message.ToolCalls` as `tool_use` content blocks on an `assistant` wire message and `ToolResults` as `tool_result` content blocks on a `user` wire message, MERGING every consecutive `RoleTool` source message into ONE wire `user` message (Anthropic requires all `tool_result` blocks answering one assistant turn to arrive together).
+
+#### REQ: reasoning-maps-to-provider-knob
+
+`ChatRequest.Reasoning` (`""`/`"low"`/`"medium"`/`"high"`) MUST map to `reasoning_effort` on `ai/openaicompat` (set only when non-empty) and to Anthropic extended thinking (`thinking: {type: "enabled", budget_tokens: 1024/4096/16000}`) on `ai/anthropic`, with `MaxTokens` raised above `budget_tokens` when the request's own `MaxTokens` would not clear it. Thinking/signature deltas from `ai/anthropic` MUST NOT be emitted as `EventTextDelta` -- they are dropped.
+
+#### REQ: cloudproto-and-cloud-pass-tools-through
+
+`ai/cloud` MUST pass `ChatRequest.Tools`/`ToolChoice`/`Reasoning` and `Message.ToolCalls`/`ToolResults` through unchanged (it marshals the whole `ai.ChatRequest`/`ai.Event`). `cloudproto.ReadEvents` MUST treat `tool.call` and `tool.result` as known event types (not silently dropped as unknown).
+
+#### REQ: agent-loop-contract
+
+`ai/agent.Loop` (`Provider ai.LLMProvider`, `Handlers map[string]Handler`, `MaxSteps` default 8, `MaxToolCalls` default 16) MUST itself implement `ai.LLMProvider` (`Name() "agent"`). `Loop.Run` MUST stream every step's events in order (text deltas, `tool.call`, `tool.result`, usage), append the assistant's tool-call message and a `RoleTool` result message to its OWN copy of `req.Messages` between steps, and end with EXACTLY ONE final `EventCompleted` carrying the SUMMED usage across every step -- never a `EventCompleted` per step. A step with no tool calls ends the run. Multiple tool calls returned in one step (parallel calls) MUST be executed SEQUENTIALLY, in the order the model returned them. `Loop.Messages()` MUST return the full transcript (including tool-call/tool-result messages) of the last completed `Run`.
+
+#### REQ: agent-loop-error-handling
+
+A `Handler` returning a non-nil error (infrastructure failure) or panicking MUST NOT abort the `Run`: both become an `ai.ToolResult{IsError: true}` fed back to the model, same as a missing handler for an unregistered tool name. Exceeding `MaxSteps` or `MaxToolCalls` MUST be reported as a FATAL `ai.Error{Code: "limit"}` (the fatal-pair contract, REQ: fatal-error-contract). A cancelled `ctx` (checked before each step and before/after each tool call) MUST yield the fatal `ai.ErrCodeCanceled` pair.
 
 ### Decision chain
 
@@ -302,6 +332,41 @@ A BYOK adapter (`ai/openaicompat` or `ai/anthropic`, selected by `BYOK.Protocol`
 **Given** a FULLY populated `diag.Turn` (every field set, `Errors` built from `diag.ErrorCode`) containing a sentinel string standing in for private user text
 **When** it is JSON-marshalled and logged via `diag.Log`
 **Then** the sentinel appears in neither the marshalled JSON nor the log output, no field name matches `text`, `message`, or a raw key/secret pattern, and `diag.Log` emits at `slog.LevelDebug`
+
+### AC: tool-calls-assembled-from-multi-chunk-parallel-deltas
+**Requirements:** ai-layer#req:tool-call-streaming-assembly
+
+**Given** a fixture streaming two parallel tool calls, each with its arguments split across multiple delta chunks (by index)
+**When** `ai/openaicompat.Provider.Stream` or `ai/anthropic.Provider.Stream` is ranged to completion
+**Then** exactly two `EventToolCall` events are yielded, each carrying a complete `ai.ToolCall` with concatenated `Arguments`, before the terminal `EventCompleted` carrying `StopReason: "tool_calls"`
+
+### AC: tool-messages-round-trip-in-request-body
+**Requirements:** ai-layer#req:tool-messages-on-the-wire
+
+**Given** an `ai.ChatRequest` whose `Messages` include an assistant message with `ToolCalls` and a `RoleTool` message with `ToolResults`
+**When** `ai/openaicompat` or `ai/anthropic` builds the outbound request body
+**Then** the wire body carries the tool call(s) and result(s) in that adapter's native shape (openaicompat: `tool_calls` + one `role:"tool"` message per result; anthropic: `tool_use` + `tool_result` content blocks, with consecutive `RoleTool` source messages merged into one wire message)
+
+### AC: reasoning-sets-thinking-budget-above-max-tokens
+**Requirements:** ai-layer#req:reasoning-maps-to-provider-knob
+
+**Given** `ChatRequest.Reasoning: "medium"` and a `MaxTokens` at or below the medium budget (4096)
+**When** `ai/anthropic` builds the request
+**Then** `thinking` is `{type: "enabled", budget_tokens: 4096}` and the request's `MaxTokens` is raised strictly above 4096; separately, `ai/openaicompat` sets `reasoning_effort: "medium"` and omits the field entirely when `Reasoning` is unset
+
+### AC: agent-loop-two-step-tool-use-sums-usage
+**Requirements:** ai-layer#req:agent-loop-contract
+
+**Given** an `ai/agent.Loop` over a fake provider that first returns a tool call and then a final text-only completion, with a registered `Handler`
+**When** `Loop.Run` is drained
+**Then** the handler is called once, exactly one `EventToolResult` and exactly one final `EventCompleted` are seen (never a `EventCompleted` per step), its `Usage` is the sum of both steps', and `Loop.Messages()` returns the user/assistant-tool-call/tool-result transcript
+
+### AC: agent-loop-limits-and-error-resilience
+**Requirements:** ai-layer#req:agent-loop-error-handling
+
+**Given** a `Loop` with `MaxSteps: 2` over a provider that always returns another tool call (never stops), and separately a `Loop` whose `Handler` returns an error or panics
+**When** each is run
+**Then** the first yields a fatal `ai.Error{Code: "limit"}`; the second continues the run and reports an `IsError` `ai.ToolResult` for the failing call instead of aborting
 
 ## Open Questions
 

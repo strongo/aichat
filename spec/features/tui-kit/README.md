@@ -72,6 +72,26 @@ The module's `tui/*` tree MUST be organised as: `tui` (the message vocabulary sh
 
 A `SetBusy(true)` phase has NO IDENTITY of its own -- unlike `StartStream`, which is keyed by `id` and whose `DoneMsg` always names that `id` back, `SetBusy`/`SetBusyCancel` carry no per-call token, and chatshell itself needs none (cancelling just invokes whatever func is currently registered). A product whose own async work can outlive a cancelled (or superseded) `SetBusy(true)` phase gets NO signal from chatshell telling it "this result belongs to the phase that's still current" versus "this result belongs to a phase the user already cancelled or that was replaced by a newer one". Such a product MUST track its own phase identity across a `SetBusy(true)`/cancel-or-finish/`SetBusy(false)` cycle (e.g. a locally incremented phase token compared at the async completion handler) -- chatshell provides none for this path, by design, the same way `StartStream`'s `id` exists precisely because the streaming path needed one.
 
+#### REQ: chatshell-side-panel
+
+`chatshell.WithSidePanel(p SidePanel)` (`SidePanel`: `Title() string`, `View(width, height int, focused bool) string`, `Update(msg tea.Msg) (SidePanel, tea.Cmd)`) MUST REPLACE the default sidebar end-to-end for the whole sidebar zone: F6 visibility toggling, `Ctrl+←/→` split-percent resizing (clamped to `sidebar.MinChatPercent`/`MaxChatPercent`, 40/75, same as the default sidebar), `Shift+Right`/`Shift+Left` focus-ring participation, and rendering all route through the installed `SidePanel` instead of `sidebar.Model` once set. It starts visible, matching the default sidebar's own start state.
+
+#### REQ: chatshell-overlay
+
+`chatshell.Model.PushOverlay(o Overlay) tea.Cmd` (`Overlay`: `View(width, height int) string`, `Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)`) MUST push a modal dialog onto an overlay stack. While the stack is non-empty, the TOP overlay MUST capture every message chatshell would otherwise handle itself (including keys that would submit the composer or trigger chatshell's own shortcuts) until its `Update` returns `done: true`, at which point it is popped; an OLDER overlay beneath it MUST NOT receive any message while a newer one is on top. The top overlay MUST be rendered centred over the rest of the screen. A `tea.WindowSizeMsg` MUST still resize the shell even while an overlay is open.
+
+#### REQ: chatshell-global-keys
+
+`chatshell.WithGlobalKeys(func(tea.KeyPressMsg) (tea.Cmd, bool))` MUST be checked BEFORE chatshell's own key handling (Ctrl+C, Esc, F6, Shift+arrows, the composer, ...) on every `tea.KeyPressMsg` chatshell would otherwise process (i.e. when no `Overlay` is capturing it) -- returning `consumed: true` stops chatshell from handling that key at all this cycle; `consumed: false` lets chatshell's normal handling proceed as if the hook were absent.
+
+#### REQ: chatshell-product-bars
+
+`chatshell.WithTopBar(func(width int) string)` and `WithStatusBar(func(width int) string)` MUST, when set, REPLACE chatshell's default bold-title top line and default `SetStatus`-driven status line(s) respectively in `View()`'s rendered output.
+
+#### REQ: chatshell-transcript-ops
+
+`chatshell.Model.ReplaceBlock(entryID string, b transcript.Block)` MUST replace the `Block` of the transcript entry identified by `entryID` IN PLACE (same position, same ID) -- e.g. to refresh or re-run a grid -- and MUST be a no-op when no entry has that ID. `SetComposerText(s string)` MUST set the composer's text and move the cursor to the end (an edit-previous-message flow). `ClearTranscript()` MUST remove every transcript entry and return focus to the composer (`/clear`, a session switch).
+
 ### Sidebar
 
 #### REQ: sidebar-pin-and-notify
@@ -177,6 +197,34 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a `grid.Model` built `WithExtraViews` of two product views
 **When** `"2"` and `"3"` are pressed in turn
 **Then** `SetView`'s active view switches to the first and then the second registered `ExtraView`, and `"1"` returns to `ViewTable`
+
+### AC: side-panel-replaces-sidebar-in-focus-ring-and-split
+**Requirements:** tui-kit#req:chatshell-side-panel
+
+**Given** a `chatshell.Model` built `WithSidePanel(p)` at a width above the split threshold
+**When** `Shift+Right` is pressed, then a key while focused, then `F6`, then `Ctrl+Right`
+**Then** the focus ring moves to the sidebar zone and `p.Update` receives the key, `F6` hides the panel (`splitEnabled()` becomes false), and `Ctrl+Right` grows `panelChatPercent()` -- all without touching the default `sidebar.Model`
+
+### AC: overlay-captures-keys-until-done-and-stacks
+**Requirements:** tui-kit#req:chatshell-overlay
+
+**Given** a `chatshell.Model` with two overlays pushed (`PushOverlay` twice)
+**When** a key is sent
+**Then** only the TOP overlay's `Update` receives it (not the one beneath, not the composer); when the top overlay's `Update` returns `done: true` it is popped and the one beneath becomes top; once the stack is empty again, keys reach the composer as normal
+
+### AC: global-keys-checked-before-shell-defaults
+**Requirements:** tui-kit#req:chatshell-global-keys
+
+**Given** a `chatshell.Model` built `WithGlobalKeys` a hook that claims `F3` (`consumed: true`) and passes every other key through
+**When** `F3` is sent, then Enter with composer text is sent
+**Then** the hook fires for `F3` and chatshell does not additionally treat it as any of its own shortcuts, while the unclaimed Enter still submits normally
+
+### AC: replace-block-updates-entry-in-place
+**Requirements:** tui-kit#req:chatshell-transcript-ops
+
+**Given** a transcript entry with `ID: "grid-1"` holding one `transcript.Block`
+**When** `Model.ReplaceBlock("grid-1", newBlock)` is called
+**Then** the entry at that position now renders `newBlock`, its `ID` and position are unchanged, and `ClearTranscript()` afterward empties the transcript and returns focus to the composer
 
 ## Open Questions
 

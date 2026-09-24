@@ -223,3 +223,32 @@ every message chatshell does not itself recognise — e.g. a product message,
 or a Block message such as `grid.RowActivatedMsg` — in addition to that
 message being broadcast to the transcript's Blocks (see `transcript.Targeted`
 for routing a message to one entry by ID instead of every Block).
+
+## Extension points (`tui/chatshell`)
+
+- **`WithSidePanel(p SidePanel)`** replaces the default sidebar END TO END:
+  `F6` visibility, `Ctrl+Left`/`Ctrl+Right` split-percent resizing (still
+  clamped 40–75%), `Shift+Right`/`Shift+Left` focus-ring participation and
+  rendering all route through `p` instead of `tui/sidebar` once set. A
+  `SidePanel` is `Title() string`, `View(width, height int, focused bool)
+  string`, `Update(msg tea.Msg) (SidePanel, tea.Cmd)` — e.g. a DataTug
+  workspace pane with its own tabs, explorer and bookmarks.
+- **`PushOverlay(o Overlay) tea.Cmd`** pushes a modal dialog. The TOP overlay
+  on the stack captures every message chatshell would otherwise handle
+  itself — including keys that would submit the composer — until its
+  `Update` returns `done: true`, and renders centred over the screen. An
+  `Overlay` is `View(width, height int) string`, `Update(msg tea.Msg) (o
+  Overlay, cmd tea.Cmd, done bool)`.
+- **`WithGlobalKeys(func(tea.KeyPressMsg) (tea.Cmd, bool))`** is checked
+  BEFORE chatshell's own key handling (so a product can claim `F3`/`F4`
+  pickers or any other key ahead of chatshell's defaults); returning
+  `consumed: true` stops chatshell handling that key at all this cycle.
+- **`WithTopBar(func(width int) string)`** / **`WithStatusBar(func(width
+  int) string)`** replace the default bold title line / `SetStatus`-driven
+  status line(s) with product-rendered content.
+- **`Model.ReplaceBlock(entryID string, b transcript.Block)`** swaps a
+  transcript entry's `Block` in place (same position, same ID) — e.g. to
+  refresh or re-run a grid. **`SetComposerText(s string)`** sets the
+  composer text and moves the cursor to the end (an edit-previous-message
+  flow). **`ClearTranscript()`** empties the transcript and returns focus to
+  the composer (`/clear`, a session switch).
