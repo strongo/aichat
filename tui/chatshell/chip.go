@@ -51,11 +51,13 @@ func WithChips(chips []Chip) Option {
 // and reset to "no chip focused" (returning keyboard focus to the input)
 // when it doesn't -- e.g. the list shrank.
 //
-// SetChips does NOT clear a pending Shift+Esc undo snapshot (see
-// snapshotChipUndo): the snapshot exists to let the user recover from a
-// removal THEY just performed, and a product-driven SetChips call (adding
-// or syncing chips for an unrelated reason) shouldn't silently discard that
-// recovery option out from under them.
+// SetChips does NOT clear a pending Shift+Esc/Ctrl+Y undo snapshot (see
+// snapshotComposerUndo): the snapshot exists to let the user recover from a
+// change THEY just made, and a product-driven SetChips call (adding or
+// syncing chips for an unrelated reason) shouldn't silently discard that
+// recovery option out from under them. When a restore does eventually
+// happen, any chip present now that wasn't part of the snapshot is kept,
+// not discarded -- see mergeRestoredChips.
 func (m *Model) SetChips(chips []Chip) {
 	m.chips = append([]Chip(nil), chips...)
 	m.clampChipFocus()
@@ -68,9 +70,49 @@ func (m *Model) Chips() []Chip {
 	return append([]Chip(nil), m.chips...)
 }
 
+// RemoveChip removes the chip with the given ID -- a product-facing
+// equivalent of Backspace/Delete on a focused chip or a mouse click on its
+// ×, e.g. a "remove attachment" control the product renders elsewhere in
+// its own UI. It snapshots the pre-removal draft first, same as any other
+// removal (so Shift+Esc/Ctrl+Y can undo it), and reports whether a chip
+// with that ID was found and removed.
+func (m *Model) RemoveChip(id string) tea.Cmd {
+	for i, c := range m.chips {
+		if c.ID == id {
+			return m.removeChipAt(i)
+		}
+	}
+	return nil
+}
+
+// ClearChips detaches every chip -- a product-facing equivalent of Esc's
+// second step (clearComposerStep) -- e.g. a toolbar "clear attachments"
+// button. It snapshots the pre-clear draft first (so Shift+Esc/Ctrl+Y can
+// undo it) and is a no-op (returns nil) when there are no chips to clear.
+func (m *Model) ClearChips() tea.Cmd {
+	if len(m.chips) == 0 {
+		return nil
+	}
+	m.snapshotComposerUndo()
+	return m.doClearChips()
+}
+
+// doClearChips empties the chip list WITHOUT snapshotting -- callers
+// (clearComposerStep, ClearChips) snapshot first themselves, since one
+// (Esc's second step) only wants to snapshot when it's actually about to
+// act, and the other (ClearChips) already checked len(m.chips) > 0 before
+// calling this.
+func (m *Model) doClearChips() tea.Cmd {
+	m.chips = nil
+	m.chipFocus = -1
+	m.input.Focus()
+	m.resize()
+	return m.notifyChipsChange()
+}
+
 // clampChipFocus resets chipFocus to "no chip focused" (and returns
 // keyboard focus to the input) when it no longer indexes a live chip --
-// shared by SetChips, removeChip and restoreChipsCmd.
+// shared by SetChips, removeChipAt and restoreComposerDraft.
 func (m *Model) clampChipFocus() {
 	if m.chipFocus >= len(m.chips) {
 		m.chipFocus = -1
@@ -87,26 +129,38 @@ func (m *Model) notifyChipsChange() tea.Cmd {
 	return nil
 }
 
-// snapshotChipUndo remembers the chip list as it stood before the FIRST
-// removal since the last successful Shift+Esc restore or message submit
-// (mirrors DataTug's rememberComposerDraft): a run of several removals with
-// no restore or submit in between is undone as one unit by Shift+Esc, not
-// one chip at a time.
-func (m *Model) snapshotChipUndo() {
-	if m.chipUndo == nil {
-		snap := append([]Chip(nil), m.chips...)
-		m.chipUndo = &snap
+// composerDraft is a snapshot of the composer's text and chip list, taken
+// immediately before the first change (of either) since the last
+// successful Shift+Esc/Ctrl+Y restore, message submit, or composer text
+// edit -- see snapshotComposerUndo and restoreComposerDraft.
+type composerDraft struct {
+	text  string
+	chips []Chip
+}
+
+// snapshotComposerUndo remembers the composer's text and chip list as they
+// stood before the FIRST change since the last successful restore/submit/
+// text-edit (mirrors DataTug's rememberComposerDraft): a run of several
+// changes (e.g. several chip removals) with nothing resetting the snapshot
+// in between is undone as ONE unit by Shift+Esc/Ctrl+Y, not one change at a
+// time. A no-op once a snapshot is already pending.
+func (m *Model) snapshotComposerUndo() {
+	if m.composerUndo == nil {
+		m.composerUndo = &composerDraft{
+			text:  m.input.Value(),
+			chips: append([]Chip(nil), m.chips...),
+		}
 	}
 }
 
-// removeChip removes the chip at index (a no-op, returning nil, for an
-// out-of-range index), snapshotting the pre-removal list for Shift+Esc
-// first, and returns the ChipObserver notification command.
-func (m *Model) removeChip(index int) tea.Cmd {
+// removeChipAt removes the chip at index (a no-op, returning nil, for an
+// out-of-range index), snapshotting the pre-removal draft first, and
+// returns the ChipObserver notification command.
+func (m *Model) removeChipAt(index int) tea.Cmd {
 	if index < 0 || index >= len(m.chips) {
 		return nil
 	}
-	m.snapshotChipUndo()
+	m.snapshotComposerUndo()
 	next := make([]Chip, 0, len(m.chips)-1)
 	next = append(next, m.chips[:index]...)
 	m.chips = append(next, m.chips[index+1:]...)
@@ -115,19 +169,86 @@ func (m *Model) removeChip(index int) tea.Cmd {
 	return m.notifyChipsChange()
 }
 
-// restoreChipsCmd implements Shift+Esc: it reports ok=false (a no-op) when
-// there is nothing to restore, and otherwise replaces the current chip list
-// with the pre-removal snapshot, clears the snapshot, and returns the
-// resulting ChipObserver notification command.
-func (m *Model) restoreChipsCmd() (tea.Cmd, bool) {
-	if m.chipUndo == nil {
+// clearComposerStep implements Esc's two-step clear in the input zone
+// (DataTug's own clearComposerStep, generalised to text+chips): the FIRST
+// Esc, while there's text, clears the composer TEXT ONLY -- even while a
+// chip is focused, since chip focus and "there's text to clear" are
+// independent; the SECOND Esc, once the text is already empty, detaches
+// EVERY chip. Either step snapshots the pre-clear draft first (so
+// Shift+Esc/Ctrl+Y can undo it). Reports cleared=false (nothing to do, so
+// the caller should fall through to Esc's normal focus-ring behaviour) when
+// the input is already empty and there are no chips.
+func (m *Model) clearComposerStep() (tea.Cmd, bool) {
+	if m.input.Value() == "" && len(m.chips) == 0 {
 		return nil, false
 	}
-	m.chips = *m.chipUndo
-	m.chipUndo = nil
-	m.clampChipFocus()
+	m.snapshotComposerUndo()
+	if m.input.Value() != "" {
+		m.input.Reset()
+		m.commandMenuIndex = 0
+		m.commandMenuDismissed = ""
+		return nil, true
+	}
+	return m.doClearChips(), true
+}
+
+// restoreComposerDraft implements Shift+Esc/Ctrl+Y: restores the composer
+// text exactly as snapshotted, and the chip list as the snapshot MERGED
+// with any chip added since (matched by ID -- see mergeRestoredChips), so a
+// chip the product attached AFTER the snapshot was taken isn't silently
+// discarded by an unrelated undo. Reports ok=false (a no-op) when there is
+// nothing to restore.
+func (m *Model) restoreComposerDraft() (tea.Cmd, bool) {
+	if m.composerUndo == nil {
+		return nil, false
+	}
+	draft := m.composerUndo
+	m.composerUndo = nil
+	m.input.SetValue(draft.text)
+	m.input.CursorEnd()
+	m.chips = mergeRestoredChips(draft.chips, m.chips)
+	m.chipFocus = -1
+	m.input.Focus()
 	m.resize()
 	return m.notifyChipsChange(), true
+}
+
+// chipKey identifies a chip for mergeRestoredChips's union: its ID when it
+// has one, or its Label when it doesn't (a chip with no ID has no other
+// stable identity chatshell knows about, so two chips sharing the same
+// empty ID are only ever treated as "the same chip" when their Label also
+// matches).
+func chipKey(c Chip) string {
+	if c.ID != "" {
+		return "id\x00" + c.ID
+	}
+	return "lbl\x00" + c.Label
+}
+
+// mergeRestoredChips implements restoreComposerDraft's chip merge (m2, r1
+// review): the result is the snapshot's own chips, in their original
+// order, UNION any chip in current that ISN'T already represented in the
+// snapshot (by chipKey) -- appended after the snapshot's chips, in
+// current's own order. A chip removed since the snapshot was taken (it's
+// in snapshot but not in current) is still restored, since the whole point
+// of Shift+Esc/Ctrl+Y is to bring it back; a chip added since (it's in
+// current but not in snapshot) is kept rather than silently dropped by an
+// undo that was never about it.
+func mergeRestoredChips(snapshot, current []Chip) []Chip {
+	seen := make(map[string]bool, len(snapshot)+len(current))
+	merged := make([]Chip, 0, len(snapshot)+len(current))
+	for _, c := range snapshot {
+		merged = append(merged, c)
+		seen[chipKey(c)] = true
+	}
+	for _, c := range current {
+		key := chipKey(c)
+		if !seen[key] {
+			merged = append(merged, c)
+			seen[key] = true
+		}
+	}
+	return merged
 }
 
 // cycleChipFocus implements Tab (forward: true) / Shift+Tab (forward:
@@ -245,18 +366,14 @@ func (m *Model) chipsView(width int) string {
 
 // chipsTopY returns the Y coordinate (chatshell's own top-left-origin
 // coordinate frame, matching tea.Mouse's) of the first chip row, so
-// handleMouseClick can translate a click's Y into a row index. It is the
+// handleMouseClick can translate a click's Y into a row index: the
 // rendered top bar's height, plus the transcript's fixed viewport height
-// (historyHeight), plus the slash-command menu's height when the menu is
+// (historyHeight), plus the slash-command menu's height when it's
 // currently showing -- exactly the content View() stacks above the chip
-// row(s), in order.
+// row(s), in order (see historyHeight's own doc for why each of these is
+// measured rather than assumed).
 func (m *Model) chipsTopY() int {
-	y := strings.Count(m.topBarView(), "\n") + 1
-	y += m.historyHeight()
-	if menu := m.commandMenuView(); menu != "" {
-		y += strings.Count(menu, "\n") + 1
-	}
-	return y
+	return m.topBarHeight() + m.historyHeight() + m.menuHeight()
 }
 
 // handleMouseClick handles a tea.MouseClickMsg: a click on a chip's "×"
@@ -289,7 +406,7 @@ func (m *Model) chipCloseClick(msg tea.MouseClickMsg) (tea.Cmd, bool) {
 	}
 	for _, cell := range rows[row] {
 		if msg.X == cell.x {
-			return m.removeChip(cell.index), true
+			return m.removeChipAt(cell.index), true
 		}
 	}
 	return nil, false

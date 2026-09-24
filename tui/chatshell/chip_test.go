@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
 	"github.com/strongo/aichat/tui/focus"
@@ -24,8 +25,8 @@ func (h *chipHandler) OnChipsChange(chips []Chip) tea.Cmd {
 }
 
 // bareHandler implements only Handler -- no optional capabilities at all --
-// so chip removal against it exercises notifyChipsChange's "no ChipObserver"
-// branch.
+// so a chip change against it exercises notifyChipsChange's "no
+// ChipObserver" branch.
 type bareHandler struct{}
 
 func (bareHandler) Submit(string) tea.Cmd { return nil }
@@ -78,15 +79,17 @@ func TestSetChipsDoesNotClearPendingUndo(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
 	m.SetChips(threeChips())
-	m.removeChip(0) // snapshots chipUndo
-	if m.chipUndo == nil {
+	m.removeChipAt(0) // snapshots composerUndo
+	if m.composerUndo == nil {
 		t.Fatal("expected a pending undo snapshot")
 	}
 	m.SetChips(threeChips()) // product-driven change, unrelated to the removal
-	if m.chipUndo == nil {
-		t.Fatal("SetChips must not clear a pending Shift+Esc undo")
+	if m.composerUndo == nil {
+		t.Fatal("SetChips must not clear a pending Shift+Esc/Ctrl+Y undo")
 	}
 }
+
+// --- Tab/Left/Right focus -------------------------------------------------
 
 func TestCycleChipFocusForwardAndBackward(t *testing.T) {
 	h := &fakeHandler{}
@@ -180,6 +183,8 @@ func TestLeftRightIgnoredWithoutChipFocus(t *testing.T) {
 	}
 }
 
+// --- Backspace/Delete/Ctrl+D removal ---------------------------------------
+
 func TestBackspaceAndDeleteRemoveFocusedChip(t *testing.T) {
 	h := &chipHandler{}
 	m := newTestShell(h)
@@ -197,6 +202,24 @@ func TestBackspaceAndDeleteRemoveFocusedChip(t *testing.T) {
 	m.Update(tea.KeyPressMsg{Code: tea.KeyDelete})
 	if got := m.Chips(); len(got) != 1 || got[0].Label != "Order" {
 		t.Fatalf("Chips() = %+v", got)
+	}
+}
+
+func TestCtrlDRemovesLastChipRegardlessOfFocus(t *testing.T) {
+	h := &chipHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	// No chip focused (input holds keyboard focus): Ctrl+D still works.
+	m.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	got := m.Chips()
+	if len(got) != 2 || got[0].Label != "Customer" || got[1].Label != "Invoice" {
+		t.Fatalf("Chips() = %+v, want the last chip removed", got)
+	}
+	if len(h.changes) != 1 {
+		t.Fatalf("OnChipsChange calls = %d, want 1", len(h.changes))
+	}
+	if m.composerUndo == nil {
+		t.Fatal("Ctrl+D should snapshot like any other removal")
 	}
 }
 
@@ -233,15 +256,15 @@ func TestBackspaceWithoutChipFocusReachesTextarea(t *testing.T) {
 	}
 }
 
-func TestRemoveChipOutOfRangeIsNoop(t *testing.T) {
+func TestRemoveChipAtOutOfRangeIsNoop(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
 	m.SetChips(threeChips())
-	if cmd := m.removeChip(-1); cmd != nil {
-		t.Fatal("removeChip(-1) should return nil")
+	if cmd := m.removeChipAt(-1); cmd != nil {
+		t.Fatal("removeChipAt(-1) should return nil")
 	}
-	if cmd := m.removeChip(99); cmd != nil {
-		t.Fatal("removeChip(99) should return nil")
+	if cmd := m.removeChipAt(99); cmd != nil {
+		t.Fatal("removeChipAt(99) should return nil")
 	}
 	if len(m.Chips()) != 3 {
 		t.Fatalf("Chips() = %+v, want unchanged", m.Chips())
@@ -255,6 +278,138 @@ func TestRemoveChipWithoutChipObserverIsSafe(t *testing.T) {
 	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
 	if len(m.Chips()) != 2 {
 		t.Fatalf("Chips() = %+v", m.Chips())
+	}
+}
+
+// --- exported RemoveChip/ClearChips ----------------------------------------
+
+func TestRemoveChipByID(t *testing.T) {
+	h := &chipHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.RemoveChip("b")
+	got := m.Chips()
+	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "c" {
+		t.Fatalf("Chips() = %+v", got)
+	}
+	if m.composerUndo == nil {
+		t.Fatal("RemoveChip should snapshot like any other removal")
+	}
+	// An unknown ID is a documented no-op.
+	if cmd := m.RemoveChip("nope"); cmd != nil {
+		t.Fatal("RemoveChip(unknown) should return nil")
+	}
+	if len(m.Chips()) != 2 {
+		t.Fatalf("Chips() = %+v, want unchanged for an unknown ID", m.Chips())
+	}
+}
+
+func TestClearChipsDetachesAllAndSnapshots(t *testing.T) {
+	h := &chipHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.ClearChips()
+	if len(h.changes) != 1 || len(h.changes[0]) != 0 {
+		t.Fatalf("OnChipsChange calls = %+v, want one call with an empty list", h.changes)
+	}
+	if len(m.Chips()) != 0 {
+		t.Fatalf("Chips() = %+v, want empty", m.Chips())
+	}
+	if m.composerUndo == nil {
+		t.Fatal("ClearChips should snapshot the pre-clear chips")
+	}
+	if !m.input.Focused() {
+		t.Fatal("input should hold focus once every chip is cleared")
+	}
+}
+
+func TestClearChipsNoopWithoutChips(t *testing.T) {
+	h := &chipHandler{}
+	m := newTestShell(h)
+	if cmd := m.ClearChips(); cmd != nil {
+		t.Fatal("ClearChips with no chips should return nil")
+	}
+	if len(h.changes) != 0 {
+		t.Fatal("no notification expected for a no-op ClearChips")
+	}
+}
+
+// --- Esc's two-step clear (b1) ---------------------------------------------
+
+func TestEscFirstClearsTextSecondClearsChipsEvenWhileAChipIsFocused(t *testing.T) {
+	h := &chipHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.input.SetValue("draft")
+	m.chipFocus = 1 // a chip is focused; the first Esc must still clear TEXT
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if m.input.Value() != "" {
+		t.Fatalf("input = %q, want cleared by the first Esc", m.input.Value())
+	}
+	if len(m.Chips()) != 3 {
+		t.Fatalf("Chips() = %+v, want untouched by the first Esc", m.Chips())
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if len(m.Chips()) != 0 {
+		t.Fatalf("Chips() = %+v, want cleared by the second Esc", m.Chips())
+	}
+}
+
+func TestEscWithNoTextGoesStraightToClearingChips(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if len(m.Chips()) != 0 {
+		t.Fatalf("Chips() = %+v, want cleared by a single Esc when there's no text", m.Chips())
+	}
+}
+
+func TestEscIsANoopAndFallsThroughWhenNothingToClear(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	// No text, no chips: Esc has nothing to clear, so it falls through to
+	// the default focus-ring Esc (already Input -> Input, a harmless no-op).
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if m.focusRing.Zone() != focus.ZoneInput {
+		t.Fatalf("Zone() = %v, want ZoneInput", m.focusRing.Zone())
+	}
+}
+
+// --- Shift+Esc / Ctrl+Y restore (b1) ---------------------------------------
+
+func TestShiftEscRestoresTextAndChipsClearedByEscTwoStep(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.input.SetValue("draft")
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape}) // clears text, snapshots "draft"+3 chips
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape}) // clears chips; snapshot untouched (already set)
+	if m.input.Value() != "" || len(m.Chips()) != 0 {
+		t.Fatalf("input=%q chips=%+v, want both cleared", m.input.Value(), m.Chips())
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape, Mod: tea.ModShift})
+	if m.input.Value() != "draft" || len(m.Chips()) != 3 {
+		t.Fatalf("input=%q chips=%+v, want the draft and chips restored", m.input.Value(), m.Chips())
+	}
+}
+
+func TestCtrlYRestoresSameAsShiftEsc(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.chipFocus = 0
+	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+	if len(m.Chips()) != 2 {
+		t.Fatalf("Chips() = %+v", m.Chips())
+	}
+	m.Update(tea.KeyPressMsg{Code: 'y', Mod: tea.ModCtrl})
+	if len(m.Chips()) != 3 {
+		t.Fatalf("Chips() = %+v, want restored via Ctrl+Y", m.Chips())
 	}
 }
 
@@ -274,8 +429,8 @@ func TestShiftEscRestoresChipsRemovedSinceLastSnapshot(t *testing.T) {
 	if len(got) != 3 || got[0].Label != "Customer" || got[1].Label != "Invoice" || got[2].Label != "Order" {
 		t.Fatalf("Chips() after restore = %+v", got)
 	}
-	if m.chipUndo != nil {
-		t.Fatal("chipUndo should be cleared after a successful restore")
+	if m.composerUndo != nil {
+		t.Fatal("composerUndo should be cleared after a successful restore")
 	}
 	last := h.changes[len(h.changes)-1]
 	if len(last) != 3 {
@@ -310,19 +465,88 @@ func TestShiftEscIgnoredWhileBusy(t *testing.T) {
 	}
 }
 
-func TestSubmitClearsPendingChipUndo(t *testing.T) {
+// --- m2: restore merges chips added since the snapshot ---------------------
+
+func TestShiftEscRestoreKeepsChipsAddedSinceTheSnapshot(t *testing.T) {
+	h := &chipHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.chipFocus = 1
+	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace}) // removes Invoice; snapshots [Customer,Invoice,Order]
+	if got := m.Chips(); len(got) != 2 {
+		t.Fatalf("Chips() = %+v", got)
+	}
+	// The product attaches something new (by ID, not in the snapshot) while
+	// a restore is still pending.
+	d := Chip{ID: "d", Label: "Shipment"}
+	m.SetChips(append(m.Chips(), d))
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape, Mod: tea.ModShift})
+	got := m.Chips()
+	if len(got) != 4 {
+		t.Fatalf("Chips() = %+v, want the 3 restored plus the 1 added since", got)
+	}
+	byID := map[string]bool{}
+	for _, c := range got {
+		byID[c.ID] = true
+	}
+	for _, id := range []string{"a", "b", "c", "d"} {
+		if !byID[id] {
+			t.Fatalf("Chips() = %+v, missing %q", got, id)
+		}
+	}
+}
+
+func TestMergeRestoredChipsDedupsIDlessChipsByLabel(t *testing.T) {
+	snapshot := []Chip{{Label: "Customer"}, {ID: "b", Label: "Invoice"}}
+	current := []Chip{{Label: "Customer"}} // same (ID-less) chip, still present -- not a duplicate
+	merged := mergeRestoredChips(snapshot, current)
+	if len(merged) != 2 {
+		t.Fatalf("mergeRestoredChips = %+v, want no duplicate for the still-present ID-less chip", merged)
+	}
+
+	current2 := []Chip{{Label: "Different"}} // a genuinely different ID-less chip: kept
+	merged2 := mergeRestoredChips(snapshot, current2)
+	if len(merged2) != 3 {
+		t.Fatalf("mergeRestoredChips = %+v, want the distinct ID-less chip kept", merged2)
+	}
+}
+
+// --- m1: Enter with a chip focused ------------------------------------------
+
+func TestEnterWithChipFocusedSubmitsAndResetsChipFocus(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.chipFocus = 1
+	m.input.Blur()
+	m.input.SetValue("go")
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(h.submitted) != 1 || h.submitted[0] != "go" {
+		t.Fatalf("submitted = %v", h.submitted)
+	}
+	if m.chipFocus != -1 {
+		t.Fatalf("chipFocus = %d, want -1 after submit", m.chipFocus)
+	}
+	if !m.input.Focused() {
+		t.Fatal("input should regain focus after submit")
+	}
+}
+
+func TestSubmitClearsPendingComposerUndo(t *testing.T) {
 	h := &chipHandler{}
 	m := newTestShell(h)
 	m.SetChips(threeChips())
 	m.chipFocus = 0
 	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
-	if m.chipUndo == nil {
+	if m.composerUndo == nil {
 		t.Fatal("expected a pending undo snapshot before submit")
 	}
 	m.input.SetValue("go")
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if m.chipUndo != nil {
-		t.Fatal("submitting the message should clear the pending chip undo")
+	if m.composerUndo != nil {
+		t.Fatal("submitting the message should clear the pending undo")
 	}
 	// Shift+Esc after submit is now a no-op.
 	before := len(m.Chips())
@@ -331,6 +555,48 @@ func TestSubmitClearsPendingChipUndo(t *testing.T) {
 		t.Fatalf("Chips() changed after post-submit Shift+Esc")
 	}
 }
+
+func TestComposerTextEditDropsPendingUndo(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.chipFocus = 0
+	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+	if m.composerUndo == nil {
+		t.Fatal("expected a pending undo snapshot")
+	}
+	m.Update(tea.KeyPressMsg{Text: "x"})
+	if m.composerUndo != nil {
+		t.Fatal("editing the composer text should drop the pending undo")
+	}
+}
+
+// --- M1: ClearTranscript -----------------------------------------------------
+
+func TestClearTranscriptDropsComposerUndoAndChipFocus(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	m.chipFocus = 1
+	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+	if m.composerUndo == nil {
+		t.Fatal("expected a pending undo snapshot")
+	}
+	m.ClearTranscript()
+	if m.composerUndo != nil {
+		t.Fatal("ClearTranscript should drop the pending composer-undo snapshot")
+	}
+	if m.chipFocus != -1 {
+		t.Fatalf("chipFocus = %d, want -1 after ClearTranscript", m.chipFocus)
+	}
+	// ClearTranscript does not itself touch the chip list -- that's the
+	// product's call, via SetChips.
+	if len(m.Chips()) != 2 {
+		t.Fatalf("Chips() = %+v, want left as-is by ClearTranscript", m.Chips())
+	}
+}
+
+// --- rendering / layout ------------------------------------------------------
 
 func TestChipRowsEmptyWithoutChips(t *testing.T) {
 	h := &fakeHandler{}
@@ -416,7 +682,66 @@ func TestViewRendersChipRowAboveComposer(t *testing.T) {
 	}
 }
 
-// --- mouse click removal -------------------------------------------------
+// --- cheap fix: historyHeight() accounts for the menu and a multi-line
+// top bar so View()'s total rendered height matches m.height exactly ------
+
+func renderedLineCount(s string) int { return len(strings.Split(s, "\n")) }
+
+func TestViewHeightMatchesTerminalHeightBaseline(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24}) // narrow: no sidebar split
+	if got := renderedLineCount(m.View().Content); got != m.height {
+		t.Fatalf("rendered %d lines, want exactly m.height = %d", got, m.height)
+	}
+}
+
+func TestViewHeightMatchesTerminalHeightWithMultiLineTopBar(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithTopBar(func(int) string { return "line1\nline2\nline3" }))
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	if got := renderedLineCount(m.View().Content); got != m.height {
+		t.Fatalf("rendered %d lines, want exactly m.height = %d", got, m.height)
+	}
+}
+
+func TestViewHeightMatchesTerminalHeightWithOpenCommandMenu(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithCommands([]Command{{Name: "/a", Help: "a"}, {Name: "/ab", Help: "ab"}}))
+	m.input.SetValue("/a")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	if m.commandMenuView() == "" {
+		t.Fatal("expected the command menu to be open")
+	}
+	if got := renderedLineCount(m.View().Content); got != m.height {
+		t.Fatalf("rendered %d lines, want exactly m.height = %d", got, m.height)
+	}
+}
+
+func TestViewHeightMatchesTerminalHeightWithStatus(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	m.SetStatus("model: gpt\nusage: 12")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	if got := renderedLineCount(m.View().Content); got != m.height {
+		t.Fatalf("rendered %d lines, want exactly m.height = %d", got, m.height)
+	}
+	if m.statusSegmentHeight() != 2 {
+		t.Fatalf("statusSegmentHeight() = %d, want 2", m.statusSegmentHeight())
+	}
+}
+
+func TestViewHeightMatchesTerminalHeightWithChipsAndMenu(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithCommands([]Command{{Name: "/a", Help: "a"}}), WithChips(threeChips()))
+	m.input.SetValue("/a")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	if got := renderedLineCount(m.View().Content); got != m.height {
+		t.Fatalf("rendered %d lines, want exactly m.height = %d", got, m.height)
+	}
+}
+
+// --- mouse click removal ----------------------------------------------------
 
 func chipMouseSetup(t *testing.T) (*chipHandler, *Model) {
 	t.Helper()
@@ -452,6 +777,35 @@ func TestMouseClickOnCloseGlyphRemovesChip(t *testing.T) {
 	got := m.Chips()
 	if len(got) != 2 || got[0].Label != "Customer" || got[1].Label != "Order" {
 		t.Fatalf("Chips() = %+v", got)
+	}
+	if len(h.changes) != 1 {
+		t.Fatalf("OnChipsChange calls = %d, want 1", len(h.changes))
+	}
+}
+
+// TestMouseClickFindsCloseGlyphInRenderedView (m3, r1 review) locates the ×
+// by scanning View()'s ACTUAL rendered output -- not via the internal
+// chipsTopY/chipRows helpers under test elsewhere -- so this test would
+// catch a real drift between where chips are drawn and where a click is
+// interpreted, not just an internal-helper self-consistency bug.
+func TestMouseClickFindsCloseGlyphInRenderedView(t *testing.T) {
+	h, m := chipMouseSetup(t)
+	view := m.View().Content
+	lines := strings.Split(view, "\n")
+	row, col := -1, -1
+	for y, line := range lines {
+		stripped := ansi.Strip(line)
+		if x := strings.Index(stripped, chipCloseGlyph); x >= 0 {
+			row, col = y, x
+			break
+		}
+	}
+	if row < 0 {
+		t.Fatalf("rendered view has no %q glyph:\n%s", chipCloseGlyph, view)
+	}
+	m.Update(tea.MouseClickMsg{X: col, Y: row, Button: tea.MouseLeft})
+	if len(m.Chips()) != 2 {
+		t.Fatalf("Chips() = %+v, want the first rendered chip removed", m.Chips())
 	}
 	if len(h.changes) != 1 {
 		t.Fatalf("OnChipsChange calls = %d, want 1", len(h.changes))
@@ -545,10 +899,19 @@ func TestChipsTopYAccountsForMultiLineTopBarAndMenu(t *testing.T) {
 		t.Fatalf("chipsTopY() = %d, want %d", withoutMenu, wantWithoutMenu)
 	}
 
+	// Opening the menu grows menuHeight() but shrinks historyHeight() by
+	// exactly as much (historyHeight() now accounts for the menu, per the
+	// "cheap fix" REQ), so the chip row's own Y position is UNCHANGED --
+	// that's the point: View()'s total height stays == m.height either way,
+	// with the menu and the chip row always landing in the same place
+	// relative to the top bar and transcript combined.
 	m.input.SetValue("/help")
+	if m.commandMenuView() == "" {
+		t.Fatal("expected the command menu to be open")
+	}
 	withMenu := m.chipsTopY()
-	if withMenu <= withoutMenu {
-		t.Fatalf("chipsTopY() = %d, want greater than %d once the command menu shows", withMenu, withoutMenu)
+	if withMenu != withoutMenu {
+		t.Fatalf("chipsTopY() = %d, want unchanged at %d once the command menu shows (historyHeight absorbs it)", withMenu, withoutMenu)
 	}
 	if view := m.View(); !strings.Contains(view.Content, "help") {
 		t.Fatalf("expected the open command menu in the rendered view:\n%s", view.Content)
@@ -562,14 +925,16 @@ func TestSyncFocusClearsChipFocusOnZoneChange(t *testing.T) {
 	m.chipFocus = 1
 	m.input.Blur()
 
-	// Esc from the chip row returns focus to the composer and drops chip
-	// focus (default branch of syncFocus).
+	// Esc from the chip row -- with no text and a fresh chip list -- clears
+	// the chips (Esc's second step, since there's no text to clear first)
+	// and drops chip focus.
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	if m.chipFocus != -1 || !m.input.Focused() {
 		t.Fatalf("chipFocus=%d inputFocused=%v, want -1/true after Esc", m.chipFocus, m.input.Focused())
 	}
 
 	// Moving into the transcript also drops chip focus.
+	m.SetChips(threeChips())
 	m.AppendBlock(&fakeBlock{})
 	m.chipFocus = 0
 	m.input.Blur()
@@ -582,5 +947,62 @@ func TestSyncFocusClearsChipFocusOnZoneChange(t *testing.T) {
 	}
 	if m.focusRing.Zone() != focus.ZoneTranscript {
 		t.Fatalf("Zone() = %v, want ZoneTranscript", m.focusRing.Zone())
+	}
+}
+
+// --- b1: replay of DataTug's own
+// TestComposerAttachmentChipsCanBeFocusedClearedAndRestored
+// (origin/main:pkg/chat/workspace_test.go) against chatshell's
+// product-neutral composer, step for step. ---------------------------------
+
+func TestReplayDataTugComposerAttachmentChipsCanBeFocusedClearedAndRestored(t *testing.T) {
+	h := &chipHandler{}
+	m := newTestShell(h) // width 120, height 40
+	customer := Chip{ID: "customer", Label: "Customer"}
+	m.SetChips([]Chip{customer})
+	m.input.SetValue("Top 5 rows")
+
+	if !strings.Contains(m.chipsView(m.chatWidth()), "Customer") {
+		t.Fatal("attached Customer chip is not inside the chip row")
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	if m.chipFocus != 0 {
+		t.Fatalf("Tab did not focus the attachment chip: %d", m.chipFocus)
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if m.input.Value() != "" || len(m.Chips()) != 1 {
+		t.Fatalf("first Esc should clear text only: %q, %+v", m.input.Value(), m.Chips())
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if len(m.Chips()) != 0 {
+		t.Fatalf("second Esc should clear attachments: %+v", m.Chips())
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape, Mod: tea.ModShift})
+	if m.input.Value() != "Top 5 rows" || len(m.Chips()) != 1 {
+		t.Fatalf("Shift+Esc did not restore draft and attachments: %q, %+v", m.input.Value(), m.Chips())
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+	if len(m.Chips()) != 0 {
+		t.Fatal("Backspace did not remove the focused chip")
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape, Mod: tea.ModShift})
+	if len(m.Chips()) != 1 || m.input.Value() != "Top 5 rows" {
+		t.Fatal("Shift+Esc did not restore the chip removed with Backspace")
+	}
+
+	// Clicking the visible × (found in the rendered view, as m3 requires)
+	// removes the chip.
+	m.SetMouseEnabled(true)
+	cell := chipCellFor(t, m, 0)
+	m.Update(tea.MouseClickMsg{X: cell.x, Y: m.chipsTopY(), Button: tea.MouseLeft})
+	if len(m.Chips()) != 0 {
+		t.Fatal("clicking the visible × did not remove the chip")
 	}
 }

@@ -301,13 +301,16 @@ type Model struct {
 
 	// chips are the composer's attachment chips, rendered above the input
 	// (see chip.go). chipFocus is the focused chip's index into chips, or -1
-	// when none is focused (the input itself holds keyboard focus). chipUndo,
-	// when non-nil, is the chip list as it stood immediately before the
-	// FIRST removal since the last successful Shift+Esc restore or submit —
-	// see snapshotChipUndo.
-	chips     []Chip
-	chipFocus int
-	chipUndo  *[]Chip
+	// when none is focused (the input itself holds keyboard focus).
+	//
+	// composerUndo, when non-nil, is a snapshot of BOTH the composer text
+	// and the chip list as they stood immediately before the FIRST change
+	// (Esc's text-clear step, Esc's chip-clear step, a chip removal, or
+	// ClearChips) since the last successful Shift+Esc/Ctrl+Y restore, submit,
+	// or composer text edit — see snapshotComposerUndo.
+	chips        []Chip
+	chipFocus    int
+	composerUndo *composerDraft
 }
 
 // New returns a chat screen driven by handler.
@@ -701,6 +704,14 @@ func (m *Model) SetComposerText(s string) {
 // phase (no stream, e.g. a decision chain) has no DoneMsg to cancel it
 // asynchronously, so ClearTranscript also invokes the registered
 // SetBusyCancel callback directly, same as cancelBusy does for Esc/Ctrl+C.
+//
+// ClearTranscript also drops any pending Shift+Esc/Ctrl+Y composer-draft
+// snapshot and clears chip focus (M1, r1 review) -- e.g. a session switch,
+// where the OLD session's "undo my last chip removal" and chip-row cursor
+// position no longer mean anything against the NEW session's own chips
+// (which a product typically installs right after via SetChips). It does
+// NOT itself clear m.chips: which chips belong to the new session is the
+// product's call, made via SetChips, not ClearTranscript's.
 func (m *Model) ClearTranscript() {
 	m.cancelStream()
 	m.streamID = ""
@@ -713,6 +724,8 @@ func (m *Model) ClearTranscript() {
 	m.streamMarkdown = false
 	m.markdownTickPending = false
 	m.transcript.Clear()
+	m.composerUndo = nil
+	m.chipFocus = -1
 	m.focusRing.FocusInput()
 	m.syncFocus()
 }
@@ -1242,8 +1255,47 @@ func (m *Model) sidebarWidth() int {
 	return max(1, m.width-2-m.chatWidth()-1)
 }
 
+// historyHeight is the transcript viewport's fixed height: the terminal
+// height minus every OTHER row View() stacks around it -- the top bar
+// (topBarHeight, which a product's own WithTopBar may render as more than
+// one line), the open slash-command menu (menuHeight, 0 when it isn't
+// showing), the chip row(s) (chipsHeight), the composer's own fixed single
+// line, and the status line(s) (statusSegmentHeight) -- so that
+// View()'s total rendered height always equals m.height exactly (a
+// pre-existing gap this REQ fixes: historyHeight previously assumed a
+// constant "4" rows of chrome, silently wrong once a product's top bar
+// wrapped to more than one line or the slash-command menu was open, either
+// under- or over-filling the screen).
 func (m *Model) historyHeight() int {
-	return max(1, m.height-4-len(m.statusLines())-m.chipsHeight(m.chatWidth()))
+	return max(1, m.height-m.topBarHeight()-m.menuHeight()-1-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth()))
+}
+
+// topBarHeight is the rendered top bar's line count -- 1 for the default
+// bold title, or however many lines a product's own WithTopBar renders.
+func (m *Model) topBarHeight() int {
+	return strings.Count(m.topBarView(), "\n") + 1
+}
+
+// menuHeight is the open slash-command menu's rendered line count, or 0
+// when it isn't currently showing.
+func (m *Model) menuHeight() int {
+	menu := m.commandMenuView()
+	if menu == "" {
+		return 0
+	}
+	return strings.Count(menu, "\n") + 1
+}
+
+// statusSegmentHeight is how many rows View()'s status segment occupies:
+// the status text's own line count when SetStatus has been given
+// something, or 1 when it hasn't -- lipgloss.JoinVertical still renders one
+// blank row for an EMPTY final segment, same as it would for a one-line
+// one, so an empty status is not "0 rows of chrome".
+func (m *Model) statusSegmentHeight() int {
+	if m.status == "" {
+		return 1
+	}
+	return len(m.statusLines())
 }
 
 func (m *Model) statusLines() []string {
@@ -1277,21 +1329,23 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.quit = true
 		return m, tea.Quit
-	case "shift+esc":
-		// Restores the chip list as it stood before the most recent run of
-		// removals (see snapshotChipUndo). A no-op (falls through to the
-		// zone dispatch below, same as any key chatshell doesn't claim) when
-		// busy or when there is nothing to restore.
+	case "shift+esc", "ctrl+y":
+		// Restores the composer draft (text + chips) as it stood before the
+		// most recent run of changes (see snapshotComposerUndo). A no-op
+		// (falls through to the zone dispatch below, same as any key
+		// chatshell doesn't claim) when busy or when there is nothing to
+		// restore.
 		if !m.busy {
-			if cmd, ok := m.restoreChipsCmd(); ok {
+			if cmd, ok := m.restoreComposerDraft(); ok {
 				return m, cmd
 			}
 		}
 	case "esc":
 		// Esc's priority order: close an open slash-command menu first (it
 		// stays closed until the input value changes); then cancel if busy;
-		// then let a focused Block capture it (EscCapturer); then the
-		// default focus-ring Esc (return to the composer).
+		// then -- in the input zone -- the composer's own two-step clear
+		// (clearComposerStep: text first, then chips); then let a focused
+		// Block capture it (EscCapturer); then the default focus-ring Esc.
 		if m.focusRing.Zone() == focus.ZoneInput && len(m.commandMenuMatches()) > 0 {
 			m.commandMenuDismissed = m.input.Value()
 			m.commandMenuIndex = 0
@@ -1300,6 +1354,11 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.busy {
 			m.cancelBusy()
 			return m, nil
+		}
+		if m.focusRing.Zone() == focus.ZoneInput {
+			if cmd, cleared := m.clearComposerStep(); cleared {
+				return m, cmd
+			}
 		}
 		if m.focusRing.Zone() == focus.ZoneTranscript && m.transcript.CapturesEsc() {
 			cmd := m.transcript.Update(msg)
@@ -1450,6 +1509,11 @@ func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "tab", "shift+tab":
 			m.cycleChipFocus(msg.String() == "tab")
 			return m, nil
+		case "ctrl+d":
+			// Built-in "remove the last chip" shortcut (DataTug's own
+			// Ctrl+D), independent of chip focus. Snapshots like any other
+			// removal, so Shift+Esc/Ctrl+Y can undo it.
+			return m, m.removeChipAt(len(m.chips) - 1)
 		}
 		if m.chipFocus >= 0 {
 			switch msg.String() {
@@ -1464,7 +1528,7 @@ func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "backspace", "delete":
-				return m, m.removeChip(m.chipFocus)
+				return m, m.removeChipAt(m.chipFocus)
 			}
 		}
 	}
@@ -1480,15 +1544,28 @@ func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.input.Reset()
 		m.commandMenuIndex = 0
 		m.commandMenuDismissed = ""
-		m.chipUndo = nil
+		m.composerUndo = nil
+		// m1: submitting with a chip focused ends chip focus and returns
+		// keyboard focus to the input, same as any other way of leaving the
+		// chip row.
+		m.chipFocus = -1
+		m.input.Focus()
 		m.AppendUser(text)
 		if m.handler == nil {
 			return m, nil
 		}
 		return m, m.handler.Submit(text)
 	}
+	previousValue := m.input.Value()
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	if m.input.Value() != previousValue {
+		// Any composer text edit drops a pending Shift+Esc/Ctrl+Y draft,
+		// matching DataTug's own composerUndo reset on input change --
+		// once the user has typed something new, "undo" no longer refers
+		// to a coherent prior state.
+		m.composerUndo = nil
+	}
 	m.commandMenuIndex = 0
 	return m, cmd
 }

@@ -57,8 +57,10 @@ returns to wherever it was before `Shift+Right` (or the input).
 The composer stops accepting keystrokes entirely while `Busy()` is true
 (during `StartStream`, or a product's own `SetBusy(true)` phase such as a
 decision/query lookup); the spinner runs in its place. Esc's priority order
-is: close an open slash-command menu, then cancel if busy, then let a
-focused Block capture it (`EscCapturer`), then the default focus-ring Esc.
+is: close an open slash-command menu, then cancel if busy, then — in the
+input zone — the composer's own two-step clear (text first, then chips; see
+"Attachment chips" below), then let a focused Block capture it
+(`EscCapturer`), then the default focus-ring Esc.
 
 ### Attachment chips (`tui/chatshell`)
 
@@ -66,28 +68,48 @@ focused Block capture it (`EscCapturer`), then the default focus-ring Esc.
 `Chips() []Chip` render a product's attachments as removable pills
 (`"[Label ×]"`) in wrapped rows directly above the input — e.g. DataTug's
 tables/files staged as context for the next turn (ported from
-datatug-cli#291's attachment chips). `Chip{ID, Label string; Ref
-*session.EntityRef}` is product-neutral: `Ref` carries the product's own
-entity identity when the chip has one. The transcript viewport's height
-shrinks by exactly the number of rendered chip rows, and grows back as
-chips are removed, so the layout never overflows.
+datatug-cli#291's attachment chips, matched step for step against DataTug's
+own `TestComposerAttachmentChipsCanBeFocusedClearedAndRestored`). `Chip{ID,
+Label string; Ref *session.EntityRef}` is product-neutral: `Ref` carries the
+product's own entity identity when the chip has one. `RemoveChip(id string)`
+and `ClearChips()` are product-facing equivalents of a focused-chip removal
+and Esc's chip-clear step below, for a product's own UI controls. The
+transcript viewport's height shrinks by exactly the number of rendered chip
+rows, and grows back as chips are removed, so the layout never overflows —
+`historyHeight()` also accounts for the top bar's actual rendered height (a
+product's `WithTopBar` may render more than one line) and the open
+slash-command menu's height, so `View()`'s total rendered height always
+equals the terminal height exactly.
+
+Chatshell keeps a single composer-draft snapshot covering BOTH the
+composer's text and its chip list together (mirroring DataTug's own
+`composerUndo`): the first change to either since the last restore/submit/
+text-edit snapshots both; a run of several changes with nothing resetting
+the snapshot in between undoes as ONE unit.
 
 | Key | Effect |
 |---|---|
 | `Tab`/`Shift+Tab` (chips present) | Cycle chip focus: input → chip 0 → … → last chip → input (reverse for Shift+Tab) |
 | `Left`/`Right` (a chip focused) | Move focus to the adjacent chip, clamped at the first/last |
 | `Backspace`/`Delete` (a chip focused) | Remove the focused chip |
-| `Shift+Esc` | Restore the chip list to how it stood before the most recent run of removals (one unit, not one chip at a time); no-op with nothing to restore |
+| `Ctrl+D` | Remove the LAST chip, regardless of chip focus |
+| `Enter` (a chip focused) | Submit normally, AND reset chip focus to none |
+| `Esc`, 1st press (composer has text) | Clear the composer TEXT ONLY — even while a chip is focused |
+| `Esc`, 2nd press (text already empty) | Detach EVERY chip; a single `Esc` goes straight here when there's no text to begin with |
+| `Shift+Esc` / `Ctrl+Y` | Restore the snapshotted text and chip list as one unit — merged with any chip attached since the snapshot (kept, not discarded); no-op with nothing to restore |
 | Left-click on a chip's `×` (mouse enabled) | Remove that chip; any other click falls through to chatshell's normal unhandled-message path |
 
-All chip interaction is a no-op while there are no chips or while `Busy()`
-is true. Submitting a message (`Enter`) clears any pending Shift+Esc
-snapshot. `chatshell.ChipObserver{ OnChipsChange(chips []Chip) tea.Cmd }` is
-an optional `Handler` capability notified after every chip-list change
-chatshell itself performs (a removal or a Shift+Esc restore) — it is NOT
-called from `WithChips`/`SetChips`, since those calls already come from the
-product, and `SetChips` never clears a pending Shift+Esc snapshot for the
-same reason.
+All chip interaction is a no-op while there are no chips (where a key needs
+one) or while `Busy()` is true. Submitting a message (`Enter`) or editing
+the composer text clears any pending Shift+Esc/Ctrl+Y snapshot.
+`ClearTranscript()` (e.g. a session switch) also drops a pending snapshot
+and clears chip focus, but does NOT itself touch the chip list — that's the
+product's own call via `SetChips`. `chatshell.ChipObserver{
+OnChipsChange(chips []Chip) tea.Cmd }` is an optional `Handler` capability
+notified after every chip-list change chatshell itself performs (a removal,
+`ClearChips`/Esc's chip-clear step, or a restore) — it is NOT called from
+`WithChips`/`SetChips`, since those calls already come from the product, and
+`SetChips` never clears a pending snapshot for the same reason.
 
 ## Result grid (`tui/grid`)
 
