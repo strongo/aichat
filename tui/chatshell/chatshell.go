@@ -2,6 +2,7 @@ package chatshell
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"strings"
 
@@ -13,11 +14,10 @@ import (
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
 	"github.com/strongo/aichat/tui"
+	"github.com/strongo/aichat/tui/focus"
 	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
 	"github.com/strongo/aichat/tui/transcript"
-
-	"github.com/strongo/aichat/tui/focus"
 )
 
 // splitMinWidth is the terminal width at or above which the sidebar renders
@@ -42,6 +42,24 @@ type SidebarObserver interface {
 	OnSidebarChange(refs []session.EntityRef)
 }
 
+// StreamObserver is an optional Handler capability: when implemented,
+// chatshell calls OnStreamEvent for every event a StartStream-driven stream
+// produces (Started/TextDelta/Structured/Usage/Completed/Error), in
+// addition to chatshell's own built-in handling (rendering text deltas,
+// appending non-fatal errors). Its returned tea.Cmd, if any, is batched
+// alongside the stream's own re-arm command.
+type StreamObserver interface {
+	OnStreamEvent(id string, ev ai.Event) tea.Cmd
+}
+
+// MsgHandler is an optional Handler capability: when implemented, chatshell
+// forwards every message it does not itself recognise (e.g. a product
+// message, or a Block message such as grid.RowActivatedMsg) to OnMsg, in
+// addition to broadcasting it to the transcript's Blocks.
+type MsgHandler interface {
+	OnMsg(msg tea.Msg) tea.Cmd
+}
+
 // Option configures a Model at construction time.
 type Option func(*Model)
 
@@ -56,9 +74,15 @@ func WithSidebarRenderer(render sidebar.Renderer) Option {
 }
 
 // WithContext sets the context streamed responses and Handler calls run
-// under (defaults to context.Background()).
+// under (defaults to context.Background()). StartStream derives a
+// cancellable child of it per stream.
 func WithContext(ctx context.Context) Option {
 	return func(m *Model) { m.ctx = ctx }
+}
+
+// WithTitle sets the top-bar title (defaults to "aichat").
+func WithTitle(title string) Option {
+	return func(m *Model) { m.title = title }
 }
 
 // Model is the reusable chat screen.
@@ -75,11 +99,18 @@ type Model struct {
 	commands         []Command
 	commandMenuIndex int
 
+	title  string
 	status string
 	width  int
 	height int
 	busy   bool
 	quit   bool
+
+	// streamID/streamCancel identify and cancel the in-flight StartStream
+	// call, if any. A DoneMsg whose ID does not match streamID is stale (a
+	// superseded stream) and is ignored.
+	streamID     string
+	streamCancel context.CancelFunc
 }
 
 // New returns a chat screen driven by handler.
@@ -99,6 +130,7 @@ func New(handler Handler, opts ...Option) *Model {
 		sidebar:    sidebar.New(nil),
 		focusRing:  focus.New(),
 		spinner:    spinner.New(spinner.WithSpinner(spinner.Dot)),
+		title:      "aichat",
 		width:      80,
 		height:     24,
 	}
@@ -135,10 +167,41 @@ func (m *Model) AppendBlock(block transcript.Block) {
 // it. id must be unique per turn; deltas render progressively into the
 // transcript, and a spinner runs until the first delta (or completion)
 // arrives.
+//
+// The stream runs under a context derived from the Model's context
+// (WithContext), cancelled automatically when a new StartStream call
+// supersedes it, or explicitly by the user (Esc or Ctrl+C while busy). A
+// cancelled stream ends with a "(stopped)" transcript entry, not an error.
 func (m *Model) StartStream(id string, seq iter.Seq2[ai.Event, error]) tea.Cmd {
+	m.cancelStream()
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.streamID, m.streamCancel = id, cancel
 	m.busy = true
 	m.transcript.Append(transcript.Entry{ID: id, Role: transcript.RoleAssistant, Text: ""})
-	return tea.Batch(stream.Start(m.ctx, id, seq), m.spinner.Tick)
+	return tea.Batch(stream.Start(ctx, id, seq), m.spinner.Tick)
+}
+
+// cancelStream cancels the in-flight stream, if any. Its DoneMsg (Err =
+// context.Canceled, or an ai.Error{Code: ai.ErrCodeCanceled} once the ai/
+// provider translates the cancellation) arrives later, as usual.
+func (m *Model) cancelStream() {
+	if m.streamCancel != nil {
+		m.streamCancel()
+	}
+}
+
+// SetBusy marks a product-driven phase that precedes (or stands in for) a
+// stream — e.g. a decision chain or a deterministic query — as in flight:
+// the composer stops accepting input and the spinner runs, exactly as while
+// a stream is in flight. The returned tea.Cmd starts the spinner and must be
+// returned from Update/a command chain when busy is true; it is nil when
+// busy is false.
+func (m *Model) SetBusy(busy bool) tea.Cmd {
+	m.busy = busy
+	if busy {
+		return m.spinner.Tick
+	}
+	return nil
 }
 
 // SetStatus sets the status line text (provider/model/path/usage, etc.).
@@ -166,22 +229,46 @@ func (m *Model) notifySidebarChange() {
 	}
 }
 
-// FocusedRef returns the entity ref under transcript focus, if any (e.g. a
-// grid's highlighted row).
+// FocusedRef returns the entity ref under focus: the transcript's focused
+// block's Current() when the transcript zone has focus, or the sidebar
+// cursor's ref when the sidebar zone has focus. It is nil when the composer
+// has focus, or nothing is under the cursor.
 func (m *Model) FocusedRef() *session.EntityRef {
-	if m.focusRing.Zone() != focus.ZoneTranscript {
+	switch m.focusRing.Zone() {
+	case focus.ZoneTranscript:
+		return m.transcript.Current()
+	case focus.ZoneSidebar:
+		refs := m.sidebar.Refs()
+		cursor := m.sidebar.Cursor()
+		if cursor < 0 || cursor >= len(refs) {
+			return nil
+		}
+		ref := refs[cursor]
+		return &ref
+	default:
 		return nil
 	}
-	return m.transcript.Current()
 }
 
-// SelectionRefs returns the sidebar's pinned refs, the product's working
-// selection.
+// SelectionRefs returns the transcript's current selection: the focused
+// block's entity, when any (a Block may later report more than one, e.g. a
+// grid's multi-selected rows; today this is FocusedRef's single entity).
+// It is distinct from the sidebar's pins — see SidebarRefs.
 func (m *Model) SelectionRefs() []session.EntityRef {
+	if ref := m.transcript.Current(); ref != nil {
+		return []session.EntityRef{*ref}
+	}
+	return nil
+}
+
+// SidebarRefs returns the sidebar's pinned refs, the product's saved
+// working context (distinct from SelectionRefs, the transcript selection).
+func (m *Model) SidebarRefs() []session.EntityRef {
 	return append([]session.EntityRef(nil), m.sidebar.Refs()...)
 }
 
-// Busy reports whether a stream is in flight.
+// Busy reports whether a stream, or a product SetBusy(true) phase, is in
+// flight.
 func (m *Model) Busy() bool { return m.busy }
 
 // --- tea.Model -----------------------------------------------------------
@@ -193,7 +280,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resize()
-		return m, nil
+		cmd := m.transcript.Update(msg)
+		return m, cmd
 
 	case tui.AddToSidebarMsg:
 		m.PinToSidebar(msg.Ref)
@@ -210,11 +298,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleStreamEvent(msg)
 
 	case stream.DoneMsg:
-		m.busy = false
-		if msg.Err != nil {
-			m.AppendSystem("error: " + msg.Err.Error())
-		}
-		return m, nil
+		return m.handleStreamDone(msg)
 
 	case spinner.TickMsg:
 		if !m.busy {
@@ -226,8 +310,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
+
+	default:
+		return m, m.dispatchUnhandled(msg)
 	}
-	return m, nil
+}
+
+// dispatchUnhandled forwards a message chatshell does not itself recognise
+// to the transcript (so a focused or targeted Block can react, e.g. a
+// window resize) and to an optional MsgHandler (e.g. for a product message
+// such as grid.RowActivatedMsg).
+func (m *Model) dispatchUnhandled(msg tea.Msg) tea.Cmd {
+	var cmds []tea.Cmd
+	if cmd := m.transcript.Update(msg); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	if h, ok := m.handler.(MsgHandler); ok {
+		if cmd := h.OnMsg(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m *Model) handleStreamEvent(msg stream.EventMsg) (tea.Model, tea.Cmd) {
@@ -235,11 +341,49 @@ func (m *Model) handleStreamEvent(msg stream.EventMsg) (tea.Model, tea.Cmd) {
 	case ai.EventTextDelta:
 		m.transcript.AppendDelta(msg.ID, msg.Event.Text)
 	case ai.EventError:
+		// Per the event contract, EventError with a nil Go error (this path
+		// — a fatal error arrives as a DoneMsg instead, see
+		// handleStreamDone) is non-fatal: report it but keep streaming.
 		if msg.Event.Error != nil {
 			m.AppendSystem("error: " + msg.Event.Error.Message)
 		}
 	}
-	return m, msg.Next
+	cmds := []tea.Cmd{msg.Next}
+	if obs, ok := m.handler.(StreamObserver); ok {
+		if cmd := obs.OnStreamEvent(msg.ID, msg.Event); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) handleStreamDone(msg stream.DoneMsg) (tea.Model, tea.Cmd) {
+	if msg.ID != m.streamID {
+		return m, nil // stale Done from a superseded/cancelled stream
+	}
+	m.busy = false
+	m.streamCancel = nil
+	switch {
+	case isCanceled(msg.Err):
+		m.AppendSystem("(stopped)")
+	case msg.Err != nil:
+		m.AppendSystem("error: " + msg.Err.Error())
+	}
+	return m, nil
+}
+
+// isCanceled reports whether err represents a user-initiated cancellation:
+// either tui/stream's own ctx.Done() race (context.Canceled) or, once the
+// ai/ provider has translated it, ai.Error{Code: ai.ErrCodeCanceled}.
+func isCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	var aerr *ai.Error
+	return errors.As(err, &aerr) && aerr.Code == ai.ErrCodeCanceled
 }
 
 func (m *Model) resize() {
@@ -281,14 +425,33 @@ func (m *Model) statusLines() []string {
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
+		if m.busy {
+			m.cancelStream()
+			return m, nil
+		}
 		m.quit = true
 		return m, tea.Quit
 	case "esc":
+		if m.busy {
+			m.cancelStream()
+			return m, nil
+		}
+		if m.focusRing.Zone() == focus.ZoneTranscript && m.transcript.CapturesEsc() {
+			cmd := m.transcript.Update(msg)
+			return m, cmd
+		}
 		m.focusRing.Esc()
 		m.syncFocus()
 		return m, nil
 	case "f6":
 		m.sidebar.Toggle()
+		if !m.sidebar.Visible() && m.focusRing.Zone() == focus.ZoneSidebar {
+			// Hiding the sidebar while it holds focus returns focus to
+			// wherever it was before Shift+Right (or the input, if there is
+			// nowhere to return to).
+			m.focusRing.ShiftLeft(m.transcript.Stops())
+			m.syncFocus()
+		}
 		m.resize()
 		return m, nil
 	case "ctrl+left", "ctrl+right":
@@ -300,28 +463,31 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.resize()
 		return m, nil
 	case "shift+up":
-		if !m.busy && m.focusRing.Zone() == focus.ZoneInput && strings.TrimSpace(m.input.Value()) != "" {
-			break
+		if m.focusRing.Zone() == focus.ZoneInput && strings.TrimSpace(m.input.Value()) != "" {
+			break // let the composer handle cursor movement instead
 		}
 		if m.focusRing.ShiftUp(m.transcript.Stops()) {
 			m.syncFocus()
+			return m, nil
 		}
-		return m, nil
 	case "shift+down":
 		if m.focusRing.ShiftDown(m.transcript.Stops()) {
 			m.syncFocus()
+			return m, nil
 		}
-		return m, nil
 	case "shift+right":
 		if m.splitEnabled() && m.focusRing.ShiftRight() {
 			m.syncFocus()
+			return m, nil
 		}
-		return m, nil
 	case "shift+left":
-		if m.focusRing.ShiftLeft() {
+		if m.focusRing.ShiftLeft(m.transcript.Stops()) {
 			m.syncFocus()
+			return m, nil
 		}
-		return m, nil
+		// Nothing to return to (not in the sidebar): fall through so the
+		// key reaches the composer/transcript/sidebar normally instead of
+		// being silently swallowed.
 	}
 
 	switch m.focusRing.Zone() {
@@ -351,6 +517,12 @@ func (m *Model) syncFocus() {
 }
 
 func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.busy {
+		// The composer is disabled while busy (StartStream or a product
+		// SetBusy(true) phase); Esc/Ctrl+C-to-cancel is handled earlier, in
+		// handleKey, before we ever reach here.
+		return m, nil
+	}
 	if matches := m.commandMenuMatches(); len(matches) > 0 {
 		switch msg.String() {
 		case "up":
@@ -376,7 +548,7 @@ func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		text := strings.TrimSpace(m.input.Value())
-		if text == "" || m.busy {
+		if text == "" {
 			return m, nil
 		}
 		m.input.Reset()
@@ -408,7 +580,7 @@ func (m *Model) commandMenuMatches() []Command {
 }
 
 func (m *Model) View() tea.View {
-	top := lipgloss.NewStyle().Bold(true).Render("aichat")
+	top := lipgloss.NewStyle().Bold(true).Render(m.title)
 	history := m.transcript.View()
 	if m.busy {
 		history += "\n" + m.spinner.View() + " thinking…"

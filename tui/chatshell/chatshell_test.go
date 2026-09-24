@@ -13,12 +13,16 @@ import (
 	"github.com/strongo/aichat/tui"
 	"github.com/strongo/aichat/tui/focus"
 	"github.com/strongo/aichat/tui/sidebar"
+	"github.com/strongo/aichat/tui/stream"
+	"github.com/strongo/aichat/tui/transcript"
 )
 
 type fakeHandler struct {
 	submitted    []string
 	sidebarSeen  [][]session.EntityRef
 	submitResult tea.Cmd
+	streamEvents []ai.Event
+	msgsSeen     []tea.Msg
 }
 
 func (h *fakeHandler) Submit(text string) tea.Cmd {
@@ -29,6 +33,36 @@ func (h *fakeHandler) Submit(text string) tea.Cmd {
 func (h *fakeHandler) OnSidebarChange(refs []session.EntityRef) {
 	h.sidebarSeen = append(h.sidebarSeen, append([]session.EntityRef(nil), refs...))
 }
+
+func (h *fakeHandler) OnStreamEvent(id string, ev ai.Event) tea.Cmd {
+	h.streamEvents = append(h.streamEvents, ev)
+	return nil
+}
+
+func (h *fakeHandler) OnMsg(msg tea.Msg) tea.Cmd {
+	h.msgsSeen = append(h.msgsSeen, msg)
+	return nil
+}
+
+// fakeBlock is a minimal transcript.Block used to test focus/Esc/update
+// routing without depending on tui/grid (owned by another concurrent lane).
+type fakeBlock struct {
+	updates   int
+	captures  bool
+	lastEvent tea.Msg
+}
+
+func (b *fakeBlock) View(width int, focused bool) string { return "block" }
+
+func (b *fakeBlock) Update(msg tea.Msg) (transcript.Block, tea.Cmd) {
+	b.updates++
+	b.lastEvent = msg
+	return b, nil
+}
+
+func (b *fakeBlock) Focusable() bool { return true }
+
+func (b *fakeBlock) CapturesEsc() bool { return b.captures }
 
 func newTestShell(handler Handler) *Model {
 	m := New(handler)
@@ -169,8 +203,8 @@ func TestAddToSidebarMsgPinsAndNotifiesHandler(t *testing.T) {
 	m := newTestShell(h)
 	ref := session.EntityRef{Type: "row", Keys: map[string]string{"id": "1"}}
 	m.Update(tui.AddToSidebarMsg{Ref: ref})
-	if len(m.SelectionRefs()) != 1 {
-		t.Fatalf("sidebar refs = %v", m.SelectionRefs())
+	if len(m.SidebarRefs()) != 1 {
+		t.Fatalf("sidebar refs = %v", m.SidebarRefs())
 	}
 	if len(h.sidebarSeen) != 1 {
 		t.Fatalf("handler not notified: %v", h.sidebarSeen)
@@ -287,8 +321,8 @@ func TestUnpinFromSidebar(t *testing.T) {
 	m.PinToSidebar(ref)
 	h.sidebarSeen = nil
 	m.UnpinFromSidebar(ref)
-	if len(m.SelectionRefs()) != 0 {
-		t.Fatalf("refs = %v", m.SelectionRefs())
+	if len(m.SidebarRefs()) != 0 {
+		t.Fatalf("refs = %v", m.SidebarRefs())
 	}
 	if len(h.sidebarSeen) != 1 {
 		t.Fatal("handler not notified on unpin")
@@ -361,4 +395,244 @@ func TestSlashCommandMenuInsertsOnEnter(t *testing.T) {
 	if len(h.submitted) != 0 {
 		t.Fatal("Enter on menu should not submit")
 	}
+}
+
+// --- M5/M9 fix-round tests -------------------------------------------------
+
+func TestEscWhileBusyCancelsStreamAndRendersStopped(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	block := make(chan struct{})
+	seq := func(yield func(ai.Event, error) bool) {
+		if !yield(ai.Event{Type: ai.EventStarted}, nil) {
+			return
+		}
+		<-block // blocks until the derived ctx is cancelled by Esc
+	}
+	cmd := m.StartStream("turn-1", seq)
+	if !m.Busy() {
+		t.Fatal("StartStream did not set busy")
+	}
+	// Drain only the first message (EventStarted); the pump then blocks on
+	// the second yield until cancelled.
+	msg := firstFromBatch(t, cmd)
+	_, next := m.Update(msg)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	drainCmd(t, m, next, 20)
+	close(block)
+	if m.Busy() {
+		t.Fatal("still busy after cancellation")
+	}
+	found := false
+	for _, e := range m.transcript.Entries() {
+		if strings.Contains(e.Text, "(stopped)") {
+			found = true
+		}
+		if strings.Contains(e.Text, "context canceled") {
+			t.Fatalf("cancellation rendered as an error, not (stopped): %+v", e)
+		}
+	}
+	if !found {
+		t.Fatalf("no (stopped) entry in transcript: %+v", m.transcript.Entries())
+	}
+}
+
+func TestCtrlCWhileBusyCancelsStreamInsteadOfQuitting(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.busy = true
+	m.streamID = "turn-1"
+	cancelled := false
+	m.streamCancel = func() { cancelled = true }
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if !cancelled {
+		t.Fatal("Ctrl+C while busy did not cancel the stream")
+	}
+	if cmd != nil {
+		t.Fatal("Ctrl+C while busy should not quit")
+	}
+	if m.quit {
+		t.Fatal("quit flag set while busy")
+	}
+}
+
+func TestCtrlCWhenNotBusyStillQuits(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd == nil || !m.quit {
+		t.Fatal("Ctrl+C when idle should quit")
+	}
+}
+
+func TestStreamObserverReceivesEveryEvent(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventTextDelta, Text: "hi"},
+		{Type: ai.EventUsage},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStream("turn-1", seqOf(events...))
+	drainCmd(t, m, cmd, 20)
+	if len(h.streamEvents) != len(events) {
+		t.Fatalf("observer saw %d events, want %d: %+v", len(h.streamEvents), len(events), h.streamEvents)
+	}
+	for i, ev := range events {
+		if h.streamEvents[i].Type != ev.Type {
+			t.Errorf("event %d type = %v, want %v", i, h.streamEvents[i].Type, ev.Type)
+		}
+	}
+}
+
+func TestSetBusyGatesInputAndStartsSpinner(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	cmd := m.SetBusy(true)
+	if cmd == nil {
+		t.Fatal("SetBusy(true) should return a spinner-tick command")
+	}
+	if !m.Busy() {
+		t.Fatal("Busy() should be true")
+	}
+	m.input.SetValue("")
+	m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	if m.input.Value() != "" {
+		t.Fatalf("input accepted a keystroke while busy: %q", m.input.Value())
+	}
+	if cmd := m.SetBusy(false); cmd != nil {
+		t.Fatal("SetBusy(false) should not return a command")
+	}
+	if m.Busy() {
+		t.Fatal("Busy() should be false")
+	}
+	m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	if m.input.Value() != "x" {
+		t.Fatalf("input did not accept a keystroke once idle: %q", m.input.Value())
+	}
+}
+
+func TestF6HidingFocusedSidebarReturnsFocus(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift}) // focus sidebar
+	if m.focusRing.Zone() != focus.ZoneSidebar {
+		t.Fatalf("zone = %v, want sidebar", m.focusRing.Zone())
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	if m.sidebar.Visible() {
+		t.Fatal("sidebar should be hidden after F6")
+	}
+	if m.focusRing.Zone() == focus.ZoneSidebar {
+		t.Fatal("focus should have moved off the hidden sidebar")
+	}
+}
+
+func TestEscReachesCapturingBlockBeforeGlobalEsc(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	blk := &fakeBlock{captures: true}
+	m.AppendBlock(blk)
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if blk.updates != 1 {
+		t.Fatalf("capturing block did not receive Esc: updates=%d", blk.updates)
+	}
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		t.Fatalf("zone = %v, want transcript (Esc should not have returned to input)", m.focusRing.Zone())
+	}
+}
+
+func TestEscReturnsToInputWhenBlockDoesNotCaptureIt(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	blk := &fakeBlock{captures: false}
+	m.AppendBlock(blk)
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if blk.updates != 0 {
+		t.Fatal("non-capturing block should not receive Esc")
+	}
+	if m.focusRing.Zone() != focus.ZoneInput {
+		t.Fatalf("zone = %v, want input", m.focusRing.Zone())
+	}
+}
+
+func TestShiftLeftInTranscriptFallsThroughInsteadOfSwallowed(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	blk := &fakeBlock{}
+	m.AppendBlock(blk)
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModShift})
+	if blk.updates != 1 {
+		t.Fatalf("Shift+Left was swallowed instead of reaching the focused block: updates=%d", blk.updates)
+	}
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		t.Fatalf("zone changed to %v; Shift+Left with nothing to return to should not move focus", m.focusRing.Zone())
+	}
+}
+
+func TestSelectionRefsIsTranscriptNotSidebar(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.PinToSidebar(session.EntityRef{Type: "t", Keys: map[string]string{"id": "sidebar-1"}})
+	if refs := m.SelectionRefs(); len(refs) != 0 {
+		t.Fatalf("SelectionRefs should ignore sidebar pins: %v", refs)
+	}
+	if refs := m.SidebarRefs(); len(refs) != 1 {
+		t.Fatalf("SidebarRefs = %v, want 1 pin", refs)
+	}
+}
+
+func TestFocusedRefFromSidebarCursor(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ref := session.EntityRef{Type: "t", Keys: map[string]string{"id": "1"}, Title: "One"}
+	m.PinToSidebar(ref)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift}) // -> sidebar
+	if m.focusRing.Zone() != focus.ZoneSidebar {
+		t.Fatalf("zone = %v, want sidebar", m.focusRing.Zone())
+	}
+	got := m.FocusedRef()
+	if got == nil || !got.Same(ref) {
+		t.Fatalf("FocusedRef() = %v, want %v", got, ref)
+	}
+}
+
+func TestWithTitleSetsTopBar(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithTitle("datatug chat"))
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	if !strings.Contains(m.View().Content, "datatug chat") {
+		t.Fatal("View() does not contain the configured title")
+	}
+}
+
+// firstFromBatch runs cmd and, if it produces a tea.BatchMsg, returns the
+// first EventMsg/DoneMsg found in it (chatshell's spinner tick and the
+// stream's own first message race inside one Batch).
+func firstFromBatch(t *testing.T, cmd tea.Cmd) tea.Msg {
+	t.Helper()
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		return msg
+	}
+	for _, sub := range batch {
+		if sub == nil {
+			continue
+		}
+		m := sub()
+		switch m.(type) {
+		case stream.EventMsg, stream.DoneMsg:
+			return m
+		}
+	}
+	t.Fatal("no stream message found in batch")
+	return nil
 }

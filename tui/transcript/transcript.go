@@ -41,10 +41,31 @@ type EntityBlock interface {
 	Current() *session.EntityRef
 }
 
+// EscCapturer is an optional Block capability: when a focused block is in an
+// input-like mode of its own (e.g. a grid's "/" filter box has focus), it
+// returns true so Esc reaches the block (via Update) instead of chatshell's
+// global "return focus to the composer" handling.
+type EscCapturer interface {
+	CapturesEsc() bool
+}
+
+// Targeted is an optional message capability: when a non-key message
+// implements it, Model.Update forwards the message only to the entry whose
+// ID matches TargetEntryID, instead of broadcasting it to every Block.
+type Targeted interface {
+	TargetEntryID() string
+}
+
+// MarkdownRenderer renders markdown text to terminal-safe output at width.
+// Entries with Markdown set use it when the Model was built WithMarkdownRenderer;
+// otherwise Markdown is inert and the entry renders as plain text.
+type MarkdownRenderer func(text string, width int) string
+
 // Entry is one transcript item.
 type Entry struct {
-	// ID identifies a streaming assistant entry for AppendDelta. Products
-	// that never stream can leave it empty.
+	// ID identifies a streaming assistant entry for AppendDelta, and is the
+	// target of Targeted messages. Products that never stream and never
+	// target messages by entry can leave it empty.
 	ID       string
 	Role     Role
 	Text     string
@@ -52,6 +73,14 @@ type Entry struct {
 	// Block, when set, is rendered instead of Text and receives key events
 	// while focused.
 	Block Block
+
+	// render caches this entry's last-rendered view so AppendDelta on one
+	// streaming entry does not re-render the whole transcript; it is
+	// invalidated on content change, width change or focus change.
+	renderValid   bool
+	renderWidth   int
+	renderFocused bool
+	renderOut     string
 }
 
 func (e Entry) focusable() bool {
@@ -59,6 +88,14 @@ func (e Entry) focusable() bool {
 		return e.Block.Focusable()
 	}
 	return e.Role == RoleUser
+}
+
+// Option configures a Model at construction time.
+type Option func(*Model)
+
+// WithMarkdownRenderer sets the renderer used for entries with Markdown set.
+func WithMarkdownRenderer(r MarkdownRenderer) Option {
+	return func(m *Model) { m.markdownRenderer = r }
 }
 
 // Model is the transcript viewport: an ordered list of Entry plus a
@@ -71,12 +108,17 @@ type Model struct {
 	height   int
 	// focusIndex is the focused stop (an index into the focusable subset of
 	// entries, in transcript order), or -1 when nothing is focused.
-	focusIndex int
+	focusIndex       int
+	markdownRenderer MarkdownRenderer
 }
 
 // New returns an empty, unfocused transcript.
-func New() *Model {
-	return &Model{viewport: viewport.New(), focusIndex: -1}
+func New(opts ...Option) *Model {
+	m := &Model{viewport: viewport.New(), focusIndex: -1}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // SetSize resizes the viewport and re-renders.
@@ -84,31 +126,44 @@ func (m *Model) SetSize(width, height int) {
 	m.width, m.height = max(1, width), max(1, height)
 	m.viewport.SetWidth(m.width)
 	m.viewport.SetHeight(m.height)
-	m.Rebuild(false)
+	m.Rebuild(m.shouldAutoFollow())
 }
 
 // Entries returns the current entries (read-only use expected).
 func (m *Model) Entries() []Entry { return m.entries }
 
-// Append adds a new entry to the end of the transcript.
+// Append adds a new entry to the end of the transcript. It scrolls to the
+// bottom only when the transcript is unfocused or was already at the
+// bottom, so focusing an earlier stop to read it is not disturbed by new
+// content arriving.
 func (m *Model) Append(e Entry) {
 	m.entries = append(m.entries, e)
-	m.Rebuild(true)
+	m.Rebuild(m.shouldAutoFollow())
 }
 
 // AppendDelta appends text to the streaming entry identified by id, creating
 // it (as an assistant entry) on first use. It is the transcript half of
 // tui/stream's channel re-arm pattern: each EventMsg's text delta lands here.
+// Only the streaming entry's cached render is invalidated; the rest of the
+// transcript is reused as-is.
 func (m *Model) AppendDelta(id, text string) {
 	for i := range m.entries {
 		if m.entries[i].ID != "" && m.entries[i].ID == id {
 			m.entries[i].Text += text
-			m.Rebuild(true)
+			m.entries[i].renderValid = false
+			m.Rebuild(m.shouldAutoFollow())
 			return
 		}
 	}
 	m.entries = append(m.entries, Entry{ID: id, Role: RoleAssistant, Text: text})
-	m.Rebuild(true)
+	m.Rebuild(m.shouldAutoFollow())
+}
+
+// shouldAutoFollow reports whether new content should scroll the viewport to
+// the bottom: when nothing in the transcript is focused (focus is on the
+// composer or sidebar) or the viewport was already scrolled to the bottom.
+func (m *Model) shouldAutoFollow() bool {
+	return m.focusIndex < 0 || m.viewport.AtBottom()
 }
 
 // Stops returns the number of focusable entries.
@@ -151,6 +206,28 @@ func (m *Model) Blur() {
 	m.Rebuild(false)
 }
 
+// FocusedBlock returns the Block under focus, or nil.
+func (m *Model) FocusedBlock() Block {
+	e := m.FocusedEntry()
+	if e == nil {
+		return nil
+	}
+	return e.Block
+}
+
+// CapturesEsc reports whether the focused Block wants Esc routed to it
+// (via Update) instead of chatshell's global "return to composer" handling.
+func (m *Model) CapturesEsc() bool {
+	blk := m.FocusedBlock()
+	if blk == nil {
+		return false
+	}
+	if ec, ok := blk.(EscCapturer); ok {
+		return ec.CapturesEsc()
+	}
+	return false
+}
+
 // FocusedEntry returns the currently focused entry, or nil.
 func (m *Model) FocusedEntry() *Entry {
 	i := m.entryIndexForStop(m.focusIndex)
@@ -173,16 +250,50 @@ func (m *Model) Current() *session.EntityRef {
 	return nil
 }
 
-// Update routes msg to the focused entry's Block, when any, and re-renders.
+// Update routes msg. Key presses go only to the focused entry's Block, when
+// any. Every other message (e.g. a window resize, or a product message) is
+// broadcast to every Block, unless it implements Targeted, in which case it
+// is forwarded only to the entry with the matching ID.
 func (m *Model) Update(msg tea.Msg) tea.Cmd {
+	if _, isKey := msg.(tea.KeyPressMsg); !isKey {
+		return m.broadcast(msg)
+	}
 	idx := m.entryIndexForStop(m.focusIndex)
 	if idx < 0 || m.entries[idx].Block == nil {
 		return nil
 	}
 	blk, cmd := m.entries[idx].Block.Update(msg)
 	m.entries[idx].Block = blk
+	m.entries[idx].renderValid = false
 	m.Rebuild(false)
 	return cmd
+}
+
+func (m *Model) broadcast(msg tea.Msg) tea.Cmd {
+	targetID, targeted := "", false
+	if t, ok := msg.(Targeted); ok {
+		targetID, targeted = t.TargetEntryID(), true
+	}
+	var cmds []tea.Cmd
+	for i := range m.entries {
+		if m.entries[i].Block == nil {
+			continue
+		}
+		if targeted && m.entries[i].ID != targetID {
+			continue
+		}
+		blk, cmd := m.entries[i].Block.Update(msg)
+		m.entries[i].Block = blk
+		m.entries[i].renderValid = false
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	m.Rebuild(m.shouldAutoFollow())
+	return tea.Batch(cmds...)
 }
 
 // ScrollUp/ScrollDown pass through to the viewport for plain scrolling
@@ -193,13 +304,16 @@ func (m *Model) ScrollDown(lines int) { m.viewport.SetYOffset(m.viewport.YOffset
 // Rebuild re-renders every entry into the viewport's content and, when an
 // entry is focused, scrolls it into view (ensureBlockVisible). It mirrors
 // DataTug's rebuildHistory/ensureBlockVisible in pkg/chat/ui.go, generalised
-// away from DataTug-specific entry kinds.
+// away from DataTug-specific entry kinds. Per-entry views are cached
+// (Entry.renderOut) and only recomputed when the entry's content changed
+// (renderValid cleared) or its width/focused state differs from the cache.
 func (m *Model) Rebuild(scrollToBottom bool) {
 	width := max(1, m.width)
 	blocks := make([]string, 0, len(m.entries))
 	activeBlock := -1
 	stop := -1
-	for _, e := range m.entries {
+	for i := range m.entries {
+		e := &m.entries[i]
 		focused := false
 		if e.focusable() {
 			stop++
@@ -208,14 +322,23 @@ func (m *Model) Rebuild(scrollToBottom bool) {
 				activeBlock = len(blocks)
 			}
 		}
+		if e.renderValid && e.renderWidth == width && e.renderFocused == focused {
+			blocks = append(blocks, e.renderOut)
+			continue
+		}
+		var out string
 		switch {
 		case e.Block != nil:
-			blocks = append(blocks, e.Block.View(width, focused))
+			out = e.Block.View(width, focused)
 		case e.Role == RoleUser:
-			blocks = append(blocks, userCardView(e.Text, width, focused))
+			out = userCardView(e.Text, width, focused)
+		case e.Markdown && m.markdownRenderer != nil:
+			out = m.markdownRenderer(e.Text, width)
 		default:
-			blocks = append(blocks, plainMessageView(e.Role, e.Text, width))
+			out = plainMessageView(e.Role, e.Text, width)
 		}
+		e.renderOut, e.renderWidth, e.renderFocused, e.renderValid = out, width, focused, true
+		blocks = append(blocks, out)
 	}
 	m.viewport.SetContent(strings.Join(blocks, "\n\n"))
 	if scrollToBottom {

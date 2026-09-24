@@ -108,10 +108,41 @@ an entity there directly.
 `tui/chatshell` adds every pinned/removed ref to `Handler.OnSidebarChange`
 when the product's `Handler` implements it (`chatshell.SidebarObserver`).
 
+`Model.SelectionRefs()` and `Model.SidebarRefs()` are distinct: `SelectionRefs`
+is the **transcript** selection (the focused Block's `Current()`), while
+`SidebarRefs` is the sidebar's pins. `Model.FocusedRef()` follows whichever
+zone has focus — the transcript's `Current()`, or the sidebar cursor's ref
+when the sidebar zone is focused — and is nil from the composer.
+
 ## Streaming (`tui/stream`)
 
 `stream.Start(ctx, id, seq)` pumps an `ai.LLMProvider.Stream` result into
-`stream.EventMsg`/`stream.DoneMsg` without buffering the response.
+`stream.EventMsg`/`stream.DoneMsg` without buffering the response, per the
+event contract: a fatal error is exactly one final yield
+`(ai.Event{Type: EventError, Error: e}, e)` (arrives as `DoneMsg{Err: e}`,
+not an `EventMsg`); `EventError` with a nil Go error is non-fatal (arrives as
+an `EventMsg`, and the stream continues); a user-initiated cancellation
+surfaces as `ai.ErrCodeCanceled` once the `ai/` provider has translated it,
+or as `context.Canceled` from tui/stream's own ctx-race before that.
+
 `chatshell.Model.StartStream` wires this into the transcript: text deltas
 append progressively to the streaming entry, and a spinner runs until the
-stream produces its first delta or completes.
+stream produces its first delta or completes. It derives a cancellable
+context per stream `id`; `Esc`/`Ctrl+C` while busy cancels it, and the
+cancellation renders as a `(stopped)` transcript entry rather than an error
+(`chatshell.isCanceled` recognises both forms above). A superseded stream's
+late `DoneMsg` (a stale `id`) is ignored.
+
+An optional `chatshell.StreamObserver` (`OnStreamEvent(id string, ev
+ai.Event) tea.Cmd`) on the product's `Handler` receives every event
+(Started/TextDelta/Structured/Usage/Completed/Error) in addition to
+chatshell's own built-in handling — e.g. to track usage or diagnostics.
+`Model.SetBusy(bool) tea.Cmd` marks a product-driven pre-stream phase (a
+decision chain, a deterministic query) busy the same way: composer disabled,
+spinner running.
+
+An optional `chatshell.MsgHandler` (`OnMsg(msg tea.Msg) tea.Cmd`) receives
+every message chatshell does not itself recognise — e.g. a product message,
+or a Block message such as `grid.RowActivatedMsg` — in addition to that
+message being broadcast to the transcript's Blocks (see `transcript.Targeted`
+for routing a message to one entry by ID instead of every Block).

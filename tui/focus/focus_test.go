@@ -87,7 +87,7 @@ func TestShiftRightAndLeftRoundTripFromTranscript(t *testing.T) {
 	if r.Zone() != ZoneSidebar {
 		t.Fatalf("zone = %v, want sidebar", r.Zone())
 	}
-	if !r.ShiftLeft() {
+	if !r.ShiftLeft(3) {
 		t.Fatal("ShiftLeft did not move")
 	}
 	if r.Zone() != ZoneTranscript || r.Stop() != 1 {
@@ -98,9 +98,34 @@ func TestShiftRightAndLeftRoundTripFromTranscript(t *testing.T) {
 func TestShiftRightAndLeftRoundTripFromInput(t *testing.T) {
 	r := New()
 	r.ShiftRight()
-	r.ShiftLeft()
+	r.ShiftLeft(0)
 	if r.Zone() != ZoneInput {
 		t.Fatalf("zone = %v, want input", r.Zone())
+	}
+}
+
+func TestShiftLeftClampsReturnStopToCurrentStops(t *testing.T) {
+	r := New()
+	r.FocusStop(4) // e.g. focus on stop 4 of what was a 5-stop transcript
+	r.ShiftRight()
+	// The transcript shrank to 2 stops (0,1) while the sidebar had focus.
+	if !r.ShiftLeft(2) {
+		t.Fatal("ShiftLeft did not move")
+	}
+	if r.Zone() != ZoneTranscript || r.Stop() != 1 {
+		t.Fatalf("zone=%v stop=%d, want transcript/1 (clamped)", r.Zone(), r.Stop())
+	}
+}
+
+func TestShiftLeftClampsToInputWhenNoStopsRemain(t *testing.T) {
+	r := New()
+	r.FocusStop(2)
+	r.ShiftRight()
+	if !r.ShiftLeft(0) {
+		t.Fatal("ShiftLeft did not move")
+	}
+	if r.Zone() != ZoneInput {
+		t.Fatalf("zone = %v, want input (no stops left)", r.Zone())
 	}
 }
 
@@ -118,7 +143,7 @@ func TestShiftRightTwiceIsNoop(t *testing.T) {
 
 func TestShiftLeftFromNonSidebarIsNoop(t *testing.T) {
 	r := New()
-	if moved := r.ShiftLeft(); moved {
+	if moved := r.ShiftLeft(0); moved {
 		t.Fatal("ShiftLeft from input moved")
 	}
 }

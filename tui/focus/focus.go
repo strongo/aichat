@@ -153,13 +153,24 @@ func (r *Ring) ShiftRight() bool {
 }
 
 // ShiftLeft implements Shift+Left: returns focus from the sidebar to where
-// it was before ShiftRight. It reports whether focus moved.
-func (r *Ring) ShiftLeft() bool {
+// it was before ShiftRight. stops is the CURRENT number of focusable
+// transcript entries: when the remembered zone was Transcript and its stop
+// no longer exists (entries were removed while the sidebar had focus), the
+// returned stop is clamped to the last valid one, or to Input when there are
+// no stops left at all. It reports whether focus moved.
+func (r *Ring) ShiftLeft(stops int) bool {
 	if r.zone != ZoneSidebar {
 		return false
 	}
 	r.zone = r.returnZone
 	r.stop = r.returnStop
+	if r.zone == ZoneTranscript {
+		if stops <= 0 {
+			r.zone, r.stop = ZoneInput, -1
+		} else if r.stop >= stops {
+			r.stop = stops - 1
+		}
+	}
 	return true
 }
 
