@@ -20,6 +20,11 @@ type Role string
 const (
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
+	// RoleTool carries ToolResults answering a prior assistant ToolCalls
+	// message. Adapters translate it to whatever the provider needs (e.g.
+	// Anthropic user messages with tool_result blocks, OpenAI-compatible
+	// role:"tool" messages).
+	RoleTool Role = "tool"
 )
 
 // Message is one conversation turn. The system prompt and context travel
@@ -28,6 +33,35 @@ const (
 type Message struct {
 	Role Role   `json:"role"`
 	Text string `json:"text"`
+	// ToolCalls is set on an assistant message that invoked tools.
+	ToolCalls []ToolCall `json:"toolCalls,omitempty"`
+	// ToolResults is set on a RoleTool message answering prior ToolCalls.
+	ToolResults []ToolResult `json:"toolResults,omitempty"`
+}
+
+// Tool is a function the model may call. Schema is the JSON Schema of the
+// arguments object (not the whole tool envelope).
+type Tool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Schema      json.RawMessage `json:"schema"`
+}
+
+// ToolCall is one invocation the model asked for, with its arguments already
+// assembled from any streamed deltas.
+type ToolCall struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+// ToolResult answers a ToolCall by CallID. Content is provider-facing text
+// (JSON-encode structured results yourself); IsError marks a tool-level
+// failure (as opposed to an infrastructure failure, which aborts the run).
+type ToolResult struct {
+	CallID  string `json:"callId"`
+	Content string `json:"content"`
+	IsError bool   `json:"isError,omitempty"`
 }
 
 // ContextKind separates stable context (instructions, schemas, skills,
@@ -85,7 +119,31 @@ type ChatRequest struct {
 	// Metadata is opaque key/value data forwarded to the cloud for diagnostics
 	// (e.g. "path": "llm-fallback"). Never put secrets or user content here.
 	Metadata map[string]string `json:"metadata,omitempty"`
+	// Tools the model may call this turn.
+	Tools []Tool `json:"tools,omitempty"`
+	// ToolChoice: "" (adapter default) | "auto" | "none" | "required" | a
+	// specific tool name.
+	ToolChoice string `json:"toolChoice,omitempty"`
+	// Reasoning requests extended/deliberate reasoning where the provider
+	// supports it: "" | "low" | "medium" | "high". Adapters map it to their
+	// own knob (OpenAI-compatible reasoning_effort, Anthropic extended
+	// thinking budget) and ignore it where unsupported.
+	Reasoning string `json:"reasoning,omitempty"`
 }
+
+// ToolChoice values for ChatRequest.ToolChoice.
+const (
+	ToolChoiceAuto     = "auto"
+	ToolChoiceNone     = "none"
+	ToolChoiceRequired = "required"
+)
+
+// Reasoning effort levels for ChatRequest.Reasoning.
+const (
+	ReasoningLow    = "low"
+	ReasoningMedium = "medium"
+	ReasoningHigh   = "high"
+)
 
 // EventType names a normalised stream event. The string values are also the
 // SSE event names of the cloud protocol (see package cloudproto).
@@ -98,6 +156,20 @@ const (
 	EventUsage      EventType = "usage"
 	EventError      EventType = "error"
 	EventCompleted  EventType = "response.completed"
+	// EventToolCall is emitted once per call, fully assembled (adapters buffer
+	// streamed argument deltas), before the terminal EventCompleted of that
+	// response.
+	EventToolCall EventType = "tool.call"
+	// EventToolResult is emitted only by ai/agent as it feeds tool results
+	// back into the loop; adapters never emit it.
+	EventToolResult EventType = "tool.result"
+)
+
+// StopReason values for Event.StopReason on EventCompleted.
+const (
+	StopReasonToolCalls = "tool_calls"
+	StopReasonEnd       = "end"
+	StopReasonLength    = "length"
 )
 
 // Event is one normalised stream event. Exactly the fields relevant to Type
@@ -116,6 +188,12 @@ type Event struct {
 	Usage *Usage `json:"usage,omitempty"`
 	// Error: a terminal or non-terminal provider error.
 	Error *Error `json:"error,omitempty"`
+	// ToolCall: set on EventToolCall, one fully-assembled call.
+	ToolCall *ToolCall `json:"toolCall,omitempty"`
+	// ToolResult: set on EventToolResult (ai/agent only).
+	ToolResult *ToolResult `json:"toolResult,omitempty"`
+	// StopReason: set on EventCompleted; "tool_calls" | "end" | "length".
+	StopReason string `json:"stopReason,omitempty"`
 }
 
 // Usage is token and allowance accounting for one response.
@@ -124,6 +202,10 @@ type Usage struct {
 	OutputTokens     int64 `json:"outputTokens,omitempty"`
 	CacheReadTokens  int64 `json:"cacheReadTokens,omitempty"`
 	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
+	// ReasoningTokens counts provider-side reasoning/thinking tokens, when
+	// reported (e.g. OpenAI o-series/reasoning_effort, Anthropic extended
+	// thinking).
+	ReasoningTokens int64 `json:"reasoningTokens,omitempty"`
 	// Allowance is set by the cloud provider (ai/cloud); nil for BYOK.
 	Allowance *Allowance `json:"allowance,omitempty"`
 }
