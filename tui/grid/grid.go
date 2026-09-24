@@ -87,6 +87,15 @@ const firstExtraView = 1
 type ExtraView struct {
 	// Label is shown in the view switcher header, e.g. "Charts".
 	Label string
+	// ShortLabel is shown instead of Label once the header is too narrow
+	// for the full text (see viewLabels) — main's own fixed forms
+	// ("Charts" → "C", "Current row" → "Row") rather than a generic
+	// N-character truncation of Label, which can make two labels
+	// indistinguishable once both are cut to the same length (e.g.
+	// "Charts"/"Current row" both truncating to "Ch"/"Cu" reads fine, but
+	// a runt truncation of arbitrary text has no such guarantee). Falls
+	// back to Label's own generic truncation when empty.
+	ShortLabel string
 	// Render draws the view's body at the given content width/height.
 	Render func(m *Model, width, height int) string
 	// Update optionally handles a key press while this view is active and
@@ -98,31 +107,32 @@ type ExtraView struct {
 
 // CardView returns an ExtraView rendering the highlighted row as a formatted
 // vertical field list (Column name / FormatValue'd value). label defaults to
-// "Current row" when empty. Ported from DataTug's recordset_views.go
-// currentRowContent (raw=false).
+// "Current row" when empty; its ShortLabel is main's own "Row". Ported from
+// DataTug's recordset_views.go currentRowContent (raw=false).
 func CardView(label string) ExtraView {
-	return rowFieldView(label, "Current row", false)
+	return rowFieldView(label, "Current row", "Row", false)
 }
 
 // InspectorView is CardView's raw-value counterpart: it renders each field's
 // Go value (%#v) instead of FormatValue's terminal-safe text. label defaults
-// to "Inspector" when empty.
+// to "Inspector" when empty, ShortLabel to "Insp".
 func InspectorView(label string) ExtraView {
-	return rowFieldView(label, "Inspector", true)
+	return rowFieldView(label, "Inspector", "Insp", true)
 }
 
 // rowFieldView builds CardView/InspectorView: the highlighted row's fields as
 // a vertical list, scrollable with up/down when the row has more fields than
 // fit the pane (each field is two lines: name, then value), and reset to the
 // top whenever the highlighted row changes.
-func rowFieldView(label, fallback string, raw bool) ExtraView {
+func rowFieldView(label, fallback, shortLabel string, raw bool) ExtraView {
 	if label == "" {
 		label = fallback
 	}
 	offset := 0
 	lastRow := -1
 	return ExtraView{
-		Label: label,
+		Label:      label,
+		ShortLabel: shortLabel,
 		Render: func(m *Model, width, height int) string {
 			rowIndex := m.CurrentIndex()
 			if rowIndex != lastRow {
@@ -274,6 +284,15 @@ func WithFilterDisabled() Option {
 	return func(m *Model) { m.filterDisabled = true }
 }
 
+// WithoutViewSwitcher hides the "1 Table [· 2 Charts ...]" view-switcher
+// text from the header entirely — main's own title-only header for a grid
+// with no other views worth advertising (DataTug's bookmark, dock and
+// parameter-lookup grids). Digit keys still switch views if any are
+// registered; this only affects what the header displays.
+func WithoutViewSwitcher() Option {
+	return func(m *Model) { m.viewSwitcherHidden = true }
+}
+
 // DefaultMaxVisibleRows is the page size a Model uses when WithMaxVisibleRows
 // is not supplied.
 const DefaultMaxVisibleRows = 12
@@ -297,14 +316,15 @@ type Model struct {
 	sortDesc       bool
 	selectedColumn int
 
-	extraViews     []ExtraView
-	layout         LayoutFunc
-	maxVisibleRows int
-	keyHandler     KeyHandler
-	footerHook     FooterHook
-	style          Style
-	secondaryFocus bool
-	filterDisabled bool
+	extraViews         []ExtraView
+	layout             LayoutFunc
+	maxVisibleRows     int
+	keyHandler         KeyHandler
+	footerHook         FooterHook
+	style              Style
+	secondaryFocus     bool
+	filterDisabled     bool
+	viewSwitcherHidden bool
 }
 
 // New builds a grid from columns and rows. Row order is preserved until the

@@ -1161,3 +1161,91 @@ func TestInspectorViewShowsFullDateNotGoDump(t *testing.T) {
 		t.Fatalf("raw date content leaked Go's internal struct dump: %q", content)
 	}
 }
+
+// TestSplitLayoutPadsNarrowTablePaneToPrimaryWidth is the regression test
+// for m2: a table with few/narrow columns renders narrower than
+// SplitLayout's PrimaryWidth budget — without padding, JoinHorizontal
+// positions the secondary pane right after that narrower content, shifting
+// it left and leaving a gap of blank cells between the secondary card and
+// the outer card's own right border, instead of the secondary card sitting
+// flush there.
+func TestSplitLayoutPadsNarrowTablePaneToPrimaryWidth(t *testing.T) {
+	cols := []Column{{Name: "id", Numeric: true}, {Name: "ok"}}
+	rows := []Row{{Key: "0", Values: []any{1, "y"}}}
+	m := New(cols, rows,
+		WithExtraViews(ExtraView{Label: "Charts", Render: func(m *Model, w, h int) string { return "" }}),
+		WithSplitLayout(func(totalWidth, naturalWidth int, view View) SplitLayout {
+			return SplitLayout{Split: true, PrimaryWidth: 40, SecondaryWidth: totalWidth - 40}
+		}),
+	)
+	m.SetView(View(firstExtraView))
+	body := m.body(100)
+	lines := strings.Split(body, "\n")
+	// Every line's secondary card must start at the same column — right
+	// after the fixed PrimaryWidth — regardless of the (much narrower)
+	// natural width of a 2-column table. Indexed by RUNE (display column),
+	// not byte: the border glyphs (╭│╰) are multi-byte UTF-8, so a
+	// byte-offset comparison would report false mismatches even when
+	// every line is correctly aligned by display column.
+	first := -1
+	for _, line := range lines {
+		runes := []rune(ansi.Strip(line))
+		col := -1
+		for i, r := range runes {
+			if r == '╭' || r == '│' || r == '╰' {
+				col = i
+				break
+			}
+		}
+		if col < 0 {
+			continue
+		}
+		if first < 0 {
+			first = col
+		} else if col != first {
+			t.Fatalf("secondary card's left edge is not aligned across lines: %d vs %d\n%s", first, col, body)
+		}
+	}
+	if first != 41 { // layout.PrimaryWidth + the 1-cell gap column
+		t.Fatalf("secondary card starts at column %d, want 41 (layout.PrimaryWidth + gap): %q", first, ansi.Strip(lines[0]))
+	}
+}
+
+// TestViewSwitcherUsesShortLabelsAtNarrowWidths is the regression test for
+// m3: a product-provided ShortLabel (e.g. DataTug's "Charts" → "C",
+// CardView's own built-in "Current row" → "Row") is used in the view
+// switcher's shortened header tiers, so two views stay visually
+// distinguishable at the width where their names would otherwise both
+// truncate to the same generic N-character prefix.
+func TestViewSwitcherUsesShortLabelsAtNarrowWidths(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(
+		ExtraView{Label: "Charts", ShortLabel: "C", Render: func(m *Model, w, h int) string { return "" }},
+		CardView(""),
+	))
+	for _, width := range []int{30, 60} {
+		header := ansi.Strip(m.HeaderLine(width))
+		if !strings.Contains(header, "2 C") {
+			t.Fatalf("width %d: header missing short Charts label: %q", width, header)
+		}
+		if !strings.Contains(header, "3 Row") {
+			t.Fatalf("width %d: header missing short Current row label: %q", width, header)
+		}
+	}
+}
+
+// TestWithoutViewSwitcherHidesSwitcherText is the regression test for m4:
+// a minimal grid (DataTug's dock/bookmark/parameter-lookup grids) never
+// had a "1 Table" view switcher in main; WithoutViewSwitcher restores a
+// title-only header instead.
+func TestWithoutViewSwitcherHidesSwitcherText(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithTitle("Bookmarks"), WithoutViewSwitcher())
+	header := ansi.Strip(m.HeaderLine(60))
+	if strings.Contains(header, "1 Table") || strings.Contains(header, "│") {
+		t.Fatalf("header still shows the view switcher: %q", header)
+	}
+	if !strings.Contains(header, "Bookmarks") {
+		t.Fatalf("header missing title: %q", header)
+	}
+}

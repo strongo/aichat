@@ -35,6 +35,18 @@ func (m *Model) View(width int, focused bool) string {
 // gridState.recordsetHeader, generalised over an arbitrary list of views
 // instead of the fixed Table/Charts/Current row/Raw/Headers set.
 func (m *Model) headerLine(width int) string {
+	if m.viewSwitcherHidden {
+		// A minimal grid (dock/bookmark/parameter-lookup — see
+		// WithoutViewSwitcher) never had a "1 Table" switcher to show;
+		// main's own header there is title-only.
+		title := ansi.Truncate(sanitize(m.title), max(1, width), "…")
+		if m.focused {
+			title = activeTitleStyle.Render(title)
+		} else {
+			title = inactiveTitleStyle.Render(title)
+		}
+		return padAnsiLine(title, width)
+	}
 	labels := m.viewLabels(width)
 	separator := " · "
 	if width < 42 {
@@ -71,20 +83,29 @@ func (m *Model) HeaderLine(width int) string { return m.headerLine(width) }
 
 // viewLabels returns one label per view (Table, then each registered
 // ExtraView in order), abbreviated to fit width. Ported from DataTug's
-// recordsetHeader breakpoints (<62, <42, 24-36, <=24 cells), generalised: a
-// fixed word-count abbreviation replaces DataTug's hand-picked short forms
-// ("Charts" → "Chart" → "C"), since a product-registered ExtraView label is
-// arbitrary text, not one of a fixed known set.
+// recordsetHeader breakpoints (<62, <42, 24-36, <=24 cells). A view's own
+// ShortLabel (e.g. DataTug's Charts → "C", CardView's built-in "Row") is
+// used verbatim in the shortened tiers when set — main's own hand-picked
+// short forms — falling back to a generic N-character truncation of Label
+// only when a view didn't provide one (a product-registered ExtraView
+// label is otherwise arbitrary text, not one of a fixed known set).
 func (m *Model) viewLabels(width int) []string {
 	names := make([]string, 0, 1+len(m.extraViews))
+	shortNames := make([]string, 0, 1+len(m.extraViews))
 	names = append(names, "Table")
+	shortNames = append(shortNames, "")
 	for _, v := range m.extraViews {
 		names = append(names, v.Label)
+		shortNames = append(shortNames, v.ShortLabel)
 	}
 	shorten := func(n int) []string {
 		out := make([]string, len(names))
 		for i, name := range names {
-			out[i] = strconv.Itoa(i+1) + " " + abbreviate(name, n)
+			short := shortNames[i]
+			if short == "" {
+				short = abbreviate(name, n)
+			}
+			out[i] = strconv.Itoa(i+1) + " " + short
 		}
 		return out
 	}
@@ -138,7 +159,15 @@ func (m *Model) body(width int) string {
 	if !layout.Split {
 		return m.padOrClampHeight(m.viewBody(m.view, width, m.paneHeight()), m.paneHeight())
 	}
-	primary := stripHeaderSeparator(m.tableViewAt(layout.PrimaryWidth))
+	// padLinesToWidth: bubble-table only renders as wide as its columns
+	// actually need, up to layout.PrimaryWidth — a table with few/narrow
+	// columns can render narrower than the width SplitLayout allotted it.
+	// lipgloss.JoinHorizontal positions the secondary pane right after
+	// whatever width primary's lines actually are, so an unpadded narrow
+	// primary shifts the secondary card left, leaving a gap of blank
+	// cells between it and the outer card's own right border instead of
+	// the secondary card sitting flush there (m2).
+	primary := padLinesToWidth(stripHeaderSeparator(m.tableViewAt(layout.PrimaryWidth)), layout.PrimaryWidth)
 	// The secondary pane gets its own bordered card (title, ●/○ focus
 	// bullet) so a split layout's two panes are visually distinguishable —
 	// the primary (table) side's own focus cue is the outer card m.View
@@ -150,8 +179,40 @@ func (m *Model) body(width int) string {
 	contentWidth := max(1, cardWidth-2)
 	content := m.padOrClampHeight(m.viewBody(m.view, contentWidth, m.paneHeight()), m.paneHeight())
 	secondary := m.secondaryCard(content, cardWidth)
-	gapCol := strings.Repeat(" \n", max(0, lipgloss.Height(secondary)-1)) + " "
-	return lipgloss.JoinHorizontal(lipgloss.Top, primary, gapCol, secondary)
+	// Joined line by line rather than via lipgloss.JoinHorizontal: both
+	// primary and secondary are already padded to their own fixed widths
+	// (padLinesToWidth/secondaryCard's own borderLine/padAnsiLine calls),
+	// but JoinHorizontal's own internal width measurement of a styled,
+	// ANSI-heavy line (e.g. the table's own styled header row) has proven
+	// inconsistent by a cell or two versus a plain content line, visibly
+	// misaligning the secondary card's left edge across rows. Manual
+	// string concatenation of already-known-width lines has no such
+	// ambiguity to resolve.
+	primaryLines := strings.Split(primary, "\n")
+	secondaryLines := strings.Split(secondary, "\n")
+	blankPrimary := strings.Repeat(" ", max(0, layout.PrimaryWidth))
+	blankSecondary := strings.Repeat(" ", max(0, cardWidth))
+	height := max(len(primaryLines), len(secondaryLines))
+	lines := make([]string, height)
+	for i := range lines {
+		// primary/secondary are already each padded to a known-fixed
+		// width (padLinesToWidth; secondaryCard's own borderLine/
+		// padAnsiLine calls) — re-running padAnsiLine on an
+		// already-correctly-sized, heavily-styled line here previously
+		// misjudged its width by a cell or two on some rows and not
+		// others, visibly misaligning the secondary card's left edge; a
+		// plain blank fallback line avoids re-measuring styled content at
+		// all.
+		p, s := blankPrimary, blankSecondary
+		if i < len(primaryLines) {
+			p = primaryLines[i]
+		}
+		if i < len(secondaryLines) {
+			s = secondaryLines[i]
+		}
+		lines[i] = p + " " + s
+	}
+	return strings.Join(lines, "\n")
 }
 
 // paneHeight bounds a non-table view's rendered height (see the height clamp
@@ -181,6 +242,20 @@ func (m *Model) padOrClampHeight(content string, height int) string {
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// padLinesToWidth right-pads every line of content to exactly width
+// display cells (ansi-aware, via padAnsiLine) — used to give a split
+// layout's primary (table) pane a fixed, predictable width even when
+// bubble-table itself rendered narrower than that (m2), so
+// lipgloss.JoinHorizontal always positions the secondary pane at the same
+// offset rather than wherever the table's actual content happened to end.
+func padLinesToWidth(content string, width int) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		lines[i] = padAnsiLine(line, width)
 	}
 	return strings.Join(lines, "\n")
 }
