@@ -438,6 +438,100 @@ func TestStream_RetryAfterHonouredOn429(t *testing.T) {
 	}
 }
 
+func TestStream_429BillingErrorNotRetried(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"type":"billing_error","message":"Your credit balance is too low to access the Anthropic API"}}`))
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	start := time.Now()
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	elapsed := time.Since(start)
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeQuota {
+		t.Fatalf("err = %v, want ErrCodeQuota", err)
+	}
+	if aiErr.Retryable {
+		t.Error("a billing-exhausted 429 must not be retryable")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (must not retry billing exhaustion)", attempts)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("elapsed = %v, want fast (no Retry-After wait for a non-retryable error)", elapsed)
+	}
+}
+
+func TestStream_NoRetryAfterWaitOnLastAttempt(t *testing.T) {
+	// Mirrors ai/openaicompat's equivalent test: with the default
+	// MaxAttempts=3, WaitOnRetryAfter is eligible to fire after attempts 1
+	// and 2 ("not last") but MUST NOT fire after attempt 3 (the last) --
+	// there's no attempt 4 to time a gap against, so this asserts on TOTAL
+	// elapsed: two honoured ~2s waits plus small backoff+jitter lands well
+	// under the headroom a bogus THIRD wait would add.
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"try again later"}}`))
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	start := time.Now()
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected an error after exhausting retries")
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3 (default MaxAttempts)", attempts)
+	}
+	if elapsed >= 5800*time.Millisecond {
+		t.Errorf("elapsed = %v, want well under a 3rd Retry-After wait -- it must not be honoured on the last attempt", elapsed)
+	}
+	if elapsed < 3500*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= ~4s (Retry-After honoured on the two non-final attempts)", elapsed)
+	}
+}
+
+func TestMessagesURL_TolerantOfTrailingV1(t *testing.T) {
+	cases := map[string]string{
+		"https://api.anthropic.com":     "https://api.anthropic.com/v1/messages",
+		"https://api.anthropic.com/":    "https://api.anthropic.com/v1/messages",
+		"https://api.anthropic.com/v1":  "https://api.anthropic.com/v1/messages",
+		"https://api.anthropic.com/v1/": "https://api.anthropic.com/v1/messages",
+	}
+	for in, want := range cases {
+		if got := messagesURL(in); got != want {
+			t.Errorf("messagesURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestStream_TrailingV1BaseURLDoesNotDoubleUp(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL + "/v1/", APIKey: "k"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/messages" {
+		t.Errorf("path = %q, want %q (BaseURL's own trailing /v1/ must not double up)", gotPath, "/v1/messages")
+	}
+}
+
 func TestNew_PanicsWithoutBaseURL(t *testing.T) {
 	defer func() {
 		if recover() == nil {

@@ -46,10 +46,12 @@ type BYOK struct {
 	// Protocol is "openai-compatible" (default) or "anthropic".
 	Protocol string `yaml:"protocol" json:"protocol"`
 	// Endpoint is the provider's API base URL. Empty uses a sensible
-	// default for the chosen Protocol (https://api.openai.com/v1/ or
-	// https://api.anthropic.com/v1/) -- set it to point BYOK at a
-	// self-hosted or third-party OpenAI-compatible/Anthropic-compatible
-	// endpoint instead.
+	// default for the chosen Protocol (https://api.openai.com/v1/ for
+	// openai-compatible, https://api.anthropic.com -- bare host, no /v1 --
+	// for anthropic; ai/anthropic appends its own fixed "/v1/messages", so
+	// baking "/v1" into this default too would double it) -- set it to
+	// point BYOK at a self-hosted or third-party
+	// OpenAI-compatible/Anthropic-compatible endpoint instead.
 	Endpoint string `yaml:"endpoint" json:"endpoint"`
 	Model    string `yaml:"model" json:"model"`
 	// APIKeyEnv names the environment variable holding the API key. The key

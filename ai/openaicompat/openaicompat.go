@@ -156,8 +156,10 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		}
 
 		var resp *http.Response
+		attempt := 0
 		doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
-			r, e := p.doRequest(ctx, payload)
+			attempt++
+			r, e := p.doRequest(ctx, payload, attempt >= retry.DefaultMaxAttempts)
 			resp = r
 			return e
 		})
@@ -269,7 +271,11 @@ func toAIError(ctx context.Context, err error) *ai.Error {
 	return &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
 }
 
-func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Response, error) {
+// doRequest issues one attempt. lastAttempt tells it not to bother waiting
+// out a 429's Retry-After delay when nothing will retry afterward anyway --
+// that wait would only add latency to a request that's about to fail out to
+// the caller regardless (m3).
+func (p *Provider) doRequest(ctx context.Context, payload []byte, lastAttempt bool) (*http.Response, error) {
 	url := strings.TrimSuffix(p.cfg.BaseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
@@ -295,13 +301,22 @@ func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Respons
 	}
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode == http.StatusTooManyRequests {
+	aiErr := httpStatusError(resp.StatusCode, b)
+	if resp.StatusCode == http.StatusTooManyRequests && !lastAttempt && aiErr.IsRetryable() {
 		retry.WaitOnRetryAfter(ctx, resp.Header.Get("Retry-After"))
 	}
-	return nil, httpStatusError(resp.StatusCode, b)
+	return nil, aiErr
 }
 
-func httpStatusError(status int, body []byte) error {
+// quotaIndicators are the OpenAI error type/code values that mean the
+// account's quota/credit is exhausted rather than a transient rate limit --
+// retrying doesn't help until the account is topped up, so these must not
+// be marked Retryable even though they arrive on a 429.
+var quotaIndicators = map[string]bool{
+	"insufficient_quota": true,
+}
+
+func httpStatusError(status int, body []byte) *ai.Error {
 	var apiErr apiErrorBody
 	_ = json.Unmarshal(body, &apiErr)
 	msg := apiErr.Error.Message
@@ -315,6 +330,9 @@ func httpStatusError(status int, body []byte) error {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		return &ai.Error{Code: ai.ErrCodeAuth, Message: msg}
 	case status == http.StatusTooManyRequests:
+		if quotaIndicators[apiErr.Error.Type] || quotaIndicators[apiErr.Error.Code] {
+			return &ai.Error{Code: ai.ErrCodeQuota, Message: msg}
+		}
 		return &ai.Error{Code: ai.ErrCodeRateLimited, Message: msg, Retryable: true}
 	case status >= 500:
 		return &ai.Error{Code: ai.ErrCodeUpstream, Message: msg, Retryable: true}

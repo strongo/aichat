@@ -141,8 +141,10 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		}
 
 		var resp *http.Response
+		attempt := 0
 		doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
-			r, e := p.doRequest(ctx, payload)
+			attempt++
+			r, e := p.doRequest(ctx, payload, attempt >= retry.DefaultMaxAttempts)
 			resp = r
 			return e
 		})
@@ -316,8 +318,23 @@ func toUsage(u *usagePayload) *ai.Usage {
 	}
 }
 
-func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Response, error) {
-	url := strings.TrimSuffix(p.cfg.BaseURL, "/") + "/v1/messages"
+// messagesURL builds the Messages API URL, tolerating a BaseURL that
+// already ends in "/v1" or "/v1/" -- ai/anthropic's request path is the
+// fixed "/v1/messages", so a caller-supplied (or defaulted) BaseURL that
+// already carries the "/v1" segment must have it stripped first, or the
+// result doubles into ".../v1/v1/messages".
+func messagesURL(base string) string {
+	base = strings.TrimSuffix(base, "/")
+	base = strings.TrimSuffix(base, "/v1")
+	return base + "/v1/messages"
+}
+
+// doRequest issues one attempt. lastAttempt tells it not to bother waiting
+// out a 429's Retry-After delay when nothing will retry afterward anyway --
+// that wait would only add latency to a request that's about to fail out to
+// the caller regardless (m3).
+func (p *Provider) doRequest(ctx context.Context, payload []byte, lastAttempt bool) (*http.Response, error) {
+	url := messagesURL(p.cfg.BaseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -343,15 +360,30 @@ func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Respons
 	}
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode == http.StatusTooManyRequests {
+	aiErr := httpStatusError(resp.StatusCode, b)
+	if resp.StatusCode == http.StatusTooManyRequests && !lastAttempt && aiErr.IsRetryable() {
 		retry.WaitOnRetryAfter(ctx, resp.Header.Get("Retry-After"))
 	}
-	return nil, httpStatusError(resp.StatusCode, b)
+	return nil, aiErr
 }
 
-func httpStatusError(status int, body []byte) error {
+// isBillingError reports whether an Anthropic error body indicates
+// exhausted credit/billing rather than a transient rate limit -- Anthropic
+// has no single dedicated error type for this the way OpenAI's
+// "insufficient_quota" is, so this checks both the "type" field and a
+// message substring a low-balance response is documented to contain.
+func isBillingError(errType, message string) bool {
+	if strings.Contains(strings.ToLower(errType), "billing") {
+		return true
+	}
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "credit balance") || strings.Contains(lower, "credit_balance")
+}
+
+func httpStatusError(status int, body []byte) *ai.Error {
 	var apiErr struct {
 		Error struct {
+			Type    string `json:"type"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
@@ -367,6 +399,9 @@ func httpStatusError(status int, body []byte) error {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		return &ai.Error{Code: ai.ErrCodeAuth, Message: msg}
 	case status == http.StatusTooManyRequests:
+		if isBillingError(apiErr.Error.Type, apiErr.Error.Message) {
+			return &ai.Error{Code: ai.ErrCodeQuota, Message: msg}
+		}
 		return &ai.Error{Code: ai.ErrCodeRateLimited, Message: msg, Retryable: true}
 	case status >= 500:
 		return &ai.Error{Code: ai.ErrCodeUpstream, Message: msg, Retryable: true}

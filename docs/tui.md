@@ -198,6 +198,26 @@ report it asynchronously). A **second, immediately-following** `Ctrl+C`
 always quits, whether or not the first press's cancellation has finished;
 any other key re-arms it back to "cancel on the next Ctrl+C".
 
+**A `SetBusy(true)` phase has no identity of its own** — unlike a stream,
+which `StartStream` keys by `id` and whose `DoneMsg` always names that `id`
+back, `SetBusy`/`SetBusyCancel` carry no per-call token at all. chatshell
+itself doesn't need one: cancelling just calls whatever func is currently
+registered and clears busy. But a PRODUCT whose own async work outlives a
+cancelled phase (e.g. a decision-chain goroutine that keeps running briefly
+after `SetBusyCancel`'s func fires, or a query that was already in flight)
+gets no signal from chatshell distinguishing "this result belongs to the
+phase that's still current" from "this result belongs to a phase the user
+already cancelled". A product with that shape must track its own identity
+across a `SetBusy(true)`/cancel/`SetBusy(false)` cycle — e.g. increment a
+local phase token when starting a phase and again when cancelling it, and
+have the async work's completion handler compare its captured token against
+the model's current one before acting on the result (exactly the pattern
+`StartStream`'s `id` gives for free on the streaming path). `SetBusy(false)`
+itself only clears `busy` and forgets the registered `SetBusyCancel` func —
+it does not, and cannot, retroactively invalidate a result already in
+flight from a phase that was never explicitly cancelled; that's on the
+product's own token check, same as the cancelled case.
+
 An optional `chatshell.MsgHandler` (`OnMsg(msg tea.Msg) tea.Cmd`) receives
 every message chatshell does not itself recognise — e.g. a product message,
 or a Block message such as `grid.RowActivatedMsg` — in addition to that

@@ -30,9 +30,15 @@ type Config struct {
 	Jitter float64
 }
 
+// DefaultMaxAttempts is the MaxAttempts a zero-value Config resolves to. It
+// is exported so a caller that needs to know when its own fn is on the
+// FINAL attempt (e.g. to skip an otherwise-pointless WaitOnRetryAfter delay
+// right before giving up) doesn't have to guess or duplicate this number.
+const DefaultMaxAttempts = 3
+
 func (c Config) withDefaults() Config {
 	if c.MaxAttempts <= 0 {
-		c.MaxAttempts = 3
+		c.MaxAttempts = DefaultMaxAttempts
 	}
 	if c.BaseDelay <= 0 {
 		c.BaseDelay = 250 * time.Millisecond

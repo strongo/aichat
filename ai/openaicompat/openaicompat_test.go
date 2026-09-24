@@ -497,3 +497,68 @@ func TestStream_RetryAfterHonouredOn429(t *testing.T) {
 		t.Errorf("retry happened after %v, want >= ~1s (Retry-After: 1)", secondAttempt.Sub(firstAttempt))
 	}
 }
+
+func TestStream_429QuotaExhaustedNotRetried(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}`))
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	start := time.Now()
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	elapsed := time.Since(start)
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeQuota {
+		t.Fatalf("err = %v, want ErrCodeQuota", err)
+	}
+	if aiErr.Retryable {
+		t.Error("a quota-exhausted 429 must not be retryable")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (must not retry quota exhaustion)", attempts)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("elapsed = %v, want fast (no Retry-After wait for a non-retryable error)", elapsed)
+	}
+}
+
+func TestStream_NoRetryAfterWaitOnLastAttempt(t *testing.T) {
+	// With the default MaxAttempts=3, WaitOnRetryAfter is eligible to fire
+	// after attempt 1 and after attempt 2 (each "not last"), but MUST NOT
+	// fire after attempt 3 (the last one) -- there's no attempt 4 whose
+	// start we could time it against, so this asserts on TOTAL elapsed
+	// instead of a single gap: two honoured waits (~2s each) plus small
+	// backoff+jitter lands well under a THIRD 2s wait's worth of headroom.
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"try again later","type":"rate_limit_exceeded"}}`))
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	start := time.Now()
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected an error after exhausting retries")
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3 (default MaxAttempts)", attempts)
+	}
+	// Correct: ~2 honoured Retry-After waits (after attempts 1 and 2) plus
+	// two small backoff+jitter delays -- comfortably under 5.5s. A bug that
+	// also waits after the LAST attempt would add a third 2s wait, pushing
+	// this past 6s.
+	if elapsed >= 5800*time.Millisecond {
+		t.Errorf("elapsed = %v, want well under a 3rd Retry-After wait -- it must not be honoured on the last attempt", elapsed)
+	}
+	if elapsed < 3500*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= ~4s (Retry-After honoured on the two non-final attempts)", elapsed)
+	}
+}
