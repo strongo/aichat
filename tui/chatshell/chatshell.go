@@ -260,6 +260,14 @@ func (m *Model) AppendBlock(block transcript.Block) {
 	m.transcript.Append(transcript.Entry{Block: block})
 }
 
+// AppendBlockWithID appends a rich transcript.Block under a caller-chosen,
+// stable id, so a product can later FocusEntry(id) (e.g. DataTug's Ctrl+G
+// "jump to latest grid") or ReplaceBlock(id, ...) it. id must be non-empty
+// and unique among live entries, same requirement as StartStream's id.
+func (m *Model) AppendBlockWithID(id string, block transcript.Block) {
+	m.transcript.Append(transcript.Entry{ID: id, Block: block})
+}
+
 // StartStream starts a streamed assistant entry. id must be unique per
 // turn; deltas render progressively into the transcript, and a spinner runs
 // until the first delta (or completion) arrives.
@@ -275,12 +283,25 @@ func (m *Model) AppendBlock(block transcript.Block) {
 // entry, not an error, and StreamObserver.OnStreamDone (if implemented)
 // always fires once the stream ends, however it ended.
 func (m *Model) StartStream(id string, open func(ctx context.Context) iter.Seq2[ai.Event, error]) tea.Cmd {
+	return m.startStream(id, false, open)
+}
+
+// StartStreamMarkdown is StartStream, but the streaming entry is rendered
+// through the configured MarkdownRenderer (WithMarkdownRenderer) as it
+// accumulates, same as AppendAssistantMarkdown for a non-streamed message —
+// e.g. DataTug's agent/HTTP markdown responses. With no renderer configured
+// it behaves like StartStream (transcript.Entry.Markdown is inert then).
+func (m *Model) StartStreamMarkdown(id string, open func(ctx context.Context) iter.Seq2[ai.Event, error]) tea.Cmd {
+	return m.startStream(id, true, open)
+}
+
+func (m *Model) startStream(id string, markdown bool, open func(ctx context.Context) iter.Seq2[ai.Event, error]) tea.Cmd {
 	m.cancelStream()
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.streamID, m.streamCancel = id, cancel
 	m.busy = true
 	m.ctrlCArmed = false
-	m.transcript.Append(transcript.Entry{ID: id, Role: transcript.RoleAssistant, Text: ""})
+	m.transcript.Append(transcript.Entry{ID: id, Role: transcript.RoleAssistant, Text: "", Markdown: markdown})
 	seq := open(ctx)
 	return tea.Batch(stream.Start(ctx, id, seq), m.spinner.Tick)
 }

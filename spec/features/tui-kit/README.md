@@ -94,11 +94,11 @@ An optional `SidePanelPinner` capability (`PinRef(ref session.EntityRef) bool`, 
 
 `chatshell.Model.ReplaceBlock(entryID string, b transcript.Block)` MUST replace the `Block` of the transcript entry identified by `entryID` IN PLACE (same position, same ID) -- e.g. to refresh or re-run a grid -- and MUST be a no-op when no entry has that ID. If the CURRENTLY FOCUSED transcript entry (by ID, not raw stop index -- either the one being replaced or a different one whose stop shifted because this swap changed an earlier entry's `Focusable()` answer) is still focusable afterward, focus MUST stay on that same entry.
 
-`SetComposerText(s string)` MUST set the composer's text and move the cursor to the end (an edit-previous-message flow). `ClearTranscript()` MUST cancel any in-flight stream, remove every transcript entry, and return focus to the composer (`/clear`, a session switch); an `EventMsg` for the just-cancelled stream's ID that arrives afterward MUST NOT mutate the (now-cleared) transcript. `FocusEntry(id string) bool` MUST move focus to the transcript entry identified by `id`, scrolling it into view, and report whether such a focusable entry exists (`false` leaves focus unchanged) -- e.g. DataTug's Ctrl+G "jump to latest grid".
+`SetComposerText(s string)` MUST set the composer's text and move the cursor to the end (an edit-previous-message flow). `ClearTranscript()` MUST cancel any in-flight stream, remove every transcript entry, and return focus to the composer (`/clear`, a session switch); an `EventMsg` for the just-cancelled stream's ID that arrives afterward MUST NOT mutate the (now-cleared) transcript. `FocusEntry(id string) bool` MUST move focus to the transcript entry identified by `id`, scrolling it into view, and report whether such a focusable entry exists (`false` leaves focus unchanged) -- e.g. DataTug's Ctrl+G "jump to latest grid". `AppendBlockWithID(id string, b transcript.Block)` MUST append a `transcript.Block` under a caller-chosen id, same as `StartStream`'s id, so the appended entry is later addressable via `FocusEntry`/`ReplaceBlock` -- `AppendBlock` (no id) remains for blocks a product never needs to address again.
 
 #### REQ: chatshell-markdown-renderer
 
-`chatshell.WithMarkdownRenderer(r transcript.MarkdownRenderer)` MUST configure the renderer `AppendAssistantMarkdown(text string)` — and any `transcript.Entry` with `Markdown` set — uses (e.g. a glamour-backed renderer for agent or HTTP-response markdown), equivalent to `transcript.New(transcript.WithMarkdownRenderer(r))` but settable on a `chatshell.Model`'s already-constructed transcript.
+`chatshell.WithMarkdownRenderer(r transcript.MarkdownRenderer)` MUST configure the renderer `AppendAssistantMarkdown(text string)` — and any `transcript.Entry` with `Markdown` set — uses (e.g. a glamour-backed renderer for agent or HTTP-response markdown), equivalent to `transcript.New(transcript.WithMarkdownRenderer(r))` but settable on a `chatshell.Model`'s already-constructed transcript. `StartStreamMarkdown(id string, open func(ctx context.Context) iter.Seq2[ai.Event, error]) tea.Cmd` MUST behave exactly like `StartStream` except the streaming entry is created with `Markdown` set, so each delta re-renders the FULL accumulated text through the configured renderer as it streams (progressive, since `transcript.Model` invalidates and re-renders the entry on every `AppendDelta`), and at minimum on completion; with no renderer configured it behaves identically to `StartStream` (the flag is inert).
 
 ### Sidebar
 
@@ -261,6 +261,20 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a `chatshell.Model` built `WithMarkdownRenderer(r)`
 **When** `AppendAssistantMarkdown(text)` is called and the transcript is rendered
 **Then** the entry's `Markdown` field is set and its rendered view is `r`'s output, not the raw text
+
+### AC: append-block-with-id-is-later-focusable
+**Requirements:** tui-kit#req:chatshell-transcript-ops
+
+**Given** a `chatshell.Model`
+**When** `AppendBlockWithID("grid-1", b)` is called
+**Then** the transcript has one entry with `ID == "grid-1"` and `FocusEntry("grid-1")` returns `true`
+
+### AC: start-stream-markdown-renders-accumulated-text-progressively
+**Requirements:** tui-kit#req:chatshell-markdown-renderer
+
+**Given** a `chatshell.Model` built `WithMarkdownRenderer(r)`
+**When** `StartStreamMarkdown(id, open)` streams several text deltas to completion
+**Then** the entry's `Markdown` field is set, its final `Text` is the full accumulated string, its rendered view is `r`'s output over that accumulated text (not the raw text), and `r` is invoked more than once (progressively) as deltas arrive; with no renderer configured, `StartStreamMarkdown` behaves identically to `StartStream`
 
 ## Open Questions
 

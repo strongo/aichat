@@ -1329,3 +1329,72 @@ func TestWithMarkdownRendererAndAppendAssistantMarkdown(t *testing.T) {
 		t.Errorf("renderer called with text=%q width=%d", gotText, gotWidth)
 	}
 }
+
+func TestAppendBlockWithIDIsLaterFocusable(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+	m.AppendBlockWithID("grid-1", &fakeBlock{})
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || entries[0].ID != "grid-1" {
+		t.Fatalf("entries = %+v, want one entry with ID %q", entries, "grid-1")
+	}
+	if !m.FocusEntry("grid-1") {
+		t.Fatal("FocusEntry(\"grid-1\") = false, want true: AppendBlockWithID must make the block focusable by id")
+	}
+}
+
+func TestStartStreamMarkdownRendersAccumulatedTextThroughRenderer(t *testing.T) {
+	h := &fakeHandler{}
+	var renderCalls int
+	var lastText string
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		renderCalls++
+		lastText = text
+		return "RENDERED:" + text
+	}))
+	m.ctx = context.Background()
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventTextDelta, Text: "# Hel"},
+		{Type: ai.EventTextDelta, Text: "lo"},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStreamMarkdown("turn-1", openSeq(events...))
+	drainCmd(t, m, cmd, 20)
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || !entries[0].Markdown || entries[0].Text != "# Hello" {
+		t.Fatalf("entries = %+v, want one Markdown entry with the accumulated text", entries)
+	}
+	view := m.transcript.View()
+	if !strings.Contains(view, "RENDERED:# Hello") {
+		t.Fatalf("view = %q, want the final accumulated text rendered through the configured renderer", view)
+	}
+	if renderCalls == 0 {
+		t.Error("renderer was never called")
+	}
+	if lastText != "# Hello" {
+		t.Errorf("last render call text = %q, want the fully accumulated text", lastText)
+	}
+}
+
+func TestStartStreamWithoutMarkdownRendererBehavesLikeStartStream(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventTextDelta, Text: "hi"},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStreamMarkdown("turn-1", openSeq(events...))
+	drainCmd(t, m, cmd, 20)
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || entries[0].Text != "hi" {
+		t.Fatalf("entries = %+v, want the plain accumulated text", entries)
+	}
+}
