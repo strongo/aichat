@@ -401,6 +401,19 @@ func TestChain_HonoursProviderDecisionTimeout(t *testing.T) {
 	}
 }
 
+func TestLowConfidence_IntentConfidenceBelowFloorWithHighModuleConfidence(t *testing.T) {
+	// Module confidence clears the floor but Intent's doesn't: the Intent
+	// branch of lowConfidence must independently reject this decision.
+	d := Decision{
+		Module:      Scored{Value: "calendar", Confidence: 0.95},
+		Intent:      Scored{Value: "show", Confidence: 0.1},
+		Interaction: InteractionCommand,
+	}
+	if !lowConfidence(d, 0.7) {
+		t.Fatal("expected low_confidence: intent confidence below the floor")
+	}
+}
+
 func TestChain_TimeoutDetectionUsesErrorsIs(t *testing.T) {
 	// A provider that wraps context.DeadlineExceeded must still be
 	// classified as "timeout", not "error", per R3 (errors.Is, not ==).
