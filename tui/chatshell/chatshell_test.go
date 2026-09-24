@@ -1202,6 +1202,61 @@ type variableFocusBlock struct {
 
 func (b *variableFocusBlock) Focusable() bool { return b.focusable }
 
+// TestReplaceBlockMovesFocusToNearestStopWhenFocusedEntryBecomesNonFocusable
+// covers r3's m2: when a ReplaceBlock makes the CURRENTLY FOCUSED entry
+// itself non-focusable, focus must move to the nearest remaining focusable
+// stop, not just fall silently unfocused inside the transcript zone.
+func TestReplaceBlockMovesFocusToNearestStopWhenFocusedEntryBecomesNonFocusable(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &fakeBlock{}})                         // stop 0
+	m.transcript.Append(transcript.Entry{ID: "b", Block: &variableFocusBlock{focusable: true}}) // stop 1
+	m.transcript.Append(transcript.Entry{ID: "c", Block: &fakeBlock{}})                         // stop 2
+
+	m.focusRing.FocusStop(1)
+	m.syncFocus()
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.ID != "b" {
+		t.Fatalf("setup: focused entry = %+v, want b", fe)
+	}
+
+	m.ReplaceBlock("b", &variableFocusBlock{focusable: false})
+
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		t.Fatalf("Zone() = %v, want still ZoneTranscript (a focusable entry remains)", m.focusRing.Zone())
+	}
+	fe := m.transcript.FocusedEntry()
+	if fe == nil {
+		t.Fatal("no focused entry after ReplaceBlock made \"b\" non-focusable, want the nearest remaining stop")
+	}
+	if fe.ID != "a" && fe.ID != "c" {
+		t.Errorf("focused entry = %+v, want the nearest remaining focusable entry (a or c)", fe)
+	}
+}
+
+// TestReplaceBlockFallsBackToComposerWhenNoFocusableEntryRemains covers r3's
+// m2's other branch: when the focused entry becomes non-focusable and NO
+// other focusable entry remains, focus hands off to the composer.
+func TestReplaceBlockFallsBackToComposerWhenNoFocusableEntryRemains(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.transcript.Append(transcript.Entry{ID: "only", Block: &variableFocusBlock{focusable: true}})
+
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.ID != "only" {
+		t.Fatalf("setup: focused entry = %+v, want only", fe)
+	}
+
+	m.ReplaceBlock("only", &variableFocusBlock{focusable: false})
+
+	if m.focusRing.Zone() != focus.ZoneInput {
+		t.Errorf("Zone() = %v, want ZoneInput (composer) since no focusable entry remains", m.focusRing.Zone())
+	}
+	if fe := m.transcript.FocusedEntry(); fe != nil {
+		t.Errorf("FocusedEntry() = %+v, want nil", fe)
+	}
+}
+
 // TestReplaceBlockSyncsFocusRingStopNotJustTranscript covers r2's m5:
 // ReplaceBlock must resync m.focusRing's own stop, not just
 // transcript.Model's internal focusIndex — otherwise the next syncFocus
@@ -1569,6 +1624,99 @@ func TestStartStreamMarkdownRendersOnNewlineBoundary(t *testing.T) {
 	if last := renderTexts[len(renderTexts)-1]; last != "line one\nline two" {
 		t.Errorf("last render text = %q, want the full accumulated text on completion", last)
 	}
+}
+
+// TestStartStreamMarkdownScheduledFollowUpTickRendersTrailingFragment is r3's
+// m1 regression test: a delta that gets throttled out (no newline, inside
+// the throttle window) must still render within ~markdownRenderThrottle even
+// if NO further delta ever arrives (e.g. the stream stalls) -- via a
+// scheduled tea.Tick follow-up, not only "wait for the next delta or
+// completion". Drives the stream through a channel it controls (never
+// closed, no completion) so the only way the trailing fragment renders is
+// the scheduled tick firing.
+func TestStartStreamMarkdownScheduledFollowUpTickRendersTrailingFragment(t *testing.T) {
+	h := &fakeHandler{}
+	var renderTexts []string
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		renderTexts = append(renderTexts, text)
+		return "RENDERED:" + text
+	}))
+	m.ctx = context.Background()
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	fakeNow := time.Now()
+	m.nowFunc = func() time.Time { return fakeNow }
+
+	var tickDur time.Duration
+	var tickFn func(time.Time) tea.Msg
+	m.tickFunc = func(d time.Duration, fn func(time.Time) tea.Msg) tea.Cmd {
+		tickDur, tickFn = d, fn
+		return func() tea.Msg { return nil } // never auto-fires; the test invokes tickFn itself
+	}
+
+	// A manual, one-event-at-a-time driver (not drainCmd, which greedily
+	// re-arms the pump and would block forever waiting on the next send
+	// this test controls by hand): unwrap StartStreamMarkdown's initial
+	// tea.Batch once, keep the stream.Start half, and thread stream.
+	// EventMsg.Next by hand between sends.
+	ch := make(chan ai.Event)
+	seq := func(yield func(ai.Event, error) bool) {
+		for ev := range ch {
+			if !yield(ev, nil) {
+				return
+			}
+		}
+	}
+	initial := m.StartStreamMarkdown("turn-1", func(ctx context.Context) iter.Seq2[ai.Event, error] { return seq })
+	batch, ok := initial().(tea.BatchMsg)
+	if !ok || len(batch) == 0 {
+		t.Fatalf("initial cmd = %T, want a non-empty tea.BatchMsg", initial())
+	}
+	pump := batch[0] // stream.Start's re-armable half
+
+	// First delta: lastMarkdownRender is zero-value, so time.Since is huge
+	// -> renders immediately (establishing a recent lastMarkdownRender).
+	ch <- ai.Event{Type: ai.EventTextDelta, Text: "Hel"}
+	ev1, ok := pump().(stream.EventMsg)
+	if !ok {
+		t.Fatalf("pump() = %#v, want stream.EventMsg", ev1)
+	}
+	m.Update(ev1)
+	if len(renderTexts) == 0 || renderTexts[len(renderTexts)-1] != "Hel" {
+		t.Fatalf("renderTexts = %v, want the first delta rendered immediately", renderTexts)
+	}
+	rendersAfterFirst := len(renderTexts)
+
+	// Second delta: no newline, and fakeNow hasn't advanced, so this one is
+	// throttled out -- but it must schedule a follow-up tick.
+	ch <- ai.Event{Type: ai.EventTextDelta, Text: "lo"}
+	ev2, ok := ev1.Next().(stream.EventMsg)
+	if !ok {
+		t.Fatalf("ev1.Next() = %#v, want stream.EventMsg", ev2)
+	}
+	m.Update(ev2)
+	if len(renderTexts) != rendersAfterFirst {
+		t.Fatalf("renderTexts = %v, want no new render yet (this delta should have been throttled)", renderTexts)
+	}
+	if tickFn == nil {
+		t.Fatal("no follow-up tick was scheduled for the throttled delta")
+	}
+	if tickDur != markdownRenderThrottle {
+		t.Errorf("tick duration = %v, want markdownRenderThrottle (%v)", tickDur, markdownRenderThrottle)
+	}
+
+	// Fire the scheduled tick myself -- no further delta, no completion.
+	fakeNow = fakeNow.Add(markdownRenderThrottle)
+	msg := tickFn(fakeNow)
+	m.Update(msg)
+
+	if len(renderTexts) != rendersAfterFirst+1 {
+		t.Fatalf("renderTexts = %v, want exactly one more render after the tick fired", renderTexts)
+	}
+	if last := renderTexts[len(renderTexts)-1]; last != "Hello" {
+		t.Errorf("tick-triggered render text = %q, want the full accumulated \"Hello\"", last)
+	}
+	close(ch)
 }
 
 func TestStartStreamWithoutMarkdownRendererBehavesLikeStartStream(t *testing.T) {

@@ -330,6 +330,20 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			MaxTokens: maxTokens,
 			Stream:    true,
 		}
+		// N3 remainder (r3 review): the adaptive-thinking family (Opus
+		// 5/5.5, Sonnet 5, Fable, and other adaptive ids -- anything
+		// thinkingModeAdaptive reports true for) thinks by default even
+		// with Reasoning left UNSET -- omitting `thinking` does not
+		// disable it on these models, it just leaves depth at the API's
+		// own default. This must not be gated on `reasoningBudgets[req.
+		// Reasoning]` (that map has no "" entry, so Reasoning:"" used to
+		// skip the bump entirely and leave defaultMax's 2048, almost no
+		// room to answer after reasoning). Apply it unconditionally
+		// whenever the caller left MaxTokens unset (same M8 guard as
+		// every other MaxTokens default here) and the model is adaptive.
+		if req.MaxTokens == 0 && thinkingModeAdaptive(model) && body.MaxTokens < 16000 {
+			body.MaxTokens = 16000
+		}
 		if len(req.Tools) > 0 {
 			body.Tools = make([]toolDef, len(req.Tools))
 			for i, t := range req.Tools {
@@ -349,17 +363,13 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			switch {
 			case thinkingModeAdaptive(model):
 				// Claude 4.6+ family: adaptive thinking, no budget_tokens;
-				// depth is controlled by output_config.effort instead.
+				// depth is controlled by output_config.effort instead. The
+				// N3 MaxTokens default for this family is applied
+				// unconditionally above (regardless of Reasoning), not
+				// here -- this switch only fires when req.Reasoning names
+				// an actual budget level.
 				body.Thinking = &thinkingConfig{Type: "adaptive"}
 				body.OutputConfig = &outputConfigWire{Effort: req.Reasoning}
-				// N3 (r2 review): defaultMax (2048) leaves adaptive
-				// thinking almost no room to write an answer after
-				// reasoning. When the caller left MaxTokens unset (free to
-				// raise, same M8 guard as every other branch here), bump
-				// the default up to 16000.
-				if req.MaxTokens == 0 && body.MaxTokens < 16000 {
-					body.MaxTokens = 16000
-				}
 			case req.MaxTokens > 0 && req.MaxTokens < 2048:
 				// Not enough room for a useful thinking budget (min 1024)
 				// alongside any real output without exceeding the caller's

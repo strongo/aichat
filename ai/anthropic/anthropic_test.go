@@ -864,6 +864,42 @@ func TestStream_AdaptiveThinkingKeepsCallerMaxTokensWhenSet(t *testing.T) {
 	}
 }
 
+// TestStream_AdaptiveModelDefaultsMaxTokensEvenWithReasoningUnset is r3's
+// regression test for the N3 remainder: claude-opus-5 (and the rest of the
+// adaptive-thinking family) thinks BY DEFAULT even when Reasoning is left
+// "" -- the 16000 MaxTokens default must not be gated on
+// reasoningBudgets[req.Reasoning] (which has no "" entry), or Reasoning:""
+// on an adaptive model silently gets defaultMax's 2048 instead.
+func TestStream_AdaptiveModelDefaultsMaxTokensEvenWithReasoningUnset(t *testing.T) {
+	var gotBody messagesRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-opus-5"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{
+		// Reasoning deliberately left unset.
+		Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+	}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if gotBody.MaxTokens != 16000 {
+		t.Errorf("MaxTokens = %d, want 16000 (claude-opus-5 thinks by default even with Reasoning unset)", gotBody.MaxTokens)
+	}
+	if gotBody.Thinking != nil {
+		t.Errorf("Thinking = %+v, want nil: Reasoning unset means no explicit thinking config is sent, only the MaxTokens default changes", gotBody.Thinking)
+	}
+}
+
 // TestStream_LegacyThinkingDefaultMaxTokensIsBudgetPlus4096CappedAt16000 is
 // N3's regression test for the legacy budget_tokens form: with MaxTokens
 // left unset, the default is budget+4096, capped at 16000.

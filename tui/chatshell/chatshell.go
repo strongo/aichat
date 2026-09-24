@@ -206,10 +206,22 @@ type Model struct {
 	// transcript.AppendDeltaNoRender) — see handleStreamEvent.
 	streamMarkdown     bool
 	lastMarkdownRender time.Time
+	// markdownTickPending is true while a follow-up markdownRenderTickMsg
+	// is scheduled (m1, r3 review): a throttled-out delta with no further
+	// deltas arriving would otherwise leave its trailing fragment
+	// unrendered indefinitely (nothing re-invalidates the entry until the
+	// NEXT delta or stream completion) — this guarantees a render within
+	// ~markdownRenderThrottle regardless. Guards against scheduling a pile
+	// of redundant ticks while one is already in flight.
+	markdownTickPending bool
 	// nowFunc, when set, replaces time.Now for the markdown-render throttle
 	// (tests only, via a fake clock — avoids real sleeps in a wall-clock
 	// throttle test). nil means time.Now.
 	nowFunc func() time.Time
+	// tickFunc, when set, replaces tea.Tick for the markdown-render
+	// follow-up (tests only — avoids a real ~100ms sleep per test). nil
+	// means tea.Tick.
+	tickFunc func(d time.Duration, fn func(time.Time) tea.Msg) tea.Cmd
 
 	// busyCancel is the cancel func for a product's own SetBusy(true) phase
 	// (e.g. a decision chain), set via SetBusyCancel. Esc/Ctrl+C while busy
@@ -337,6 +349,7 @@ func (m *Model) startStream(id string, markdown bool, open func(ctx context.Cont
 	m.streamID, m.streamCancel = id, cancel
 	m.streamMarkdown = markdown
 	m.lastMarkdownRender = time.Time{}
+	m.markdownTickPending = false
 	m.busy = true
 	m.ctrlCArmed = false
 	m.transcript.Append(transcript.Entry{ID: id, Role: transcript.RoleAssistant, Text: "", Markdown: markdown})
@@ -516,14 +529,50 @@ func (m *Model) Busy() bool { return m.busy }
 // leaving it stale would silently undo transcript's own recomputed focus the
 // next time that happens.
 func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
-	m.transcript.ReplaceBlock(entryID, b)
+	var hadFocus bool
+	var oldStop int
 	if m.focusRing.Zone() == focus.ZoneTranscript {
 		if fe := m.transcript.FocusedEntry(); fe != nil {
-			if stop := m.transcript.StopForID(fe.ID); stop >= 0 {
-				m.focusRing.FocusStop(stop)
-			}
+			hadFocus = true
+			oldStop = m.transcript.StopForID(fe.ID)
 		}
 	}
+
+	m.transcript.ReplaceBlock(entryID, b)
+
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		return
+	}
+	if fe := m.transcript.FocusedEntry(); fe != nil {
+		// Same entry (or a different one whose stop shifted) is still
+		// focusable: resync focusRing's own stop, per m5.
+		if stop := m.transcript.StopForID(fe.ID); stop >= 0 {
+			m.focusRing.FocusStop(stop)
+		}
+		return
+	}
+	if !hadFocus {
+		return
+	}
+	// m2 (r3 review): the previously-focused entry is no longer focusable
+	// (this swap made it so, or an earlier entry's swap shifted stops out
+	// from under it). Move to the NEAREST remaining focusable stop --
+	// oldStop clamped into range, since the entries around a removed stop
+	// slide down to fill it -- or hand off to the composer if the
+	// transcript has no focusable entry left at all.
+	if n := m.transcript.Stops(); n > 0 {
+		newStop := oldStop
+		if newStop >= n {
+			newStop = n - 1
+		}
+		if newStop < 0 {
+			newStop = 0
+		}
+		m.focusRing.FocusStop(newStop)
+	} else {
+		m.focusRing.FocusInput()
+	}
+	m.syncFocus()
 }
 
 // FocusEntry moves focus to the transcript entry identified by id (e.g.
@@ -566,6 +615,8 @@ func (m *Model) ClearTranscript() {
 		m.busyCancel = nil
 	}
 	m.busy = false
+	m.streamMarkdown = false
+	m.markdownTickPending = false
 	m.transcript.Clear()
 	m.focusRing.FocusInput()
 	m.syncFocus()
@@ -684,6 +735,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case stream.DoneMsg:
 		return m.handleStreamDone(msg)
 
+	case markdownRenderTickMsg:
+		m.handleMarkdownRenderTick(msg)
+		return m, nil
+
 	case spinner.TickMsg:
 		if !m.busy {
 			return m, nil
@@ -768,6 +823,7 @@ func (m *Model) handleStreamEvent(msg stream.EventMsg) (tea.Model, tea.Cmd) {
 	// re-arms the pump and still notifies StreamObserver (mirroring
 	// handleStreamDone's stale-Done handling) so per-id product state can be
 	// cleaned up either way.
+	var tickCmd tea.Cmd
 	if msg.ID == m.streamID {
 		switch msg.Event.Type {
 		case ai.EventTextDelta:
@@ -781,6 +837,21 @@ func (m *Model) handleStreamEvent(msg stream.EventMsg) (tea.Model, tea.Cmd) {
 				if strings.Contains(msg.Event.Text, "\n") || m.now().Sub(m.lastMarkdownRender) >= markdownRenderThrottle {
 					m.transcript.InvalidateAndRebuild(msg.ID)
 					m.lastMarkdownRender = m.now()
+					m.markdownTickPending = false
+				} else if !m.markdownTickPending {
+					// m1 (r3 review): this delta was throttled out. Without
+					// a follow-up, its trailing fragment renders only when
+					// the NEXT delta arrives (or the stream completes) —
+					// if the stream stalls or that was the last delta
+					// before a long gap, it would sit unrendered
+					// indefinitely. Schedule one guaranteed re-render
+					// ~markdownRenderThrottle out; markdownTickPending
+					// guards against piling up a tick per throttled delta.
+					m.markdownTickPending = true
+					id := msg.ID
+					tickCmd = m.tick(markdownRenderThrottle, func(time.Time) tea.Msg {
+						return markdownRenderTickMsg{id: id}
+					})
 				}
 			} else {
 				m.transcript.AppendDelta(msg.ID, msg.Event.Text)
@@ -795,12 +866,29 @@ func (m *Model) handleStreamEvent(msg stream.EventMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	cmds := []tea.Cmd{msg.Next}
+	if tickCmd != nil {
+		cmds = append(cmds, tickCmd)
+	}
 	if obs, ok := m.handler.(StreamObserver); ok {
 		if cmd := obs.OnStreamEvent(msg.ID, msg.Event); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	}
 	return m, tea.Batch(cmds...)
+}
+
+// handleMarkdownRenderTick applies the m1 (r3 review) follow-up render
+// scheduled by handleStreamEvent: a delta that was throttled out gets one
+// guaranteed re-render ~markdownRenderThrottle later even with no further
+// deltas. A tick for a superseded/cleared/no-longer-markdown stream is a
+// no-op (mirrors handleStreamEvent's own staleness guard).
+func (m *Model) handleMarkdownRenderTick(msg markdownRenderTickMsg) {
+	m.markdownTickPending = false
+	if msg.id != m.streamID || !m.streamMarkdown {
+		return
+	}
+	m.transcript.InvalidateAndRebuild(msg.id)
+	m.lastMarkdownRender = m.now()
 }
 
 func (m *Model) handleStreamDone(msg stream.DoneMsg) (tea.Model, tea.Cmd) {
@@ -817,6 +905,7 @@ func (m *Model) handleStreamDone(msg stream.DoneMsg) (tea.Model, tea.Cmd) {
 			// triggered their own re-render.
 			m.transcript.InvalidateAndRebuild(msg.ID)
 			m.streamMarkdown = false
+			m.markdownTickPending = false
 		}
 		switch {
 		case isCanceled(msg.Err):
@@ -994,6 +1083,23 @@ func (m *Model) now() time.Time {
 	}
 	return time.Now()
 }
+
+// tick schedules fn to fire after d, using tickFunc when a test has
+// installed a fake one (m1, r3 review's markdown-render follow-up).
+func (m *Model) tick(d time.Duration, fn func(time.Time) tea.Msg) tea.Cmd {
+	if m.tickFunc != nil {
+		return m.tickFunc(d, fn)
+	}
+	return tea.Tick(d, fn)
+}
+
+// markdownRenderTickMsg is the m1 (r3 review) follow-up render: scheduled
+// whenever a text delta accumulates without triggering an immediate
+// markdown re-render (throttled out), it guarantees the trailing fragment
+// still renders within ~markdownRenderThrottle even if no further delta
+// ever arrives (e.g. the stream stalls, or that was simply the last delta
+// before a long gap).
+type markdownRenderTickMsg struct{ id string }
 
 func (m *Model) syncFocus() {
 	switch m.focusRing.Zone() {
