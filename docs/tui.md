@@ -19,10 +19,25 @@ The screen has three focus zones: **Input** (composer), **Transcript**
 | `Shift+Down` | Transcript stop N | Focus stop N+1, or Input past the last stop |
 | `Shift+Right` | Input or Transcript | Focus the sidebar (remembers where focus was) |
 | `Shift+Left` | Sidebar | Return focus to where it was before `Shift+Right` |
-| `Esc` | anywhere | Return focus to Input |
+| `Esc` | anywhere | Return focus to Input, unless the focused Block captures Esc (see below) |
 
 `Shift+Right`/`Shift+Left` only move focus when the sidebar is visible and
-the pane is split (terminal width ≥ 104 columns).
+the pane is split (terminal width ≥ 104 columns). A key that a zone does not
+consume (e.g. `Shift+Left` with nowhere to return to, or `Shift+Up` in the
+transcript with the input non-empty) is never silently swallowed: it falls
+through to that zone's normal handling (composer cursor movement, the
+focused Block's own `Update`, etc.).
+
+If the transcript's focused `Block` implements the optional
+`transcript.EscCapturer` interface (`CapturesEsc() bool`) and returns true
+(e.g. a grid whose "/" filter box currently has input focus), `Esc` is
+routed to the Block's own `Update` instead of returning focus to the
+composer — so the Block can close its own input mode first. `Shift+Left`
+also clamps its remembered transcript stop to the current number of stops,
+in case entries were removed while the sidebar had focus.
+
+`F6` hides the sidebar even while it holds focus; when that happens, focus
+returns to wherever it was before `Shift+Right` (or the input).
 
 ## Composer (`tui/chatshell`)
 
@@ -33,8 +48,14 @@ the pane is split (terminal width ≥ 104 columns).
 | `/` at start of input | Opens the slash-command menu |
 | `↑`/`↓` (menu open) | Move the menu selection |
 | `Enter`/`Tab` (menu open) | Insert the selected command |
-| `F6` | Toggle sidebar visibility |
+| `F6` | Toggle sidebar visibility (moves focus back first if the sidebar held it) |
 | `Ctrl+Left`/`Ctrl+Right` | Shrink/grow the chat pane's split share (40–75%) |
+| `Esc` / `Ctrl+C` | While busy (a stream or `SetBusy(true)` phase): cancel it, rendering `(stopped)` — not an error — in the transcript |
+| `Ctrl+C` | While idle: quit |
+
+The composer stops accepting keystrokes entirely while `Busy()` is true
+(during `StartStream`, or a product's own `SetBusy(true)` phase such as a
+decision/query lookup); the spinner runs in its place.
 
 ## Result grid (`tui/grid`)
 
@@ -43,11 +64,34 @@ the pane is split (terminal width ≥ 104 columns).
 | `↑`/`↓`, `j`/`k` | Move the highlighted row |
 | `←`/`→`, `h`/`l` | Scroll columns horizontally |
 | `1`/`2`/`3` | Switch view: Table / Card / Inspector |
+| `4`.. | Switch to a `WithExtraViews`-registered view, in registration order |
 | `Tab` | Cycle the column `s` sorts by |
 | `s` | Sort (toggle ascending/descending) by the Tab-selected column |
 | `Enter` | Emit `grid.RowActivatedMsg` for the highlighted row |
 | `+` | Emit `tui.AddToSidebarMsg` for the highlighted row's `Ref` |
 | `/` | Open bubble-table's built-in filter |
+
+`Model.CapturesEsc()` reports true while the filter input is focused, so a
+surrounding chatshell should let Esc clear/blur the filter before treating
+Esc as its own (e.g. closing the block).
+
+`grid.Row.Values` is **positional** (`[]any`, aligned with the `Columns`
+slice a `Model` was built from), not a map keyed by column name — two
+columns sharing a name (e.g. `SELECT a.id, b.id`) each keep their own value.
+Use `grid.Absent` for a cell with no value at all (a sparse selection); it
+renders differently from an explicit `nil` ("NULL"). This is a breaking
+change from the earlier `map[string]any` shape.
+
+A large result is capped to `grid.DefaultMaxVisibleRows` rows per page
+(override with `grid.WithMaxVisibleRows`) so it never renders fully into a
+scrolling transcript.
+
+A product registers its own secondary views (DataTug's Charts, Raw response,
+Headers) with `grid.WithExtraViews(...)`, and a table/secondary-view
+split-pane policy — generalising DataTug's `chooseRecordsetLayout` — with
+`grid.WithSplitLayout(...)`; `Model.NaturalWidth()` gives a `LayoutFunc` the
+table's natural (unclipped) content width to compare against the pane's
+total width.
 
 ## Sidebar (`tui/sidebar`)
 
