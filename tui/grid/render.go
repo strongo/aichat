@@ -109,6 +109,13 @@ func (m *Model) viewLabels(width int) []string {
 		}
 		return out
 	}
+	full := func() []string {
+		out := make([]string, len(names))
+		for i, name := range names {
+			out[i] = strconv.Itoa(i+1) + " " + name
+		}
+		return out
+	}
 	switch {
 	case width <= 24:
 		out := make([]string, len(names))
@@ -123,7 +130,11 @@ func (m *Model) viewLabels(width int) []string {
 	case width < 62:
 		return shorten(6)
 	default:
-		return shorten(len(strings.Join(names, "")) + 1) // no truncation
+		// Plenty of room: show each view's own full Label, never
+		// ShortLabel — that's reserved for the narrower tiers above where
+		// abbreviate()'s generic truncation would otherwise risk two
+		// labels reading the same.
+		return full()
 	}
 }
 
