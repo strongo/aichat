@@ -972,13 +972,12 @@ func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 
 	switch {
 	case m.splitEnabled() && msg.X >= m.chatWidth()+splitSeparatorWidth:
-		// Side column: the transcript viewport itself never moves here, so
-		// it is safe to ALSO broadcast to transcript Blocks (e.g. a grid
-		// reacting to it) -- unlike the chat-column case below, there is no
-		// second, chatshell-driven scroll for a Block's own handling to
-		// double against.
-		cmds = append(cmds, m.transcript.Update(msg))
-
+		// Side column: ONLY the SidePanel/sidebar gets it -- the transcript
+		// has nothing to do with a wheel event over the sidebar/SidePanel
+		// column (r4 review: broadcasting to transcript Blocks here, as an
+		// earlier revision did, read backwards -- there is no reason a
+		// wheel tick over the SIDEBAR should reach the TRANSCRIPT).
+		//
 		// A product SidePanel gets the raw event (free to interpret
 		// X/Y/Button itself); the BUILT-IN sidebar has no scroll offset of
 		// its own -- it is a cursor list -- so a wheel tick moves its
@@ -996,22 +995,25 @@ func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.sidebar.Update(key))
 		}
 	default:
-		// Chat column: chatshell itself scrolls the transcript viewport.
-		// r3 review minor 2: deliberately NOT ALSO broadcasting to
-		// transcript Blocks here (unlike the side-column case above) -- a
-		// focused Block that handles tea.MouseWheelMsg itself (e.g.
-		// scrolling its own internal view) would otherwise move TWICE for
-		// one wheel tick: once via its own Update from the broadcast, once
-		// via the outer viewport's ScrollUp/Down right below. The rule is
-		// simple and applies uniformly: the transcript receives a wheel
-		// event through EXACTLY ONE mechanism, never both -- the direct
-		// viewport scroll here, or the Block broadcast in the side-column
-		// case, never simultaneously.
-		switch msg.Button {
-		case tea.MouseWheelUp:
-			m.transcript.ScrollUp(mouseWheelScrollLines)
-		case tea.MouseWheelDown:
-			m.transcript.ScrollDown(mouseWheelScrollLines)
+		// Chat column: the FOCUSED transcript Block gets first refusal (r4
+		// review) via transcript.WheelConsumer -- a Block that wants to
+		// scroll its own internal view (e.g. a grid's row list) for this
+		// event says so, and chatshell delivers the message to it INSTEAD
+		// OF scrolling the transcript viewport itself; only when no Block
+		// is focused, the focused Block doesn't implement WheelConsumer, or
+		// it declines this particular event does chatshell fall back to
+		// scrolling the viewport directly. Exactly one of the two ever
+		// happens for one wheel tick -- never both, so a Block handling the
+		// wheel itself is never double-moved by chatshell's own scroll.
+		if consumed, cmd := m.transcript.DeliverWheelToFocusedBlock(msg); consumed {
+			cmds = append(cmds, cmd)
+		} else {
+			switch msg.Button {
+			case tea.MouseWheelUp:
+				m.transcript.ScrollUp(mouseWheelScrollLines)
+			case tea.MouseWheelDown:
+				m.transcript.ScrollDown(mouseWheelScrollLines)
+			}
 		}
 	}
 

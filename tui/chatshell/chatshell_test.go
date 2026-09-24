@@ -2009,41 +2009,117 @@ func TestMouse_WheelOverBuiltInSidebarMovesCursorNotTranscript(t *testing.T) {
 // ScrollUp/Down. See TestMouse_WheelInSideColumnReachesTranscriptBlocksViaBroadcast
 // for the complementary side-column case, where broadcasting IS safe
 // (nothing else moves the transcript there).
-func TestMouse_WheelInChatColumnDoesNotBroadcastToTranscriptBlocks(t *testing.T) {
-	h := &fakeHandler{}
-	m := New(h, WithMouse(MouseCellMotion))
-	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
-	block := &fakeBlock{}
-	m.AppendBlock(block)
-
-	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown, X: 2})
-
-	if block.updates != 0 {
-		t.Fatalf("transcript Block received the wheel event via broadcast in the chat column (updates=%d), want 0 -- this double-moves a Block that scrolls itself", block.updates)
-	}
+// wheelConsumerBlock is a transcript.Block that also implements
+// transcript.WheelConsumer, for exercising the r4-review "focused Block
+// gets first refusal" rule in the chat column.
+type wheelConsumerBlock struct {
+	fakeBlock
+	consume bool
 }
 
-// TestMouse_WheelInSideColumnReachesTranscriptBlocksViaBroadcast is the
-// complementary case: over the side column (sidebar/SidePanel), the
-// transcript viewport itself never moves, so broadcasting to its Blocks is
-// safe and still happens (dispatchUnhandled's usual guarantee, restored for
-// this branch only -- see TestMouse_WheelInChatColumnDoesNotBroadcastToTranscriptBlocks
-// for why the chat-column branch deliberately does not).
-func TestMouse_WheelInSideColumnReachesTranscriptBlocksViaBroadcast(t *testing.T) {
+func (b *wheelConsumerBlock) ConsumesWheel(msg tea.MouseWheelMsg) bool { return b.consume }
+
+// r4 review minor: a wheel event over the SIDE column (sidebar/SidePanel)
+// must never reach the transcript at all -- not the viewport, not any
+// Block -- the transcript has nothing to do with a wheel tick over the
+// sidebar.
+func TestMouse_WheelInSideColumnNeverReachesTranscript(t *testing.T) {
 	h := &fakeHandler{}
 	m := New(h, WithMouse(MouseCellMotion))
 	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
-	block := &fakeBlock{}
+	block := &wheelConsumerBlock{consume: true}
 	m.AppendBlock(block)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift}) // focus the block
+	beforeTranscript := m.transcript.View()
 
 	sideX := m.chatWidth() + splitSeparatorWidth + 1
 	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown, X: sideX})
 
-	if block.updates == 0 {
-		t.Fatal("transcript Block did not receive the wheel event via broadcast in the side column")
+	if block.updates != 0 {
+		t.Fatalf("transcript Block received the wheel event over the side column (updates=%d), want 0", block.updates)
+	}
+	if got := m.transcript.View(); got != beforeTranscript {
+		t.Fatal("transcript viewport moved for a wheel event over the side column")
+	}
+}
+
+// r4 review minor: in the CHAT column, a focused Block implementing
+// transcript.WheelConsumer that reports it consumes the event gets the
+// message delivered to it INSTEAD OF chatshell scrolling the transcript
+// viewport.
+func TestMouse_WheelChatColumn_ConsumingFocusedBlockSkipsViewportScroll(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	block := &wheelConsumerBlock{consume: true}
+	m.AppendBlock(block)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift}) // focus the block
+	beforeTranscript := m.transcript.View()
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown, X: 2})
+
+	if block.updates != 1 {
+		t.Fatalf("block.updates = %d, want 1 (delivered once)", block.updates)
 	}
 	if _, ok := block.lastEvent.(tea.MouseWheelMsg); !ok {
 		t.Fatalf("block.lastEvent = %T, want tea.MouseWheelMsg", block.lastEvent)
+	}
+	if got := m.transcript.View(); got != beforeTranscript {
+		t.Fatal("transcript viewport also scrolled even though the focused Block consumed the wheel event")
+	}
+}
+
+// r4 review minor: a focused Block that implements WheelConsumer but
+// DECLINES the event (ConsumesWheel returns false) falls back to
+// chatshell's own viewport scroll -- and the Block is never delivered the
+// message at all (it declined, nothing to dispatch).
+func TestMouse_WheelChatColumn_DecliningFocusedBlockFallsBackToViewportScroll(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	// Appended LAST (so it's near the bottom, where the viewport already
+	// sits, leaving room to scroll UP into the 100 lines above it once
+	// focused).
+	block := &wheelConsumerBlock{consume: false}
+	m.AppendBlock(block)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift}) // focus the block (the only focusable stop)
+	beforeTranscript := m.transcript.View()
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: 2})
+
+	if block.updates != 0 {
+		t.Fatalf("block.updates = %d, want 0 (it declined, so it must not be dispatched to)", block.updates)
+	}
+	if got := m.transcript.View(); got == beforeTranscript {
+		t.Fatal("transcript viewport did not scroll despite the focused Block declining the wheel event")
+	}
+}
+
+// r4 review minor: a non-WheelConsumer focused Block (the common case)
+// falls back to chatshell's own viewport scroll, same as no Block focused
+// at all.
+func TestMouse_WheelChatColumn_NonConsumerBlockFallsBackToViewportScroll(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	block := &fakeBlock{} // appended LAST -- see the decline test above for why
+	m.AppendBlock(block)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift})
+	beforeTranscript := m.transcript.View()
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: 2})
+
+	if block.updates != 0 {
+		t.Fatalf("block.updates = %d, want 0 (fakeBlock does not implement WheelConsumer)", block.updates)
+	}
+	if got := m.transcript.View(); got == beforeTranscript {
+		t.Fatal("transcript viewport did not scroll despite the focused Block not implementing WheelConsumer")
 	}
 }
 
