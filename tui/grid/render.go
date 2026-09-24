@@ -156,6 +156,17 @@ func (m *Model) tableViewAt(width int) string {
 	return view
 }
 
+// ActiveViewContent renders just the active view's own body (table or the
+// active ExtraView) at the given size, without any card chrome and without
+// the OTHER pane a split layout would show alongside it. A product's test
+// wants this instead of the full View() output whenever a split layout could
+// put the table's own header/cells within reach of a substring match aimed
+// only at the secondary view (e.g. asserting a CardView's scroll position by
+// checking which fields are currently rendered).
+func (m *Model) ActiveViewContent(width, height int) string {
+	return m.viewBody(m.view, width, height)
+}
+
 func (m *Model) viewBody(view View, width, height int) string {
 	if view == ViewTable {
 		return m.table.View()
