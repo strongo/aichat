@@ -47,6 +47,18 @@ type targetedMsg struct{ id string }
 
 func (m targetedMsg) TargetEntryID() string { return m.id }
 
+type wheelConsumingBlock struct {
+	fakeBlock
+	consume bool
+}
+
+func (b *wheelConsumingBlock) ConsumesWheel(msg tea.MouseWheelMsg) bool { return b.consume }
+
+func (b *wheelConsumingBlock) Update(msg tea.Msg) (Block, tea.Cmd) {
+	b.updates++
+	return b, nil
+}
+
 func TestAppendAndView(t *testing.T) {
 	m := New()
 	m.SetSize(40, 10)
@@ -384,4 +396,80 @@ func TestSetMarkdownRendererAppliesAfterConstruction(t *testing.T) {
 	if gotWidth <= 0 {
 		t.Errorf("renderer width = %d, want > 0", gotWidth)
 	}
+}
+
+func TestDeliverWheelToFocusedBlock_NoFocus(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{Block: &wheelConsumingBlock{consume: true}})
+	consumed, cmd := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{})
+	if consumed {
+		t.Fatal("consumed = true, want false (nothing focused)")
+	}
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil")
+	}
+}
+
+func TestDeliverWheelToFocusedBlock_FocusedButNoBlock(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{Role: RoleUser, Text: "hi"}) // focusable (RoleUser), no Block
+	m.Focus(0)
+	consumed, _ := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{})
+	if consumed {
+		t.Fatal("consumed = true, want false (focused entry has no Block)")
+	}
+}
+
+func TestDeliverWheelToFocusedBlock_NonConsumerBlock(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	blk := &fakeBlock{label: "b"} // does not implement WheelConsumer
+	m.Append(Entry{Block: blk})
+	m.Focus(0)
+	consumed, _ := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{})
+	if consumed {
+		t.Fatal("consumed = true, want false (Block doesn't implement WheelConsumer)")
+	}
+	if blk.updates != 0 {
+		t.Fatalf("blk.updates = %d, want 0 (never dispatched)", blk.updates)
+	}
+}
+
+func TestDeliverWheelToFocusedBlock_DecliningBlock(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	blk := &wheelConsumingBlock{consume: false}
+	m.Append(Entry{Block: blk})
+	m.Focus(0)
+	consumed, _ := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{})
+	if consumed {
+		t.Fatal("consumed = true, want false (Block declined)")
+	}
+	if blk.updates != 0 {
+		t.Fatalf("blk.updates = %d, want 0 (declined, never dispatched)", blk.updates)
+	}
+}
+
+func TestDeliverWheelToFocusedBlock_ConsumingBlockDispatchesAndRebuilds(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	blk := &wheelConsumingBlock{consume: true}
+	m.Append(Entry{Block: blk})
+	m.Focus(0)
+	consumed, cmd := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	if !consumed {
+		t.Fatal("consumed = false, want true")
+	}
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil (fake block returns nil)")
+	}
+	if blk.updates != 1 {
+		t.Fatalf("blk.updates = %d, want 1", blk.updates)
+	}
+	// Rebuild ran (and re-validated the cache) as part of the dispatch --
+	// confirmed indirectly via View() not panicking/erroring on the fresh
+	// state; the important behavior is consumed=true, updates=1 above.
+	_ = m.View()
 }

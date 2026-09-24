@@ -44,7 +44,7 @@ The module's `tui/*` tree MUST be organised as: `tui` (the message vocabulary sh
 
 #### REQ: transcript-block-contract
 
-`tui/transcript.Block` MUST be the extension point for a rich transcript entry (e.g. a `tui/grid.Model`): `View(width int, focused bool) string`, `Update(msg tea.Msg) (Block, tea.Cmd)` (the Bubble Tea value-model convention: `Update` returns the possibly-new `Block` value, never mutates in place), and `Focusable() bool`. A `Block` that also implements `EntityBlock` (`Current() *session.EntityRef`) additionally reports which entity is under its cursor, which `chatshell.Model.FocusedRef` and "Add to sidebar" use.
+`tui/transcript.Block` MUST be the extension point for a rich transcript entry (e.g. a `tui/grid.Model`): `View(width int, focused bool) string`, `Update(msg tea.Msg) (Block, tea.Cmd)` (the Bubble Tea value-model convention: `Update` returns the possibly-new `Block` value, never mutates in place), and `Focusable() bool`. A `Block` that also implements `EntityBlock` (`Current() *session.EntityRef`) additionally reports which entity is under its cursor, which `chatshell.Model.FocusedRef` and "Add to sidebar" use; one that implements `WheelConsumer` (`ConsumesWheel(msg tea.MouseWheelMsg) bool`) can claim a mouse wheel event for itself while focused instead of chatshell scrolling the transcript viewport for it (see REQ: chatshell-mouse-support).
 
 #### REQ: transcript-streamed-append
 
@@ -82,6 +82,18 @@ An optional `SidePanelPinner` capability (`PinRef(ref session.EntityRef) bool`, 
 
 `chatshell.Model.PushOverlay(o Overlay) tea.Cmd` (`Overlay`: `View(width, height int) string`, `Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)`) MUST push a modal dialog onto an overlay stack. While the stack is non-empty, the TOP overlay MUST capture user INPUT ONLY — key presses, paste, and mouse events — until its `Update` returns `done: true`, at which point it is popped; an OLDER overlay beneath it MUST NOT receive any message while a newer one is on top. Every OTHER message (stream pump events, the spinner tick, sidebar/product messages, ...) takes chatshell's NORMAL path even while an overlay is open, so e.g. a stream keeps completing and clears `Busy()` behind an open dialog. A `tea.WindowSizeMsg` MUST still resize the shell (and forward to an active `SidePanel`) even while an overlay is open. The top overlay MUST be rendered centred over the rest of the screen, CLAMPED to the box it was asked to render into (`View`'s `width`/`height` arguments) regardless of what it actually draws.
 
+`Overlay` implementations MUST be POINTER types (r3 review, minor 1): `updateOverlay` stores back whatever value `Update` returns, so a value receiver's own mutations are preserved regardless, but `CloseOverlay`'s identity match (below) can only ever find a pointer, since Go interface equality on a struct value compares fields, not "is this the same logical dialog" — a value `Overlay` a product still holds a copy of never `==` the (possibly re-wrapped) value `Update` last returned.
+
+`chatshell.Model.PopOverlay() tea.Cmd` MUST close the TOP overlay PROGRAMMATICALLY, without waiting for its own `Update` to report `done: true`, and MUST be a no-op (return `nil`) when the overlay stack is empty. PopOverlay is TOP-ONLY: it closes whatever happens to be on top, regardless of which overlay a caller "meant" — correct for the common single-overlay case, but WRONG (r3 review, MAJOR) for the ASYNC-SAFE overlay pattern below once a SECOND overlay can be stacked on top of the first before its async result arrives (dialog A's submit is in flight, the user opens dialog B on top of it, A's result lands: `PopOverlay` would close B, not A).
+
+`chatshell.Model.CloseOverlay(o Overlay) bool` MUST remove `o` from the overlay stack WHEREVER IT IS (not only if it's on top), matching by POINTER IDENTITY, and report whether it was found and removed. A non-pointer `Overlay`, or a nil pointer, MUST NOT match anything (`CloseOverlay` returns `false`) rather than panicking — identity MUST be extracted via reflection (or an equivalent safe mechanism) specifically to avoid a runtime panic comparing two interface values whose dynamic type is non-comparable (e.g. one holding a slice or map field), which a direct `==` comparison would risk.
+
+Async-safe overlay pattern: an `Overlay` that must stay open ACROSS an async round trip (e.g. a form whose submission posts to a server before the dialog can close) returns `done: false` plus a product `tea.Cmd` from its own `Update` on submit, exactly like any other command chatshell dispatches. The product's own async RESULT message, once it arrives, is NOT itself overlay input (`isOverlayInputMsg` classifies only key/paste/mouse messages) — it takes chatshell's normal `Update` path and reaches an optional `MsgHandler.OnMsg` EVEN WHILE THE OVERLAY IS STILL OPEN (even while ANOTHER overlay has since been stacked on top of it), the same as every other non-input message this REQ already routes around an open overlay. From there the product calls `CloseOverlay(o)` with the SAME `*T` it passed to `PushOverlay` on success (`PopOverlay` is unsafe here once more than one overlay might be open at once), or updates the overlay in place to show an error while keeping the user's draft (e.g. an optional `interface{ OnResult(any) }` capability the product's own `Overlay` implements, or simply because the product holds that same pointer and can mutate it directly) — `chatshell` itself defines no such result-routing interface; it only guarantees the message reaches `OnMsg` and that `CloseOverlay`/`PopOverlay` work.
+
+#### REQ: chatshell-focus-accessors
+
+`(m *Model) Zone() focus.Zone` MUST report the focus ring's current zone (`focus.ZoneInput`, `focus.ZoneTranscript`, or `focus.ZoneSidebar` — the sidebar zone covers both the built-in sidebar and an installed `SidePanel`), e.g. for a product's context-specific status hint. `(m *Model) FocusedEntryID() string` MUST report the `id` of the transcript entry currently under focus (`AppendBlockWithID`/`StartStream`'s id), and MUST return `""` when the transcript isn't the focused zone, no entry is focused, or the focused entry was never given an id (a plain `AppendUser`/`AppendAssistant`/`AppendBlock` entry).
+
 #### REQ: chatshell-global-keys
 
 `chatshell.WithGlobalKeys(func(tea.KeyPressMsg) (tea.Cmd, bool))` MUST be checked BEFORE chatshell's own key handling (Ctrl+C, Esc, F6, Shift+arrows, the composer, ...) on every `tea.KeyPressMsg` chatshell would otherwise process (i.e. when no `Overlay` is capturing it) -- returning `consumed: true` stops chatshell from handling that key at all this cycle; `consumed: false` lets chatshell's normal handling proceed as if the hook were absent.
@@ -101,6 +113,17 @@ An optional `SidePanelPinner` capability (`PinRef(ref session.EntityRef) bool`, 
 `chatshell.WithMarkdownRenderer(r transcript.MarkdownRenderer)` MUST configure the renderer `AppendAssistantMarkdown(text string)` — and any `transcript.Entry` with `Markdown` set — uses (e.g. a glamour-backed renderer for agent or HTTP-response markdown), equivalent to `transcript.New(transcript.WithMarkdownRenderer(r))` but settable on a `chatshell.Model`'s already-constructed transcript. `StartStreamMarkdown(id string, open func(ctx context.Context) iter.Seq2[ai.Event, error]) tea.Cmd` MUST behave exactly like `StartStream` except the streaming entry is created with `Markdown` set; with no renderer configured it behaves identically to `StartStream` (the flag is inert).
 
 Every delta's text MUST be accumulated onto the entry immediately (so the final `Text` is always complete), but re-running the renderer over that accumulated text on every single delta is NOT required and MUST be throttled: at most once per a bounded time window (`markdownRenderThrottle`, 100ms), PLUS any delta whose text crosses a newline (a likely-stable rendering point such as a completed list item or paragraph) forces an immediate re-render even inside that window, PLUS the stream's completion MUST always force one final re-render regardless of the window, so the displayed markdown is never stale once the stream ends. A delta that gets throttled out (m1, r3 review) MUST also schedule a ONE-SHOT `tea.Tick` follow-up render `markdownRenderThrottle` later, guaranteeing its trailing fragment still renders even if NO further delta ever arrives (a stalled or slow-trickling stream) -- not only "wait for the next delta or completion"; at most one such follow-up is pending at a time (a delta arriving before it fires does not schedule a second one). `chatshell.Model` exposes no way to disable this throttle; a product that needs every-delta rendering re-renders its own copy of the accumulated `Text` outside `chatshell`.
+
+#### REQ: chatshell-mouse-support
+
+`chatshell.WithMouse(mode MouseMode)` MUST set the chat screen's initial mouse-reporting state: `MouseOff` (the default when `WithMouse` is never called) requests no mouse reporting at all -- the terminal's own native text selection/copy keeps working -- and `MouseCellMotion` requests click/release/wheel events (`tea.MouseModeCellMotion`) from construction. `WithMouse(MouseOff)` MUST NOT overwrite the Model's configured mode down to `MouseOff` -- only an actual enabling mode (`MouseCellMotion`) updates it; `MouseOff` only clears the enabled flag, so a LATER `SetMouseEnabled(true)` still restores `MouseCellMotion` (New's default) rather than silently staying off forever because the mode itself was clobbered. `(m *Model) SetMouseEnabled(enabled bool)` MUST toggle mouse reporting at runtime -- e.g. DataTug's F2 capture toggle, since a terminal's native text selection is unusable while mouse reporting is on, so a product offering both needs a key to flip between them -- taking effect on the next `View()` (chatshell has no way to push a mode change to the terminal outside the normal render cycle); `enabled: true` restores the mode configured via `WithMouse` (`MouseCellMotion` if `WithMouse` was never called OR was only ever called with `MouseOff`, never a silent no-op), `enabled: false` requests `tea.MouseModeNone` regardless of that configured mode. `(m *Model) MouseEnabled() bool` MUST report the current toggle state. `View()` MUST set the returned `tea.View`'s `MouseMode` from this state on every render.
+
+EXCEPT while an `Overlay` is on the stack (where it is already captured as overlay input, per REQ: chatshell-overlay's existing `isOverlayInputMsg` classification, unchanged by this REQ, and never reaches any of the below), a `tea.MouseWheelMsg` routes on whether the pane is split (REQ: chatshell-side-panel's `splitEnabled`) and the event's `X` falls at or past the side/sidebar column (`chatWidth() + 3`, the width of the " │ " divider `View()` draws between the chat column and that column):
+
+- in the SIDE column, the event goes ONLY to the `SidePanel`/sidebar (r4 review: the transcript has NOTHING to do with a wheel tick over the sidebar/SidePanel column -- an earlier revision broadcast it to transcript `Block`s there too, which read backwards). When a `SidePanel` is installed (`WithSidePanel`), the raw event is forwarded to `SidePanel.Update` (free to interpret `X`/`Y`/`Button` itself); otherwise (the BUILT-IN `tui/sidebar`, which has no scroll offset of its own -- it is a cursor list, not a viewport), the event moves its cursor the same way an Up/Down key would: `tea.KeyPressMsg{Code: tea.KeyUp}` for `tea.MouseWheelUp`, `tea.KeyPressMsg{Code: tea.KeyDown}` for `tea.MouseWheelDown`, forwarded to `sidebar.Model.Update`.
+- in the CHAT column (the default: not split, or `X` short of that boundary), the FOCUSED transcript `Block` gets first refusal via the optional `transcript.WheelConsumer` capability (`ConsumesWheel(msg tea.MouseWheelMsg) bool`, a pure query with no side effect): `transcript.Model.DeliverWheelToFocusedBlock(msg)` MUST dispatch msg to the focused entry's `Block` ONLY (never a broadcast to every entry) IF that `Block` implements `WheelConsumer` AND `ConsumesWheel(msg)` reports true for it, reporting `consumed: true` and the `Block`'s own returned `tea.Cmd`; chatshell scrolls the transcript viewport itself (`tea.MouseWheelUp`/`tea.MouseWheelDown` calling `transcript.Model.ScrollUp`/`ScrollDown`) IF AND ONLY IF `DeliverWheelToFocusedBlock` reported `consumed: false` -- no Block is focused, the focused `Block` doesn't implement `WheelConsumer`, or it declined this particular event. This is what prevents "wheel double-move" (r3 review, minor 2): a focused `Block` that handles `tea.MouseWheelMsg` itself (scrolling its own internal view, e.g. a grid's row list) is dispatched to EXACTLY ONCE and the transcript viewport does NOT also move for the same tick; a `Block` that declines, or doesn't implement the capability at all, is never dispatched to, and the viewport scrolls exactly as if no `Block` were focused.
+
+The transcript receives a wheel event through AT MOST ONE mechanism per tick, never both: the focused-`Block` dispatch OR the direct viewport scroll in the chat column (never simultaneously), and NEITHER in the side column. Regardless of which column applies, a `tea.MouseWheelMsg` MUST ALSO always be forwarded to an optional `MsgHandler.OnMsg` (same as `dispatchUnhandled` forwards every other message chatshell does not itself fully own), and any non-nil `tea.Cmd` from the focused-`Block` dispatch, the `SidePanel`/sidebar routing, or `MsgHandler` MUST be included in the returned batch.
 
 ### Sidebar
 
@@ -229,6 +252,27 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **When** the stream's events are drained
 **Then** the stream still completes and `Busy()` clears (its `EventMsg`/`DoneMsg` never reached the overlay, only key/paste/mouse would have); and every rendered line of `View()`'s output is no wider than the screen, whatever the oversized overlay tried to draw
 
+### AC: async-overlay-stays-open-on-failure-closes-on-success
+**Requirements:** tui-kit#req:chatshell-overlay
+
+**Given** a `chatshell.Model` with an `Overlay` pushed whose own `Update` never itself reports `done: true`, and a `Handler` that also implements `MsgHandler` and holds a reference to the `Model` and the overlay
+**When** a product-defined async result message carrying failure is sent through `Update`, and separately one carrying success
+**Then** the failure message reaches `MsgHandler.OnMsg` while the overlay is still open (it is not overlay input) and the overlay stays open (state on it can be mutated in place, e.g. to show an error); the success message likewise reaches `OnMsg`, whose handler calls `CloseOverlay(o)` with that same overlay, and the overlay is thereafter removed from the stack; separately, `PopOverlay()`/`CloseOverlay(o)` on an empty overlay stack both return `nil`/`false` respectively and do not panic
+
+### AC: close-overlay-removes-correct-overlay-when-another-is-stacked-on-top
+**Requirements:** tui-kit#req:chatshell-overlay
+
+**Given** a `chatshell.Model` with two `*fakeOverlay` pushed in order (A then B, B on top)
+**When** `CloseOverlay(A)` is called
+**Then** it returns `true`, A is removed from the stack, and B remains (specifically NOT removed, unlike what `PopOverlay()` would have done since B is on top); separately, `CloseOverlay` given an overlay that was never pushed returns `false` and leaves the stack untouched, and `CloseOverlay` given a NON-POINTER `Overlay` value or a nil `*T` pointer also returns `false` without panicking (never matches by Go's `==`, which would risk a panic on a non-comparable underlying type)
+
+### AC: focus-accessors-report-zone-and-focused-entry-id
+**Requirements:** tui-kit#req:chatshell-focus-accessors
+
+**Given** a `chatshell.Model` with one `AppendBlockWithID`-appended transcript entry
+**When** `Zone()`/`FocusedEntryID()` are read at construction (composer focused), after `Shift+Up` focuses the transcript entry, and after `Shift+Right` moves focus to the sidebar
+**Then** they report `(focus.ZoneInput, "")`, `(focus.ZoneTranscript, "<that entry's id>")`, and `(focus.ZoneSidebar, "")` respectively — `FocusedEntryID()` only ever reports non-empty while `Zone() == focus.ZoneTranscript` AND the focused entry was given an id
+
 ### AC: global-keys-checked-before-shell-defaults
 **Requirements:** tui-kit#req:chatshell-global-keys
 
@@ -319,6 +363,41 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a `chatshell.Model` built `WithMarkdownRenderer(r)`, a fake clock, and a fake `tea.Tick` that the test fires by hand
 **When** a delta is rendered immediately, then a second delta arrives that the throttle window suppresses (no newline, no elapsed window) and NO further delta or completion ever arrives
 **Then** a one-shot follow-up tick is scheduled for `markdownRenderThrottle` out, and firing it (with no further stream activity) triggers exactly one more render carrying the full accumulated text, including the previously-suppressed fragment
+
+### AC: mouse-wheel-scrolls-transcript-and-toggle-restores-configured-mode
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` with enough transcript entries to overflow the viewport
+**When** a `tea.MouseWheelMsg{Button: tea.MouseWheelUp}` is sent through `Update`, followed by `tea.MouseWheelMsg{Button: tea.MouseWheelDown}`
+**Then** `View().MouseMode` is `tea.MouseModeCellMotion` throughout, the transcript's rendered view changes after the wheel-up and returns to its original rendering after the matching wheel-down; separately, `SetMouseEnabled(false)` then `View()` reports `tea.MouseModeNone`, and a later `SetMouseEnabled(true)` (with no further `WithMouse` call) restores `tea.MouseModeCellMotion` rather than staying off; separately again, pushing an `Overlay` and sending the same wheel-up leaves the transcript's rendered view unchanged (the overlay captures it first)
+
+### AC: mouse-with-mouse-off-does-not-clobber-later-set-mouse-enabled
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseOff)` (an EXPLICIT off, not the implicit default of never calling `WithMouse` at all)
+**When** `SetMouseEnabled(true)` is called afterward, with no further `WithMouse` call
+**Then** `View().MouseMode` is `tea.MouseModeCellMotion`, not `tea.MouseModeNone` -- the explicit `MouseOff` must not have overwritten the Model's underlying configured mode
+
+### AC: mouse-wheel-routes-to-sidepanel-column-and-always-reaches-msghandler
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` and `WithSidePanel(p)`, split (width ≥ 104), with a `Handler` that also implements `MsgHandler`, and enough transcript entries to overflow the viewport
+**When** a `tea.MouseWheelMsg` with `X` at or past the side panel's column is sent through `Update`, and separately one with `X` inside the chat column
+**Then** the side-panel-column event reaches `p.Update` (and the transcript's rendered view is unchanged) while the chat-column event scrolls the transcript (and `p.Update` is NOT additionally called for it); in BOTH cases `MsgHandler.OnMsg` is called with the `tea.MouseWheelMsg`, and a non-nil `tea.Cmd` returned by either `p.Update` or `OnMsg` is included in `Update`'s returned command
+
+### AC: mouse-wheel-never-reaches-transcript-in-the-side-column
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` with a focused `transcript.Block` implementing `WheelConsumer` (`ConsumesWheel` returning `true`), split (width ≥ 104), no `SidePanel` installed
+**When** a `tea.MouseWheelMsg` with `X` at or past the sidebar column is sent through `Update`
+**Then** the `Block`'s `Update` is NOT called and the transcript's rendered view is unchanged -- only the built-in sidebar's cursor moves (r4 review: the transcript has nothing to do with a wheel event over the sidebar column, regardless of what the focused `Block` would otherwise consume)
+
+### AC: mouse-wheel-chat-column-focused-block-first-refusal
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` with enough transcript entries to overflow the viewport, and separately: (a) a focused `transcript.Block` implementing `WheelConsumer` with `ConsumesWheel` returning `true`, (b) a focused `transcript.Block` implementing `WheelConsumer` with `ConsumesWheel` returning `false`, (c) a focused `transcript.Block` that does not implement `WheelConsumer` at all
+**When** a `tea.MouseWheelMsg` with `X` in the chat column is sent through `Update` in each case
+**Then** in case (a) the `Block`'s `Update` is called exactly once with the wheel message and the transcript viewport does NOT also scroll; in cases (b) and (c) the `Block`'s `Update` is NEVER called and the transcript viewport DOES scroll, identically to no `Block` being focused at all
 
 ## Open Questions
 

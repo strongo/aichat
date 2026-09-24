@@ -56,6 +56,16 @@ type Targeted interface {
 	TargetEntryID() string
 }
 
+// WheelConsumer is an optional Block capability: a FOCUSED Block that wants
+// to handle a tea.MouseWheelMsg itself (e.g. scrolling its own internal
+// view, such as a grid's row list) implements it. ConsumesWheel is a pure
+// query -- it reports whether the Block WOULD consume msg without any side
+// effect -- so DeliverWheelToFocusedBlock can decide whether to actually
+// dispatch it before doing so.
+type WheelConsumer interface {
+	ConsumesWheel(msg tea.MouseWheelMsg) bool
+}
+
 // MarkdownRenderer renders markdown text to terminal-safe output at width.
 // Entries with Markdown set use it when the Model was built WithMarkdownRenderer;
 // otherwise Markdown is inert and the entry renders as plain text.
@@ -330,6 +340,31 @@ func (m *Model) FocusedEntry() *Entry {
 		return nil
 	}
 	return &m.entries[i]
+}
+
+// DeliverWheelToFocusedBlock dispatches msg to the FOCUSED entry's Block
+// ONLY (never a broadcast to every entry, unlike Update's non-key path) --
+// and ONLY when that Block implements WheelConsumer and its ConsumesWheel
+// reports true for msg. It reports whether msg was consumed: false means
+// either no Block is focused, the focused Block doesn't implement
+// WheelConsumer, or it declined this particular event, and the CALLER
+// should handle the wheel event itself instead (e.g. scroll a viewport) --
+// mirroring tui/chatshell's "never both" rule for its own transcript
+// viewport vs. a focused Block's own wheel handling.
+func (m *Model) DeliverWheelToFocusedBlock(msg tea.MouseWheelMsg) (consumed bool, cmd tea.Cmd) {
+	i := m.entryIndexForStop(m.focusIndex)
+	if i < 0 || m.entries[i].Block == nil {
+		return false, nil
+	}
+	wc, ok := m.entries[i].Block.(WheelConsumer)
+	if !ok || !wc.ConsumesWheel(msg) {
+		return false, nil
+	}
+	blk, cmd := m.entries[i].Block.Update(msg)
+	m.entries[i].Block = blk
+	m.entries[i].renderValid = false
+	m.Rebuild(false)
+	return true, cmd
 }
 
 // Current returns the entity ref under focus, when the focused entry's Block

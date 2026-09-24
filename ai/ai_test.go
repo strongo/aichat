@@ -223,6 +223,9 @@ func TestUsage_BillableTokens(t *testing.T) {
 		// InputTokens+OutputTokens only: CacheReadTokens/ReasoningTokens
 		// are subsets already inside those two totals.
 		{"openai-compatible", 150},
+		// ai/openairesponses follows the same subset convention as
+		// ai/openaicompat (see BillableTokens doc).
+		{"openai-responses", 150},
 		// InputTokens+OutputTokens+CacheReadTokens+CacheWriteTokens:
 		// Anthropic bills cache reads/writes separately from input_tokens/
 		// output_tokens. ReasoningTokens is never added (no adapter
@@ -247,8 +250,9 @@ func TestUsage_BillableTokens(t *testing.T) {
 func TestUsage_BillableTokensZeroCacheFieldsMatchAcrossProviders(t *testing.T) {
 	u := Usage{InputTokens: 30, OutputTokens: 12}
 	openai := u.BillableTokens("openai-compatible")
+	responses := u.BillableTokens("openai-responses")
 	anthropic := u.BillableTokens("anthropic")
-	if openai != 42 || anthropic != 42 {
-		t.Errorf("openai-compatible = %d, anthropic = %d, want both 42 with no cache tokens reported", openai, anthropic)
+	if openai != 42 || responses != 42 || anthropic != 42 {
+		t.Errorf("openai-compatible = %d, openai-responses = %d, anthropic = %d, want all 42 with no cache tokens reported", openai, responses, anthropic)
 	}
 }

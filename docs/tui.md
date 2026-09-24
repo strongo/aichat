@@ -224,6 +224,21 @@ or a Block message such as `grid.RowActivatedMsg` — in addition to that
 message being broadcast to the transcript's Blocks (see `transcript.Targeted`
 for routing a message to one entry by ID instead of every Block).
 
+## Mouse (`tui/chatshell`)
+
+Mouse reporting is OFF by default (a terminal's own native text
+selection/copy keeps working). A product opts in with
+`chatshell.WithMouse(chatshell.MouseCellMotion)` at construction, or toggles
+it at runtime with `(m *Model) SetMouseEnabled(bool)` / `MouseEnabled()
+bool` — e.g. DataTug's `F2` capture toggle, since native text selection is
+unusable while mouse reporting is on, so a screen offering both needs a key
+to flip between them. Once enabled, the mouse wheel scrolls the transcript
+viewport (`tea.MouseWheelUp`/`tea.MouseWheelDown`); every other mouse event
+(click, release, motion) is still delivered to chatshell's `Update` but has
+no built-in effect. While an `Overlay` is on the stack, a wheel event is
+captured by the overlay like any other input and never reaches the
+transcript.
+
 ## Extension points (`tui/chatshell`)
 
 - **`WithSidePanel(p SidePanel)`** replaces the default sidebar END TO END:

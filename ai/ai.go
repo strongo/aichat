@@ -191,6 +191,13 @@ const (
 	// server-side tools). Not a stopping point a caller should treat as
 	// "done" the way StopReasonEnd is.
 	StopReasonPauseTurn = "pause_turn"
+	// StopReasonContentFilter: the provider stopped generation because a
+	// content filter flagged the response (e.g. ai/openairesponses'
+	// response.incomplete with incomplete_details.reason
+	// "content_filter"). Like StopReasonRefusal, not an ai.Error -- the
+	// response completed, just with content the provider declined to
+	// finish delivering.
+	StopReasonContentFilter = "content_filter"
 )
 
 // Event is one normalised stream event. Exactly the fields relevant to Type
@@ -274,9 +281,14 @@ type Usage struct {
 // per-field doc on Usage) against the total it is already included in.
 // provider should be the ai.LLMProvider.Name() that produced this Usage:
 //
-//   - "openai-compatible": CacheReadTokens/ReasoningTokens are
-//     informational subsets already counted inside InputTokens/
-//     OutputTokens — Total = InputTokens + OutputTokens.
+//   - "openai-compatible" and "openai-responses": CacheReadTokens/
+//     ReasoningTokens are informational subsets already counted inside
+//     InputTokens/OutputTokens — Total = InputTokens + OutputTokens.
+//     ai/openairesponses populates them from the Responses API's
+//     usage.input_tokens_details.cached_tokens and
+//     usage.output_tokens_details.reasoning_tokens, the same subset
+//     relationship as ai/openaicompat's Chat Completions
+//     prompt_tokens_details/completion_tokens_details fields.
 //   - "anthropic" (and any other/unrecognised provider name — see below):
 //     CacheReadTokens/CacheWriteTokens are billed separately from
 //     InputTokens/OutputTokens — Total = InputTokens + OutputTokens +
@@ -292,7 +304,7 @@ type Usage struct {
 // this function doesn't know the convention of.
 func (u Usage) BillableTokens(provider string) int64 {
 	switch provider {
-	case "openai-compatible":
+	case "openai-compatible", "openai-responses":
 		return u.InputTokens + u.OutputTokens
 	default:
 		return u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens
@@ -352,7 +364,7 @@ func (e *Error) IsRetryable() bool { return e != nil && e.Retryable }
 // (never Retryable).
 type LLMProvider interface {
 	// Name identifies the provider in diagnostics ("cloud",
-	// "openai-compatible", "anthropic").
+	// "openai-compatible", "openai-responses", "anthropic").
 	Name() string
 	Stream(ctx context.Context, req ChatRequest) iter.Seq2[Event, error]
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"reflect"
 	"strings"
 	"time"
 
@@ -87,6 +88,18 @@ type SidePanel interface {
 
 // Overlay is a modal dialog: once pushed (PushOverlay) it captures every key
 // event until its Update returns done, and renders centred over the screen.
+//
+// An Overlay implementation MUST be a POINTER type (r3 review, minor 1):
+// updateOverlay stores whatever value Update returns back into the stack
+// (m.overlays[top] = updated), so a value-typed Overlay's mutations inside
+// Update are trivially preserved that way regardless -- but CloseOverlay's
+// identity match (see its doc) can only ever find a POINTER back on the
+// stack, since Go's interface equality on a struct value compares fields,
+// not "is this the same logical dialog", and a value Overlay a product
+// still holds a copy of will never == the (possibly mutated, definitely
+// re-wrapped) value Update last returned. A product using the async-safe
+// overlay pattern (see PopOverlay/CloseOverlay) MUST hold and pass the same
+// *T it originally gave PushOverlay.
 type Overlay interface {
 	View(width, height int) string
 	Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)
@@ -157,6 +170,50 @@ func WithTitle(title string) Option {
 // a glamour-backed renderer for agent or HTTP-response markdown.
 func WithMarkdownRenderer(r transcript.MarkdownRenderer) Option {
 	return func(m *Model) { m.transcript.SetMarkdownRenderer(r) }
+}
+
+// MouseMode selects whether chatshell requests terminal mouse reporting and,
+// if so, which tea.MouseMode it asks for.
+type MouseMode int
+
+const (
+	// MouseOff requests no mouse reporting (the default: a terminal's own
+	// native text selection/copy keeps working).
+	MouseOff MouseMode = iota
+	// MouseCellMotion requests click, release and wheel events (but not
+	// plain motion/hover) -- enough to scroll the transcript with the wheel
+	// without giving up terminal-native text selection on most terminals.
+	MouseCellMotion
+)
+
+// mouseTeaMode maps a MouseMode to the tea.MouseMode View() sets.
+func (mm MouseMode) mouseTeaMode() tea.MouseMode {
+	if mm == MouseCellMotion {
+		return tea.MouseModeCellMotion
+	}
+	return tea.MouseModeNone
+}
+
+// WithMouse sets the initial mouse mode (see MouseMode). Products that want
+// a runtime toggle (e.g. DataTug's F2 capture toggle, which needs the
+// terminal's native mouse selection back while capturing) call
+// SetMouseEnabled after construction; WithMouse only sets the starting
+// state and, for MouseCellMotion, the mode SetMouseEnabled(true) re-enables
+// later. The default (no WithMouse call) is MouseOff.
+func WithMouse(mode MouseMode) Option {
+	return func(m *Model) {
+		// m1 (r1 review): WithMouse(MouseOff) must NOT clobber mouseMode
+		// down to MouseOff -- doing so would make a later
+		// SetMouseEnabled(true) a silent no-op (mouseTeaMode() on
+		// MouseOff is always tea.MouseModeNone). Only an actual enabling
+		// mode updates mouseMode; MouseOff only clears mouseEnabled,
+		// leaving New's MouseCellMotion default (or an earlier WithMouse
+		// call's mode) in place for SetMouseEnabled(true) to restore.
+		if mode != MouseOff {
+			m.mouseMode = mode
+		}
+		m.mouseEnabled = mode != MouseOff
+	}
 }
 
 // Model is the reusable chat screen.
@@ -233,6 +290,14 @@ type Model struct {
 	// second, immediately-following Ctrl+C always quits instead of trying to
 	// cancel again. Any other key clears it.
 	ctrlCArmed bool
+
+	// mouseMode is the tea.MouseMode View() requests while mouseEnabled is
+	// true (see WithMouse/SetMouseEnabled); mouseEnabled false always
+	// reports tea.MouseModeNone regardless of mouseMode, so a later
+	// SetMouseEnabled(true) restores the configured mode rather than a
+	// forgotten MouseOff.
+	mouseMode    MouseMode
+	mouseEnabled bool
 }
 
 // New returns a chat screen driven by handler.
@@ -255,6 +320,11 @@ func New(handler Handler, opts ...Option) *Model {
 		title:      "aichat",
 		width:      80,
 		height:     24,
+		// mouseEnabled defaults false (MouseOff); mouseMode defaults to
+		// MouseCellMotion so a product that calls SetMouseEnabled(true)
+		// without ever calling WithMouse still gets a sensible mode rather
+		// than a silent no-op (MouseOff's tea.MouseMode is always None).
+		mouseMode: MouseCellMotion,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -263,6 +333,20 @@ func New(handler Handler, opts ...Option) *Model {
 }
 
 // --- Product-facing API -----------------------------------------------
+
+// SetMouseEnabled toggles mouse reporting at runtime, e.g. DataTug's F2
+// capture toggle (a terminal's own native text-selection/copy is unusable
+// while mouse reporting is on, so a product that wants both needs a key to
+// flip between them). enabled true requests the mode configured via
+// WithMouse (MouseCellMotion by default if WithMouse was never called);
+// enabled false requests no mouse reporting at all. The new mode takes
+// effect on the next View() -- chatshell has no way to push it to the
+// terminal outside the normal render cycle.
+func (m *Model) SetMouseEnabled(enabled bool) { m.mouseEnabled = enabled }
+
+// MouseEnabled reports whether mouse reporting is currently requested (see
+// SetMouseEnabled).
+func (m *Model) MouseEnabled() bool { return m.mouseEnabled }
 
 // AppendUser appends a user message to the transcript.
 func (m *Model) AppendUser(text string) {
@@ -631,6 +715,104 @@ func (m *Model) PushOverlay(o Overlay) tea.Cmd {
 	return nil
 }
 
+// PopOverlay closes the TOP overlay PROGRAMMATICALLY -- without waiting for
+// its own Update to report done. It is a no-op (returns nil) when no
+// overlay is open.
+//
+// PopOverlay is TOP-ONLY: it closes whatever happens to be on top at the
+// moment it is called, regardless of which overlay a caller "meant". That
+// is exactly right for the common case (at most one overlay is ever open at
+// a time), but WRONG for the async-safe pattern below once a SECOND overlay
+// can be stacked on top of the first before its async result arrives (r3
+// review, MAJOR) -- e.g. dialog A's submit is in flight, the user opens
+// dialog B on top of it, and A's result lands: PopOverlay would close B,
+// not A. Use CloseOverlay(o) instead whenever more than one overlay might
+// ever be on the stack at once; PopOverlay remains for the simpler
+// single-overlay case (or for closing "whatever's on top" on purpose, e.g.
+// an Esc-equivalent product action).
+//
+// Async-safe overlay pattern: an Overlay may need to stay open ACROSS an
+// async round trip (e.g. a form whose Enter submits to a server before it
+// can close). Its own Update returns done: false plus a product tea.Cmd on
+// submit -- exactly like any other command chatshell dispatches. The
+// product's own result message, once it arrives, is NOT itself overlay
+// input (isOverlayInputMsg only classifies key/paste/mouse messages), so it
+// takes the normal Update path and reaches an optional MsgHandler.OnMsg
+// (dispatchUnhandled's default routing) EVEN WHILE THE OVERLAY IS STILL
+// OPEN -- an open overlay only captures key/paste/mouse input, never this.
+// From there the product calls CloseOverlay(o) with the SAME *T it passed
+// to PushOverlay on success (see Overlay's doc: it MUST be a pointer type),
+// or -- to show an error while keeping the user's draft -- updates the
+// overlay in place (e.g. via an optional `interface{ OnResult(any) }`
+// capability the product's own Overlay implements, or simply because the
+// product holds that same pointer and can mutate it directly).
+func (m *Model) PopOverlay() tea.Cmd {
+	if len(m.overlays) == 0 {
+		return nil
+	}
+	m.overlays = m.overlays[:len(m.overlays)-1]
+	return nil
+}
+
+// CloseOverlay removes o from the overlay stack WHEREVER IT IS -- not only
+// if it's on top -- matching by POINTER IDENTITY (see Overlay's doc: an
+// Overlay MUST be a pointer type for this to ever find it). It reports
+// whether o was found and removed; false is a no-op. This is the
+// identity-safe replacement for PopOverlay in the async-safe overlay
+// pattern once a second overlay might be stacked on top of the one an
+// async result is meant to close (r3 review, MAJOR -- see PopOverlay's
+// doc).
+//
+// A non-pointer Overlay (or a nil pointer) can never be matched -- o's
+// pointer identity is extracted via reflection rather than Go's `==`
+// specifically to avoid a runtime panic comparing two interface values
+// whose dynamic type is non-comparable (e.g. one holding a slice or map
+// field); CloseOverlay simply reports false for such an Overlay instead of
+// crashing.
+func (m *Model) CloseOverlay(o Overlay) bool {
+	target, ok := overlayIdentity(o)
+	if !ok {
+		return false
+	}
+	for i, existing := range m.overlays {
+		if id, ok := overlayIdentity(existing); ok && id == target {
+			m.overlays = append(m.overlays[:i], m.overlays[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// overlayIdentity extracts o's pointer identity for CloseOverlay's match,
+// or reports ok=false when o is not a non-nil pointer (reflect.Value.
+// Pointer panics on most other kinds, which this guards against).
+func overlayIdentity(o Overlay) (uintptr, bool) {
+	v := reflect.ValueOf(o)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return 0, false
+	}
+	return v.Pointer(), true
+}
+
+// Zone reports which focus zone currently has focus: the composer
+// (focus.ZoneInput), a transcript stop (focus.ZoneTranscript), or the
+// sidebar/SidePanel (focus.ZoneSidebar) -- e.g. for a product's
+// context-specific status hint.
+func (m *Model) Zone() focus.Zone { return m.focusRing.Zone() }
+
+// FocusedEntryID reports the transcript entry id currently under focus
+// (Zone() == focus.ZoneTranscript), or "" when the transcript isn't
+// focused, no entry is focused, or the focused entry was never given an id
+// (AppendBlockWithID/StartStream's id; a plain AppendUser/AppendAssistant/
+// AppendBlock entry has none).
+func (m *Model) FocusedEntryID() string {
+	e := m.transcript.FocusedEntry()
+	if e == nil {
+		return ""
+	}
+	return e.ID
+}
+
 // --- side panel / sidebar unification -------------------------------------
 
 // panelVisible reports whether the sidebar zone (SidePanel or the default
@@ -750,9 +932,95 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 
+	case tea.MouseWheelMsg:
+		return m.handleMouseWheel(msg)
+
 	default:
 		return m, m.dispatchUnhandled(msg)
 	}
+}
+
+// mouseWheelScrollLines is how many transcript lines one wheel tick moves,
+// matching a typical terminal's own default scroll step.
+const mouseWheelScrollLines = 3
+
+// splitSeparatorWidth is the width, in columns, of the " │ " divider View()
+// draws between the chat column and the side panel/sidebar when split
+// (see View, chatWidth/sidebarWidth) -- handleMouseWheel uses it to tell
+// whether a wheel event's X falls in the chat column or past the divider.
+const splitSeparatorWidth = 3
+
+// handleMouseWheel scrolls the transcript viewport, UNLESS a product
+// SidePanel is installed and the event's X falls in its column (past the
+// chat column and its " │ " divider) while the pane is split -- then the
+// event is forwarded to the SidePanel instead (e.g. a product's own
+// scrollable list), and the transcript does not scroll. Either way, the
+// event is then ALSO forwarded to an optional MsgHandler (same as every
+// other message dispatchUnhandled reaches), so a product can react to
+// wheel events beyond just scrolling. It is reachable only while mouse
+// reporting is on (View's MouseMode gates whether the terminal ever sends
+// these events at all), but does not itself re-check mouseEnabled -- a
+// wheel event that already arrived is honoured regardless, same as
+// chatshell honours a key press it happens to receive.
+func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	// cmds may collect nil entries below -- tea.Batch (via its compactCmds
+	// helper) ignores them, so every branch can append unconditionally
+	// instead of each needing its own "if cmd != nil" guard, several of
+	// which would otherwise be unreachable in practice (e.g. tui/sidebar's
+	// Update never returns a non-nil cmd for an Up/Down key).
+	var cmds []tea.Cmd
+
+	switch {
+	case m.splitEnabled() && msg.X >= m.chatWidth()+splitSeparatorWidth:
+		// Side column: ONLY the SidePanel/sidebar gets it -- the transcript
+		// has nothing to do with a wheel event over the sidebar/SidePanel
+		// column (r4 review: broadcasting to transcript Blocks here, as an
+		// earlier revision did, read backwards -- there is no reason a
+		// wheel tick over the SIDEBAR should reach the TRANSCRIPT).
+		//
+		// A product SidePanel gets the raw event (free to interpret
+		// X/Y/Button itself); the BUILT-IN sidebar has no scroll offset of
+		// its own -- it is a cursor list -- so a wheel tick moves its
+		// cursor the same way Up/Down would (r2 review minor: "scroll the
+		// sidebar" for a cursor list IS moving the cursor).
+		if m.sidePanel != nil {
+			var cmd tea.Cmd
+			m.sidePanel, cmd = m.sidePanel.Update(msg)
+			cmds = append(cmds, cmd)
+		} else {
+			key := tea.KeyPressMsg{Code: tea.KeyDown}
+			if msg.Button == tea.MouseWheelUp {
+				key = tea.KeyPressMsg{Code: tea.KeyUp}
+			}
+			cmds = append(cmds, m.sidebar.Update(key))
+		}
+	default:
+		// Chat column: the FOCUSED transcript Block gets first refusal (r4
+		// review) via transcript.WheelConsumer -- a Block that wants to
+		// scroll its own internal view (e.g. a grid's row list) for this
+		// event says so, and chatshell delivers the message to it INSTEAD
+		// OF scrolling the transcript viewport itself; only when no Block
+		// is focused, the focused Block doesn't implement WheelConsumer, or
+		// it declines this particular event does chatshell fall back to
+		// scrolling the viewport directly. Exactly one of the two ever
+		// happens for one wheel tick -- never both, so a Block handling the
+		// wheel itself is never double-moved by chatshell's own scroll.
+		if consumed, cmd := m.transcript.DeliverWheelToFocusedBlock(msg); consumed {
+			cmds = append(cmds, cmd)
+		} else {
+			switch msg.Button {
+			case tea.MouseWheelUp:
+				m.transcript.ScrollUp(mouseWheelScrollLines)
+			case tea.MouseWheelDown:
+				m.transcript.ScrollDown(mouseWheelScrollLines)
+			}
+		}
+	}
+
+	if h, ok := m.handler.(MsgHandler); ok {
+		cmds = append(cmds, h.OnMsg(msg))
+	}
+	return m, tea.Batch(cmds...)
 }
 
 // isOverlayInputMsg reports whether msg is user input an open Overlay
@@ -1210,6 +1478,9 @@ func (m *Model) View() tea.View {
 	}
 	view := tea.NewView(content)
 	view.AltScreen = true
+	if m.mouseEnabled {
+		view.MouseMode = m.mouseMode.mouseTeaMode()
+	}
 	return view
 }
 
