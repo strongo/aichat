@@ -852,14 +852,40 @@ const splitSeparatorWidth = 3
 // wheel event that already arrived is honoured regardless, same as
 // chatshell honours a key press it happens to receive.
 func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	// cmds may collect nil entries below -- tea.Batch (via its compactCmds
+	// helper) ignores them, so every branch can append unconditionally
+	// instead of each needing its own "if cmd != nil" guard, several of
+	// which would otherwise be unreachable in practice (e.g. tui/sidebar's
+	// Update never returns a non-nil cmd for an Up/Down key).
 	var cmds []tea.Cmd
-	if m.sidePanel != nil && m.splitEnabled() && msg.X >= m.chatWidth()+splitSeparatorWidth {
-		var cmd tea.Cmd
-		m.sidePanel, cmd = m.sidePanel.Update(msg)
-		if cmd != nil {
+
+	// A wheel event must still reach transcript Blocks via the normal
+	// broadcast path (e.g. a grid reacting to it), same as
+	// dispatchUnhandled does for every message chatshell does not itself
+	// fully own -- unconditionally, regardless of which routing branch
+	// below actually applies.
+	cmds = append(cmds, m.transcript.Update(msg))
+
+	switch {
+	case m.splitEnabled() && msg.X >= m.chatWidth()+splitSeparatorWidth:
+		// In the panel column: a product SidePanel gets the raw event
+		// (free to interpret X/Y/Button itself); the BUILT-IN sidebar has
+		// no scroll offset of its own -- it is a cursor list -- so a wheel
+		// tick moves its cursor the same way Up/Down would (r2 review
+		// minor: "scroll the sidebar" for a cursor list IS moving the
+		// cursor).
+		if m.sidePanel != nil {
+			var cmd tea.Cmd
+			m.sidePanel, cmd = m.sidePanel.Update(msg)
 			cmds = append(cmds, cmd)
+		} else {
+			key := tea.KeyPressMsg{Code: tea.KeyDown}
+			if msg.Button == tea.MouseWheelUp {
+				key = tea.KeyPressMsg{Code: tea.KeyUp}
+			}
+			cmds = append(cmds, m.sidebar.Update(key))
 		}
-	} else {
+	default:
 		switch msg.Button {
 		case tea.MouseWheelUp:
 			m.transcript.ScrollUp(mouseWheelScrollLines)
@@ -867,13 +893,9 @@ func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 			m.transcript.ScrollDown(mouseWheelScrollLines)
 		}
 	}
+
 	if h, ok := m.handler.(MsgHandler); ok {
-		if cmd := h.OnMsg(msg); cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-	}
-	if len(cmds) == 0 {
-		return m, nil
+		cmds = append(cmds, h.OnMsg(msg))
 	}
 	return m, tea.Batch(cmds...)
 }

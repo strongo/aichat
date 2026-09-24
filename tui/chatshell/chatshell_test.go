@@ -1963,6 +1963,61 @@ type cmdMsgHandler struct {
 func (h *cmdMsgHandler) Submit(text string) tea.Cmd { return nil }
 func (h *cmdMsgHandler) OnMsg(msg tea.Msg) tea.Cmd  { return h.cmd }
 
+// r2 review minor: a wheel event over the BUILT-IN sidebar (no SidePanel
+// installed) moves its cursor like Up/Down would, rather than scrolling the
+// transcript -- the sidebar has no scroll offset of its own, it's a cursor
+// list.
+func TestMouse_WheelOverBuiltInSidebarMovesCursorNotTranscript(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+	m.PinToSidebar(session.EntityRef{Type: "t", Keys: map[string]string{"id": "1"}})
+	m.PinToSidebar(session.EntityRef{Type: "t", Keys: map[string]string{"id": "2"}})
+	m.PinToSidebar(session.EntityRef{Type: "t", Keys: map[string]string{"id": "3"}})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	beforeTranscript := m.transcript.View()
+	if got := m.sidebar.Cursor(); got != 0 {
+		t.Fatalf("initial cursor = %d, want 0", got)
+	}
+
+	sideX := m.chatWidth() + splitSeparatorWidth + 1
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown, X: sideX})
+	if got := m.sidebar.Cursor(); got != 1 {
+		t.Fatalf("cursor after wheel-down = %d, want 1", got)
+	}
+	if got := m.transcript.View(); got != beforeTranscript {
+		t.Fatal("transcript scrolled from a wheel event over the sidebar")
+	}
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: sideX})
+	if got := m.sidebar.Cursor(); got != 0 {
+		t.Fatalf("cursor after wheel-up = %d, want 0", got)
+	}
+}
+
+// r2 review minor: a wheel event, wherever it routes, must still reach
+// transcript Blocks via the normal broadcast path (restored -- it was
+// dropped when the dedicated tea.MouseWheelMsg case in Update stopped
+// falling through to dispatchUnhandled).
+func TestMouse_WheelReachesTranscriptBlocksViaBroadcast(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	block := &fakeBlock{}
+	m.AppendBlock(block)
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+
+	if block.updates == 0 {
+		t.Fatal("transcript Block did not receive the wheel event via broadcast")
+	}
+	if _, ok := block.lastEvent.(tea.MouseWheelMsg); !ok {
+		t.Fatalf("block.lastEvent = %T, want tea.MouseWheelMsg", block.lastEvent)
+	}
+}
+
 func TestMouse_WheelBatchesMsgHandlerCmd(t *testing.T) {
 	ran := false
 	h := &cmdMsgHandler{cmd: func() tea.Msg { ran = true; return nil }}
