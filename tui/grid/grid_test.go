@@ -673,3 +673,21 @@ func TestRowNavigationDoesNotWrap(t *testing.T) {
 		t.Fatalf("down at last row wrapped to %d", m.CurrentIndex())
 	}
 }
+
+// TestWithInitialSortSeedsToggleDirection is the regression test for
+// DataTug's docked-view sort toggle: a product that re-fetches externally
+// pre-sorted rows (rather than calling Sort itself) still needs the grid to
+// know which column/direction that is, so the NEXT Sort(column) call (e.g.
+// from a subsequent "s" keypress translated into another external re-fetch)
+// computes the opposite direction instead of always defaulting to ascending.
+func TestWithInitialSortSeedsToggleDirection(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithInitialSort(0, false))
+	column, desc := m.SortState()
+	if column != 0 || desc {
+		t.Fatalf("SortState() = %d,%v want 0,false", column, desc)
+	}
+	if !strings.Contains(ansi.Strip(m.View(60, true)), "sort id ↑") {
+		t.Fatalf("footer missing seeded ascending sort indicator: %q", ansi.Strip(m.View(60, true)))
+	}
+}

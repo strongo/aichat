@@ -238,6 +238,18 @@ func WithFooterHook(fn FooterHook) Option {
 	return func(m *Model) { m.footerHook = fn }
 }
 
+// WithInitialSort records that rows are already ordered by column/desc (e.g.
+// a product re-fetched pre-sorted data, such as DataTug's view-backed docks,
+// rather than calling Sort itself), without re-sorting them. It only sets
+// the grid's own sort-state bookkeeping — the footer's sort indicator and,
+// importantly, the toggle direction the NEXT Sort(column) call picks — to
+// match rows the caller has already arranged. Ported from DataTug's
+// rebuildDockGrids initializing GridModel.sortColumn/sortDesc from the
+// backing View's persisted OrderBy/Descending.
+func WithInitialSort(column int, desc bool) Option {
+	return func(m *Model) { m.sortColumn, m.sortDesc = column, desc }
+}
+
 // DefaultMaxVisibleRows is the page size a Model uses when WithMaxVisibleRows
 // is not supplied.
 const DefaultMaxVisibleRows = 12
