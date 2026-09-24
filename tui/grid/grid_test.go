@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
@@ -608,5 +609,44 @@ func TestSetTitleAndTitle(t *testing.T) {
 	}
 	if view := ansi.Strip(m.View(60, true)); !strings.Contains(view, "changed") {
 		t.Fatalf("view missing updated title: %q", view)
+	}
+}
+
+func TestColumnAlignment(t *testing.T) {
+	textColumn := Column{Name: "Customer"}
+	numberColumn := Column{Name: "Total", Numeric: true}
+	for _, selected := range []bool{false, true} {
+		if got := columnStyle(textColumn, selected).GetAlignHorizontal(); got != lipgloss.Left {
+			t.Fatalf("text alignment selected=%v = %v, want left", selected, got)
+		}
+		if got := columnStyle(numberColumn, selected).GetAlignHorizontal(); got != lipgloss.Right {
+			t.Fatalf("numeric alignment selected=%v = %v, want right", selected, got)
+		}
+	}
+}
+
+func TestCardViewResetsScrollWhenHighlightedRowChanges(t *testing.T) {
+	cols := make([]Column, 10)
+	rows := make([]Row, 2)
+	for r := range rows {
+		values := make([]any, 10)
+		for c := range cols {
+			cols[c] = Column{Name: "col" + strconv.Itoa(c)}
+			values[c] = "row" + strconv.Itoa(r) + "-v" + strconv.Itoa(c)
+		}
+		rows[r] = Row{Key: strconv.Itoa(r), Values: values}
+	}
+	m := New(cols, rows, WithExtraViews(CardView("")), WithMaxVisibleRows(4))
+	m.SetView(View(firstExtraView))
+	first := ansi.Strip(m.View(40, true))
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // scroll the card
+	scrolled := ansi.Strip(m.View(40, true))
+	if scrolled == first {
+		t.Fatal("card did not scroll")
+	}
+	m.SelectRow(1) // change the highlighted row
+	afterRowChange := ansi.Strip(m.View(40, true))
+	if !strings.Contains(afterRowChange, "col0") {
+		t.Fatalf("card did not reset to the top after the highlighted row changed: %q", afterRowChange)
 	}
 }

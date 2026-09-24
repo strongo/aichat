@@ -58,6 +58,11 @@ func (m *Model) headerLine(width int) string {
 	return padAnsiLine(title+" │ "+styledControls, width)
 }
 
+// HeaderLine returns the card's title bar content at a given width — the
+// same text embedded in the top border by View — without rendering the
+// whole card.
+func (m *Model) HeaderLine(width int) string { return m.headerLine(width) }
+
 // viewLabels returns one label per view (Table, then each registered
 // ExtraView in order), abbreviated to fit width. Ported from DataTug's
 // recordsetHeader breakpoints (<62, <42, 24-36, <=24 cells), generalised: a
@@ -245,6 +250,11 @@ func (m *Model) footer() string {
 	}
 	return builtin
 }
+
+// Footer returns the grid's current footer text (row/column range, sort
+// indicator, plus any WithFooterHook/SetFooterHook text) — the same text
+// shown in the card's bottom border.
+func (m *Model) Footer() string { return m.footer() }
 
 // scrollbarLine renders one line of the right-edge scrollbar/border. Ported
 // from DataTug's gridState.scrollbarLine.

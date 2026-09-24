@@ -295,13 +295,15 @@ func gridKeyMap() table.KeyMap {
 	// DataTug owns column navigation (h/l select a column; the grid
 	// auto-scrolls it into view) and row navigation is up/down/k only — "j"
 	// is reserved for a product's own use (DataTug's join-candidate
-	// navigation). The grid has no pages (WithNoPagination-equivalent: one
-	// page), Enter is reserved for the grid/product (RowActivatedMsg or a
-	// KeyHandler), and the filter's own bindings are unlabelled internals.
+	// navigation). Paging is a real page jump (pgup/pgdown), sized by
+	// WithMaxVisibleRows; PageFirst/PageLast, h/l's own scroll bindings and
+	// row-select all have grid-owned replacements, and Enter is reserved for
+	// the grid/product (RowActivatedMsg or a KeyHandler). The filter's own
+	// bindings are unlabelled internals.
 	km.RowUp = key.NewBinding(key.WithKeys("up", "k"))
 	km.RowDown = key.NewBinding(key.WithKeys("down"))
-	km.PageUp = key.Binding{}
-	km.PageDown = key.Binding{}
+	km.PageUp = key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "previous page"))
+	km.PageDown = key.NewBinding(key.WithKeys("pgdown"), key.WithHelp("pgdn", "next page"))
 	km.PageFirst = key.Binding{}
 	km.PageLast = key.Binding{}
 	km.ScrollLeft = key.Binding{}
@@ -565,6 +567,11 @@ func (m *Model) visibleColumnRange() (int, int) {
 	}
 	return offset + 1, last + 1
 }
+
+// VisibleColumnRange returns the 1-based (first, last) column numbers
+// currently rendered in the table (0, 0 when the pane is too narrow to show
+// any full data column, only bubble-table's overflow marker).
+func (m *Model) VisibleColumnRange() (int, int) { return m.visibleColumnRange() }
 
 func (m *Model) ensureSelectedColumnVisible() {
 	if len(m.columns) == 0 {
