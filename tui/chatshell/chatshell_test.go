@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
@@ -1056,5 +1057,275 @@ func TestWithTopBarAndStatusBarOverrideDefaults(t *testing.T) {
 	}
 	if !strings.Contains(content, "STATUS") {
 		t.Error("expected product-rendered status bar in the view")
+	}
+}
+
+// --- r1 review fixes ------------------------------------------------------
+
+func TestOverlayOnlyCapturesInputStreamStillCompletesAndClearsBusy(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventTextDelta, Text: "Hel"},
+		{Type: ai.EventTextDelta, Text: "lo"},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStream("turn-1", openSeq(events...))
+	if !m.Busy() {
+		t.Fatal("StartStream did not set busy")
+	}
+
+	ov := &fakeOverlay{name: "dialog", closeKey: "q"}
+	m.PushOverlay(ov)
+
+	drainCmd(t, m, cmd, 20)
+
+	if m.Busy() {
+		t.Fatal("stream must still complete (and clear busy) while an overlay is open — only key/paste/mouse route to the overlay")
+	}
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || entries[0].Text != "Hello" {
+		t.Fatalf("entries = %+v, want the stream's text to have rendered despite the open overlay", entries)
+	}
+	if len(ov.seen) != 0 {
+		t.Fatalf("overlay saw %d non-input messages, want 0", len(ov.seen))
+	}
+}
+
+func TestSidePanelReceivesWindowSizeAndUnhandledMsgs(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	if panel.updates == 0 {
+		t.Fatal("expected the SidePanel to receive the WindowSizeMsg")
+	}
+
+	type productMsg struct{}
+	before := panel.updates
+	m.Update(productMsg{})
+	if panel.updates <= before {
+		t.Fatal("expected the SidePanel to receive an otherwise-unhandled message")
+	}
+}
+
+func TestClearTranscriptCancelsStreamAndIgnoresStaleEvents(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+	m.AppendUser("hi")
+
+	ch := make(chan ai.Event)
+	seq := func(yield func(ai.Event, error) bool) {
+		for ev := range ch {
+			if !yield(ev, nil) {
+				return
+			}
+		}
+	}
+	cmd := m.StartStream("turn-1", func(ctx context.Context) iter.Seq2[ai.Event, error] { return seq })
+	_ = cmd
+	if !m.Busy() {
+		t.Fatal("expected StartStream to set busy")
+	}
+
+	m.ClearTranscript()
+	if m.Busy() {
+		t.Fatal("ClearTranscript must cancel the active stream and clear busy")
+	}
+	if len(m.transcript.Entries()) != 0 {
+		t.Fatalf("transcript not cleared: %+v", m.transcript.Entries())
+	}
+
+	// A stale EventMsg for the cancelled stream's ID must not resurrect a
+	// transcript entry.
+	m.Update(stream.EventMsg{ID: "turn-1", Event: ai.Event{Type: ai.EventTextDelta, Text: "stale"}, Next: func() tea.Msg { return nil }})
+	if len(m.transcript.Entries()) != 0 {
+		t.Fatalf("stale event resurrected a transcript entry: %+v", m.transcript.Entries())
+	}
+	close(ch)
+}
+
+func TestReplaceBlockKeepsFocusOnSameEntryWhenFocusabilityChanges(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.AppendUser("first")                                                // stop 0
+	m.transcript.Append(transcript.Entry{ID: "b1", Block: &fakeBlock{}}) // stop 1
+
+	// Focus the block entry (last stop).
+	m.focusRing.FocusStop(m.transcript.Stops() - 1)
+	m.transcript.Focus(m.focusRing.Stop())
+	before := m.transcript.FocusedEntry()
+	if before == nil || before.ID != "b1" {
+		t.Fatalf("before = %+v, want focused on b1", before)
+	}
+
+	m.ReplaceBlock("b1", &fakeBlock{})
+
+	after := m.transcript.FocusedEntry()
+	if after == nil || after.ID != "b1" {
+		t.Fatalf("after = %+v, want still focused on b1 (same entry) after ReplaceBlock", after)
+	}
+}
+
+func TestSidePanelPinnerRoutesPinUnpinAndSidebarRefs(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &pinnerSidePanel{}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	ref := session.EntityRef{Type: "row", Keys: map[string]string{"id": "1"}}
+	m.PinToSidebar(ref)
+	if len(m.SidebarRefs()) != 1 {
+		t.Fatalf("SidebarRefs() = %v, want 1 ref routed through the SidePanelPinner", m.SidebarRefs())
+	}
+	if len(h.sidebarSeen) != 1 {
+		t.Fatalf("handler not notified: %v", h.sidebarSeen)
+	}
+	m.UnpinFromSidebar(ref)
+	if len(m.SidebarRefs()) != 0 {
+		t.Fatalf("SidebarRefs() = %v, want empty after unpin", m.SidebarRefs())
+	}
+}
+
+func TestSidePanelWithoutPinnerIsANoOp(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{} // does not implement SidePanelPinner
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	ref := session.EntityRef{Type: "row", Keys: map[string]string{"id": "1"}}
+	m.PinToSidebar(ref)
+	if got := m.SidebarRefs(); got != nil {
+		t.Fatalf("SidebarRefs() = %v, want nil (documented no-op without SidePanelPinner)", got)
+	}
+	if len(h.sidebarSeen) != 0 {
+		t.Fatalf("handler should not be notified for a no-op pin: %v", h.sidebarSeen)
+	}
+}
+
+func TestOverlayClampedToGivenSize(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h) // width 120, height 40
+	huge := &oversizedOverlay{}
+	m.PushOverlay(huge)
+	view := m.View()
+	for _, line := range strings.Split(view.Content, "\n") {
+		if w := lipgloss.Width(line); w > m.width {
+			t.Fatalf("rendered line width %d exceeds screen width %d: %q", w, m.width, line)
+		}
+	}
+	if lines := strings.Split(view.Content, "\n"); len(lines) > m.height+2 {
+		t.Fatalf("rendered %d lines, want roughly bounded by screen height %d", len(lines), m.height)
+	}
+}
+
+// pinnerSidePanel is a fakeSidePanel that also implements SidePanelPinner.
+type pinnerSidePanel struct {
+	fakeSidePanel
+	refs []session.EntityRef
+}
+
+// Update overrides the promoted fakeSidePanel.Update, which would otherwise
+// return the embedded *fakeSidePanel itself (losing the Pinner capability
+// on the very first Update, since chatshell replaces m.sidePanel with
+// whatever Update returns).
+func (p *pinnerSidePanel) Update(msg tea.Msg) (SidePanel, tea.Cmd) {
+	_, cmd := p.fakeSidePanel.Update(msg)
+	return p, cmd
+}
+
+func (p *pinnerSidePanel) PinRef(ref session.EntityRef) bool {
+	for _, r := range p.refs {
+		if r.Same(ref) {
+			return false
+		}
+	}
+	p.refs = append(p.refs, ref)
+	return true
+}
+
+func (p *pinnerSidePanel) UnpinRef(ref session.EntityRef) bool {
+	for i, r := range p.refs {
+		if r.Same(ref) {
+			p.refs = append(p.refs[:i], p.refs[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func (p *pinnerSidePanel) Refs() []session.EntityRef { return p.refs }
+
+// oversizedOverlay renders far larger than any reasonable box, to exercise
+// renderOverlay's clamp.
+type oversizedOverlay struct{}
+
+func (o *oversizedOverlay) View(width, height int) string {
+	line := strings.Repeat("X", width+200)
+	lines := make([]string, height+200)
+	for i := range lines {
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (o *oversizedOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd, bool) { return o, nil, false }
+
+func TestFocusEntryFocusesTranscriptStopByID(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.AppendUser("first")
+	m.transcript.Append(transcript.Entry{ID: "grid-1", Block: &fakeBlock{}})
+
+	if !m.FocusEntry("grid-1") {
+		t.Fatal("FocusEntry(\"grid-1\") = false, want true")
+	}
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		t.Fatalf("Zone() = %v, want ZoneTranscript", m.focusRing.Zone())
+	}
+	entry := m.transcript.FocusedEntry()
+	if entry == nil || entry.ID != "grid-1" {
+		t.Fatalf("FocusedEntry() = %+v, want grid-1", entry)
+	}
+}
+
+func TestFocusEntryUnknownIDLeavesFocusUnchanged(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.AppendUser("first")
+	before := m.focusRing.Zone()
+
+	if m.FocusEntry("nope") {
+		t.Fatal("FocusEntry(\"nope\") = true, want false for an unknown id")
+	}
+	if m.focusRing.Zone() != before {
+		t.Fatalf("Zone() changed to %v after a failed FocusEntry", m.focusRing.Zone())
+	}
+}
+
+func TestWithMarkdownRendererAndAppendAssistantMarkdown(t *testing.T) {
+	h := &fakeHandler{}
+	var gotText string
+	var gotWidth int
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		gotText, gotWidth = text, width
+		return "RENDERED:" + text
+	}))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.AppendAssistantMarkdown("# hi")
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || !entries[0].Markdown || entries[0].Text != "# hi" {
+		t.Fatalf("entries = %+v, want one Markdown entry with the raw text", entries)
+	}
+	view := m.transcript.View()
+	if !strings.Contains(view, "RENDERED:# hi") {
+		t.Fatalf("view = %q, want the configured renderer's output", view)
+	}
+	if gotText != "# hi" || gotWidth <= 0 {
+		t.Errorf("renderer called with text=%q width=%d", gotText, gotWidth)
 	}
 }

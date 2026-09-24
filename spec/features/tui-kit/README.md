@@ -74,11 +74,13 @@ A `SetBusy(true)` phase has NO IDENTITY of its own -- unlike `StartStream`, whic
 
 #### REQ: chatshell-side-panel
 
-`chatshell.WithSidePanel(p SidePanel)` (`SidePanel`: `Title() string`, `View(width, height int, focused bool) string`, `Update(msg tea.Msg) (SidePanel, tea.Cmd)`) MUST REPLACE the default sidebar end-to-end for the whole sidebar zone: F6 visibility toggling, `Ctrl+←/→` split-percent resizing (clamped to `sidebar.MinChatPercent`/`MaxChatPercent`, 40/75, same as the default sidebar), `Shift+Right`/`Shift+Left` focus-ring participation, and rendering all route through the installed `SidePanel` instead of `sidebar.Model` once set. It starts visible, matching the default sidebar's own start state.
+`chatshell.WithSidePanel(p SidePanel)` (`SidePanel`: `Title() string`, `View(width, height int, focused bool) string`, `Update(msg tea.Msg) (SidePanel, tea.Cmd)`) MUST REPLACE the default sidebar end-to-end for the whole sidebar zone: F6 visibility toggling, `Ctrl+←/→` split-percent resizing (clamped to `sidebar.MinChatPercent`/`MaxChatPercent`, 40/75, same as the default sidebar), `Shift+Right`/`Shift+Left` focus-ring participation, and rendering all route through the installed `SidePanel` instead of `sidebar.Model` once set. It starts visible, matching the default sidebar's own start state. It MUST also receive `tea.WindowSizeMsg` (so it can lay itself out) and every message chatshell does not itself recognise (the same messages `dispatchUnhandled` gives the transcript and an optional `MsgHandler`).
+
+An optional `SidePanelPinner` capability (`PinRef(ref session.EntityRef) bool`, `UnpinRef(ref session.EntityRef) bool`, `Refs() []session.EntityRef`) routes `PinToSidebar`/`UnpinFromSidebar`/`SidebarRefs`/`AddToSidebarMsg` to the `SidePanel` instead of the (now-hidden) default sidebar's own ref list. A `SidePanel` that does NOT implement it makes those calls a documented no-op: `PinToSidebar`/`UnpinFromSidebar` do nothing (no `OnSidebarChange` notification) and `SidebarRefs` returns `nil` — chatshell MUST NOT silently fall back to exposing the default sidebar's own (invisible) state in that case.
 
 #### REQ: chatshell-overlay
 
-`chatshell.Model.PushOverlay(o Overlay) tea.Cmd` (`Overlay`: `View(width, height int) string`, `Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)`) MUST push a modal dialog onto an overlay stack. While the stack is non-empty, the TOP overlay MUST capture every message chatshell would otherwise handle itself (including keys that would submit the composer or trigger chatshell's own shortcuts) until its `Update` returns `done: true`, at which point it is popped; an OLDER overlay beneath it MUST NOT receive any message while a newer one is on top. The top overlay MUST be rendered centred over the rest of the screen. A `tea.WindowSizeMsg` MUST still resize the shell even while an overlay is open.
+`chatshell.Model.PushOverlay(o Overlay) tea.Cmd` (`Overlay`: `View(width, height int) string`, `Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)`) MUST push a modal dialog onto an overlay stack. While the stack is non-empty, the TOP overlay MUST capture user INPUT ONLY — key presses, paste, and mouse events — until its `Update` returns `done: true`, at which point it is popped; an OLDER overlay beneath it MUST NOT receive any message while a newer one is on top. Every OTHER message (stream pump events, the spinner tick, sidebar/product messages, ...) takes chatshell's NORMAL path even while an overlay is open, so e.g. a stream keeps completing and clears `Busy()` behind an open dialog. A `tea.WindowSizeMsg` MUST still resize the shell (and forward to an active `SidePanel`) even while an overlay is open. The top overlay MUST be rendered centred over the rest of the screen, CLAMPED to the box it was asked to render into (`View`'s `width`/`height` arguments) regardless of what it actually draws.
 
 #### REQ: chatshell-global-keys
 
@@ -90,7 +92,13 @@ A `SetBusy(true)` phase has NO IDENTITY of its own -- unlike `StartStream`, whic
 
 #### REQ: chatshell-transcript-ops
 
-`chatshell.Model.ReplaceBlock(entryID string, b transcript.Block)` MUST replace the `Block` of the transcript entry identified by `entryID` IN PLACE (same position, same ID) -- e.g. to refresh or re-run a grid -- and MUST be a no-op when no entry has that ID. `SetComposerText(s string)` MUST set the composer's text and move the cursor to the end (an edit-previous-message flow). `ClearTranscript()` MUST remove every transcript entry and return focus to the composer (`/clear`, a session switch).
+`chatshell.Model.ReplaceBlock(entryID string, b transcript.Block)` MUST replace the `Block` of the transcript entry identified by `entryID` IN PLACE (same position, same ID) -- e.g. to refresh or re-run a grid -- and MUST be a no-op when no entry has that ID. If the CURRENTLY FOCUSED transcript entry (by ID, not raw stop index -- either the one being replaced or a different one whose stop shifted because this swap changed an earlier entry's `Focusable()` answer) is still focusable afterward, focus MUST stay on that same entry.
+
+`SetComposerText(s string)` MUST set the composer's text and move the cursor to the end (an edit-previous-message flow). `ClearTranscript()` MUST cancel any in-flight stream, remove every transcript entry, and return focus to the composer (`/clear`, a session switch); an `EventMsg` for the just-cancelled stream's ID that arrives afterward MUST NOT mutate the (now-cleared) transcript. `FocusEntry(id string) bool` MUST move focus to the transcript entry identified by `id`, scrolling it into view, and report whether such a focusable entry exists (`false` leaves focus unchanged) -- e.g. DataTug's Ctrl+G "jump to latest grid".
+
+#### REQ: chatshell-markdown-renderer
+
+`chatshell.WithMarkdownRenderer(r transcript.MarkdownRenderer)` MUST configure the renderer `AppendAssistantMarkdown(text string)` — and any `transcript.Entry` with `Markdown` set — uses (e.g. a glamour-backed renderer for agent or HTTP-response markdown), equivalent to `transcript.New(transcript.WithMarkdownRenderer(r))` but settable on a `chatshell.Model`'s already-constructed transcript.
 
 ### Sidebar
 
@@ -212,6 +220,13 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **When** a key is sent
 **Then** only the TOP overlay's `Update` receives it (not the one beneath, not the composer); when the top overlay's `Update` returns `done: true` it is popped and the one beneath becomes top; once the stack is empty again, keys reach the composer as normal
 
+### AC: overlay-does-not-block-non-input-messages-or-clamp-oversized-content
+**Requirements:** tui-kit#req:chatshell-overlay
+
+**Given** a `chatshell.Model` with an in-flight `StartStream` and an `Overlay` pushed mid-stream, and separately an `Overlay` whose `View` renders far larger than the box it's given
+**When** the stream's events are drained
+**Then** the stream still completes and `Busy()` clears (its `EventMsg`/`DoneMsg` never reached the overlay, only key/paste/mouse would have); and every rendered line of `View()`'s output is no wider than the screen, whatever the oversized overlay tried to draw
+
 ### AC: global-keys-checked-before-shell-defaults
 **Requirements:** tui-kit#req:chatshell-global-keys
 
@@ -219,12 +234,33 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **When** `F3` is sent, then Enter with composer text is sent
 **Then** the hook fires for `F3` and chatshell does not additionally treat it as any of its own shortcuts, while the unclaimed Enter still submits normally
 
-### AC: replace-block-updates-entry-in-place
+### AC: replace-block-updates-entry-in-place-and-keeps-focus
 **Requirements:** tui-kit#req:chatshell-transcript-ops
 
-**Given** a transcript entry with `ID: "grid-1"` holding one `transcript.Block`
+**Given** a transcript entry with `ID: "grid-1"` holding one `transcript.Block`, currently focused
 **When** `Model.ReplaceBlock("grid-1", newBlock)` is called
-**Then** the entry at that position now renders `newBlock`, its `ID` and position are unchanged, and `ClearTranscript()` afterward empties the transcript and returns focus to the composer
+**Then** the entry at that position now renders `newBlock`, its `ID` and position are unchanged, focus is still on that entry, and `ClearTranscript()` afterward cancels any active stream, empties the transcript, and returns focus to the composer
+
+### AC: focus-entry-jumps-to-entry-by-id
+**Requirements:** tui-kit#req:chatshell-transcript-ops
+
+**Given** a transcript with a focusable entry `ID: "grid-1"` among others
+**When** `Model.FocusEntry("grid-1")` is called
+**Then** it returns `true`, the focus ring is on the transcript zone at that entry's stop, and `FocusEntry("nope")` for an unknown id returns `false` and leaves focus unchanged
+
+### AC: sidepanel-pinner-routes-refs-else-documented-noop
+**Requirements:** tui-kit#req:chatshell-side-panel
+
+**Given** a `chatshell.Model` built `WithSidePanel` of a panel implementing `SidePanelPinner`, and separately one that does not
+**When** `PinToSidebar`/`UnpinFromSidebar` are called and `SidebarRefs()` is read
+**Then** with the `SidePanelPinner`, refs route through it and `OnSidebarChange` fires on an actual change; without it, `SidebarRefs()` returns `nil` and `PinToSidebar`/`UnpinFromSidebar` are no-ops (no notification, no fallback to the default sidebar's own state)
+
+### AC: with-markdown-renderer-applies-to-append-assistant-markdown
+**Requirements:** tui-kit#req:chatshell-markdown-renderer
+
+**Given** a `chatshell.Model` built `WithMarkdownRenderer(r)`
+**When** `AppendAssistantMarkdown(text)` is called and the transcript is rendered
+**Then** the entry's `Markdown` field is set and its rendered view is `r`'s output, not the raw text
 
 ## Open Questions
 

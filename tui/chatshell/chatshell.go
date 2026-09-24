@@ -144,6 +144,13 @@ func WithTitle(title string) Option {
 	return func(m *Model) { m.title = title }
 }
 
+// WithMarkdownRenderer sets the renderer used for entries appended via
+// AppendAssistantMarkdown (or any transcript.Entry with Markdown set), e.g.
+// a glamour-backed renderer for agent or HTTP-response markdown.
+func WithMarkdownRenderer(r transcript.MarkdownRenderer) Option {
+	return func(m *Model) { m.transcript.SetMarkdownRenderer(r) }
+}
+
 // Model is the reusable chat screen.
 type Model struct {
 	ctx     context.Context
@@ -233,6 +240,14 @@ func (m *Model) AppendUser(text string) {
 // AppendAssistant appends a (non-streamed) assistant message.
 func (m *Model) AppendAssistant(text string) {
 	m.transcript.Append(transcript.Entry{Role: transcript.RoleAssistant, Text: text})
+}
+
+// AppendAssistantMarkdown appends a non-streamed assistant message rendered
+// through the configured MarkdownRenderer (WithMarkdownRenderer), e.g.
+// agent or HTTP-response markdown via glamour. With no renderer configured
+// it behaves like AppendAssistant (transcript.Entry.Markdown is inert then).
+func (m *Model) AppendAssistantMarkdown(text string) {
+	m.transcript.Append(transcript.Entry{Role: transcript.RoleAssistant, Text: text, Markdown: true})
 }
 
 // AppendSystem appends a system/status message (e.g. an error).
@@ -325,17 +340,45 @@ func (m *Model) SetBusyCancel(cancel func()) { m.busyCancel = cancel }
 // SetStatus sets the status line text (provider/model/path/usage, etc.).
 func (m *Model) SetStatus(text string) { m.status = text }
 
-// PinToSidebar adds ref to the sidebar and notifies an OnSidebarChange
-// Handler, if any.
+// SidePanelPinner is an optional SidePanel capability: when a product's
+// SidePanel implements it, PinToSidebar/UnpinFromSidebar/SidebarRefs and
+// AddToSidebarMsg route to it instead of the built-in sidebar's ref list. A
+// SidePanel that does NOT implement it makes Pin/Unpin/SidebarRefs a
+// documented no-op (never silently falls back to the now-hidden default
+// sidebar's own state).
+type SidePanelPinner interface {
+	// PinRef adds ref; it reports whether the set actually changed.
+	PinRef(ref session.EntityRef) bool
+	// UnpinRef removes ref; it reports whether the set actually changed.
+	UnpinRef(ref session.EntityRef) bool
+	// Refs returns the current pinned refs.
+	Refs() []session.EntityRef
+}
+
+// PinToSidebar adds ref to the sidebar (or, with a SidePanel implementing
+// SidePanelPinner, to it instead) and notifies an OnSidebarChange Handler,
+// if any.
 func (m *Model) PinToSidebar(ref session.EntityRef) {
+	if m.sidePanel != nil {
+		if p, ok := m.sidePanel.(SidePanelPinner); ok && p.PinRef(ref) {
+			m.notifySidebarChange()
+		}
+		return
+	}
 	if m.sidebar.Add(ref) {
 		m.notifySidebarChange()
 	}
 }
 
-// UnpinFromSidebar removes ref from the sidebar and notifies an
-// OnSidebarChange Handler, if any.
+// UnpinFromSidebar removes ref from the sidebar (or SidePanelPinner) and
+// notifies an OnSidebarChange Handler, if any.
 func (m *Model) UnpinFromSidebar(ref session.EntityRef) {
+	if m.sidePanel != nil {
+		if p, ok := m.sidePanel.(SidePanelPinner); ok && p.UnpinRef(ref) {
+			m.notifySidebarChange()
+		}
+		return
+	}
 	if m.sidebar.Remove(ref) {
 		m.notifySidebarChange()
 	}
@@ -343,19 +386,24 @@ func (m *Model) UnpinFromSidebar(ref session.EntityRef) {
 
 func (m *Model) notifySidebarChange() {
 	if obs, ok := m.handler.(SidebarObserver); ok {
-		obs.OnSidebarChange(append([]session.EntityRef(nil), m.sidebar.Refs()...))
+		obs.OnSidebarChange(m.SidebarRefs())
 	}
 }
 
 // FocusedRef returns the entity ref under focus: the transcript's focused
 // block's Current() when the transcript zone has focus, or the sidebar
-// cursor's ref when the sidebar zone has focus. It is nil when the composer
-// has focus, or nothing is under the cursor.
+// cursor's ref when the sidebar zone has focus (the default sidebar only —
+// a SidePanel exposes no cursor in its pinned contract, so this is nil while
+// one is active). It is nil when the composer has focus, or nothing is
+// under the cursor.
 func (m *Model) FocusedRef() *session.EntityRef {
 	switch m.focusRing.Zone() {
 	case focus.ZoneTranscript:
 		return m.transcript.Current()
 	case focus.ZoneSidebar:
+		if m.sidePanel != nil {
+			return nil
+		}
 		refs := m.sidebar.Refs()
 		cursor := m.sidebar.Cursor()
 		if cursor < 0 || cursor >= len(refs) {
@@ -379,9 +427,16 @@ func (m *Model) SelectionRefs() []session.EntityRef {
 	return nil
 }
 
-// SidebarRefs returns the sidebar's pinned refs, the product's saved
-// working context (distinct from SelectionRefs, the transcript selection).
+// SidebarRefs returns the sidebar's pinned refs: the default sidebar's, or
+// a SidePanelPinner SidePanel's, or nil when a SidePanel is active but
+// doesn't implement SidePanelPinner (see PinToSidebar).
 func (m *Model) SidebarRefs() []session.EntityRef {
+	if m.sidePanel != nil {
+		if p, ok := m.sidePanel.(SidePanelPinner); ok {
+			return append([]session.EntityRef(nil), p.Refs()...)
+		}
+		return nil
+	}
 	return append([]session.EntityRef(nil), m.sidebar.Refs()...)
 }
 
@@ -391,9 +446,26 @@ func (m *Model) Busy() bool { return m.busy }
 
 // ReplaceBlock refreshes/re-runs a grid (or any other transcript.Block) in
 // place: the entry identified by entryID keeps its position and ID, but
-// renders b from now on.
+// renders b from now on. If that entry currently holds transcript focus, it
+// keeps it (the focus ring stop is recomputed for the entry, not left
+// pointing at whatever raw index it used to occupy — necessary because
+// replacing a Block can change its own Focusable() answer).
 func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
 	m.transcript.ReplaceBlock(entryID, b)
+}
+
+// FocusEntry moves focus to the transcript entry identified by id (e.g.
+// DataTug's Ctrl+G "jump to latest grid"), scrolling it into view. It
+// reports whether such a focusable entry exists; when it doesn't, focus is
+// left unchanged.
+func (m *Model) FocusEntry(id string) bool {
+	stop := m.transcript.StopForID(id)
+	if stop < 0 {
+		return false
+	}
+	m.focusRing.FocusStop(stop)
+	m.syncFocus()
+	return true
 }
 
 // SetComposerText sets the composer's text and moves the cursor to the end,
@@ -403,9 +475,18 @@ func (m *Model) SetComposerText(s string) {
 	m.input.CursorEnd()
 }
 
-// ClearTranscript empties the transcript and returns focus to the composer,
-// e.g. /clear or a session switch.
+// ClearTranscript cancels any in-flight stream, empties the transcript and
+// returns focus to the composer, e.g. /clear or a session switch. Cancelling
+// first (rather than leaving the stream running against a now-empty
+// transcript) matters because handleStreamEvent only applies an EventMsg
+// whose ID still matches the current stream — a stray delta for the
+// cancelled stream is otherwise silently dropped instead of resurrecting a
+// transcript entry the clear just removed.
 func (m *Model) ClearTranscript() {
+	m.cancelStream()
+	m.streamID = ""
+	m.streamCancel = nil
+	m.busy = false
 	m.transcript.Clear()
 	m.focusRing.FocusInput()
 	m.syncFocus()
@@ -483,15 +564,26 @@ func (m *Model) Init() tea.Cmd { return textarea.Blink }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// A WindowSizeMsg always resizes the shell, even with an overlay open
-	// (the overlay renders over the freshly resized screen next).
+	// (the overlay renders over the freshly resized screen next), and is
+	// also forwarded to an active SidePanel so it can lay itself out.
 	if wsz, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width, m.height = wsz.Width, wsz.Height
 		m.resize()
-		cmd := m.transcript.Update(msg)
-		return m, cmd
+		cmds := []tea.Cmd{m.transcript.Update(msg)}
+		if m.sidePanel != nil {
+			var cmd tea.Cmd
+			m.sidePanel, cmd = m.sidePanel.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
 	}
 
-	if len(m.overlays) > 0 {
+	// Per the Overlay contract, the top overlay captures only key/paste/
+	// mouse input — everything else (stream events, the spinner tick,
+	// sidebar/product messages, ...) takes the normal path below so a
+	// stream can keep completing, busy can keep clearing, etc. while a
+	// dialog is open.
+	if len(m.overlays) > 0 && isOverlayInputMsg(msg) {
 		return m.updateOverlay(msg)
 	}
 
@@ -529,6 +621,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// isOverlayInputMsg reports whether msg is user input an open Overlay
+// should capture: key presses, paste, and mouse events. Everything else
+// (stream pump messages, the spinner tick, product/sidebar messages, ...)
+// is NOT overlay input and takes chatshell's normal path even while an
+// overlay is open — see Update.
+func isOverlayInputMsg(msg tea.Msg) bool {
+	switch msg.(type) {
+	case tea.KeyPressMsg, tea.KeyReleaseMsg:
+		return true
+	case tea.PasteMsg, tea.PasteStartMsg, tea.PasteEndMsg:
+		return true
+	case tea.MouseClickMsg, tea.MouseReleaseMsg, tea.MouseWheelMsg, tea.MouseMotionMsg:
+		return true
+	default:
+		return false
+	}
+}
+
 // updateOverlay forwards msg exclusively to the top overlay on the stack,
 // popping it once its Update reports done. Called only while len(m.overlays)
 // > 0 (see Update): an active overlay captures every message chatshell would
@@ -553,6 +663,13 @@ func (m *Model) dispatchUnhandled(msg tea.Msg) tea.Cmd {
 	if cmd := m.transcript.Update(msg); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
+	if m.sidePanel != nil {
+		var cmd tea.Cmd
+		m.sidePanel, cmd = m.sidePanel.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
 	if h, ok := m.handler.(MsgHandler); ok {
 		if cmd := h.OnMsg(msg); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -565,15 +682,24 @@ func (m *Model) dispatchUnhandled(msg tea.Msg) tea.Cmd {
 }
 
 func (m *Model) handleStreamEvent(msg stream.EventMsg) (tea.Model, tea.Cmd) {
-	switch msg.Event.Type {
-	case ai.EventTextDelta:
-		m.transcript.AppendDelta(msg.ID, msg.Event.Text)
-	case ai.EventError:
-		// Per the event contract, EventError with a nil Go error (this path
-		// — a fatal error arrives as a DoneMsg instead, see
-		// handleStreamDone) is non-fatal: report it but keep streaming.
-		if msg.Event.Error != nil {
-			m.AppendSystem("error: " + msg.Event.Error.Message)
+	// A stale event — from a stream ClearTranscript cancelled, or that a
+	// later StartStream superseded — must never mutate the transcript: e.g.
+	// AppendDelta's create-on-first-use fallback would otherwise resurrect a
+	// transcript entry for an ID a ClearTranscript already removed. It still
+	// re-arms the pump and still notifies StreamObserver (mirroring
+	// handleStreamDone's stale-Done handling) so per-id product state can be
+	// cleaned up either way.
+	if msg.ID == m.streamID {
+		switch msg.Event.Type {
+		case ai.EventTextDelta:
+			m.transcript.AppendDelta(msg.ID, msg.Event.Text)
+		case ai.EventError:
+			// Per the event contract, EventError with a nil Go error (this
+			// path — a fatal error arrives as a DoneMsg instead, see
+			// handleStreamDone) is non-fatal: report it but keep streaming.
+			if msg.Event.Error != nil {
+				m.AppendSystem("error: " + msg.Event.Error.Message)
+			}
 		}
 	}
 	cmds := []tea.Cmd{msg.Next}
@@ -877,7 +1003,11 @@ func (m *Model) View() tea.View {
 func (m *Model) renderOverlay(base string, o Overlay) string {
 	ow, oh := max(1, m.width*2/3), max(1, m.height*2/3)
 	overlayView := o.View(ow, oh)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlayView, lipgloss.WithWhitespaceChars(" "))
+	// Clamp regardless of what the overlay actually drew: a misbehaving or
+	// content-driven Overlay.View must never blow out the layout past the
+	// box it was asked to render into.
+	clamped := lipgloss.NewStyle().MaxWidth(ow).MaxHeight(oh).Render(overlayView)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, clamped, lipgloss.WithWhitespaceChars(" "))
 }
 
 func (m *Model) commandMenuView() string {

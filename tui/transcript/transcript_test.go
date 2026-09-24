@@ -262,3 +262,126 @@ func TestScrollUpDown(t *testing.T) {
 		t.Fatalf("YOffset after ScrollUp = %d, want %d", m.viewport.YOffset(), off-2)
 	}
 }
+
+type nonFocusableBlock struct{ fakeBlock }
+
+func (b *nonFocusableBlock) Focusable() bool { return false }
+
+func TestReplaceBlockSwapsInPlace(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{ID: "a", Block: &fakeBlock{label: "old"}})
+
+	m.ReplaceBlock("a", &fakeBlock{label: "new"})
+
+	if m.entries[0].Block.(*fakeBlock).label != "new" {
+		t.Fatalf("Block not replaced: %+v", m.entries[0])
+	}
+	if m.entries[0].ID != "a" {
+		t.Fatalf("ID changed: %+v", m.entries[0])
+	}
+}
+
+func TestReplaceBlockUnknownIDIsNoop(t *testing.T) {
+	m := New()
+	m.Append(Entry{ID: "a", Block: &fakeBlock{label: "old"}})
+	m.ReplaceBlock("nope", &fakeBlock{label: "new"})
+	if m.entries[0].Block.(*fakeBlock).label != "old" {
+		t.Fatalf("entry mutated for an unknown id: %+v", m.entries[0])
+	}
+}
+
+func TestReplaceBlockKeepsFocusOnSameEntryAcrossFocusabilityChange(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{ID: "a", Block: &fakeBlock{label: "a"}})
+	m.Append(Entry{ID: "b", Block: &fakeBlock{label: "b"}})
+	m.Focus(1) // stop 1 == entry "b"
+	if got := m.FocusedEntry(); got == nil || got.ID != "b" {
+		t.Fatalf("FocusedEntry() = %+v, want b", got)
+	}
+
+	// Swap "a" (NOT focused) to non-focusable: this removes a stop BEFORE
+	// "b"'s, so "b" now occupies stop 0 -- ReplaceBlock must follow it.
+	m.ReplaceBlock("a", &nonFocusableBlock{fakeBlock{label: "a2"}})
+
+	got := m.FocusedEntry()
+	if got == nil || got.ID != "b" {
+		t.Fatalf("FocusedEntry() = %+v, want still b after an earlier entry's focusability changed", got)
+	}
+	if m.focusIndex != 0 {
+		t.Errorf("focusIndex = %d, want 0 (b is now the only/first stop)", m.focusIndex)
+	}
+}
+
+func TestReplaceBlockOnFocusedEntryToNonFocusableClearsThatStop(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{ID: "a", Block: &fakeBlock{label: "a"}})
+	m.Focus(0)
+
+	m.ReplaceBlock("a", &nonFocusableBlock{fakeBlock{label: "a2"}})
+
+	if m.focusIndex != -1 {
+		t.Errorf("focusIndex = %d, want -1 (the focused entry is no longer focusable)", m.focusIndex)
+	}
+}
+
+func TestClearRemovesEntriesAndFocus(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{ID: "a", Block: &fakeBlock{label: "a"}})
+	m.Focus(0)
+
+	m.Clear()
+
+	if len(m.Entries()) != 0 {
+		t.Fatalf("Entries() = %+v, want empty", m.Entries())
+	}
+	if m.FocusedEntry() != nil {
+		t.Fatalf("FocusedEntry() = %+v, want nil after Clear", m.FocusedEntry())
+	}
+}
+
+func TestStopForID(t *testing.T) {
+	m := New()
+	m.Append(Entry{Role: RoleAssistant, Text: "not focusable"})
+	m.Append(Entry{ID: "grid-1", Block: &fakeBlock{label: "g1"}})
+	m.Append(Entry{ID: "grid-2", Block: &fakeBlock{label: "g2"}})
+
+	if stop := m.StopForID("grid-2"); stop != 1 {
+		t.Errorf("StopForID(grid-2) = %d, want 1", stop)
+	}
+	if stop := m.StopForID("nope"); stop != -1 {
+		t.Errorf("StopForID(nope) = %d, want -1", stop)
+	}
+	if stop := m.StopForID(""); stop != -1 {
+		t.Errorf("StopForID(\"\") = %d, want -1", stop)
+	}
+}
+
+func TestStopForIDIgnoresNonFocusableEntry(t *testing.T) {
+	m := New()
+	m.Append(Entry{ID: "sys", Role: RoleSystem, Text: "not focusable but has an ID"})
+	if stop := m.StopForID("sys"); stop != -1 {
+		t.Errorf("StopForID(sys) = %d, want -1 (system entries aren't focusable)", stop)
+	}
+}
+
+func TestSetMarkdownRendererAppliesAfterConstruction(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	var gotWidth int
+	m.SetMarkdownRenderer(func(text string, width int) string {
+		gotWidth = width
+		return "RENDERED:" + text
+	})
+	m.Append(Entry{Role: RoleAssistant, Text: "hi", Markdown: true})
+
+	if !strings.Contains(m.View(), "RENDERED:hi") {
+		t.Fatalf("View() = %q, want the configured renderer applied", m.View())
+	}
+	if gotWidth <= 0 {
+		t.Errorf("renderer width = %d, want > 0", gotWidth)
+	}
+}

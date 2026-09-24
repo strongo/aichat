@@ -98,6 +98,12 @@ func WithMarkdownRenderer(r MarkdownRenderer) Option {
 	return func(m *Model) { m.markdownRenderer = r }
 }
 
+// SetMarkdownRenderer sets the renderer used for entries with Markdown set,
+// after construction (New's caller may not own the Model's own construction
+// call, e.g. tui/chatshell, which builds a *Model itself and exposes this
+// via its own WithMarkdownRenderer Option).
+func (m *Model) SetMarkdownRenderer(r MarkdownRenderer) { m.markdownRenderer = r }
+
 // Model is the transcript viewport: an ordered list of Entry plus a
 // bubbles/viewport rendering them, a focus index over focusable entries
 // ("stops"), and the DataTug ensureBlockVisible scrolling behaviour.
@@ -148,14 +154,31 @@ func (m *Model) Append(e Entry) {
 func (m *Model) ReplaceBlock(id string, b Block) {
 	for i := range m.entries {
 		if m.entries[i].ID != "" && m.entries[i].ID == id {
+			// A Block swap can change Focusable()'s answer for this entry,
+			// which shifts what every stop index AFTER it maps to (Stops()/
+			// entryIndexForStop count only focusable entries) -- and that
+			// shift can move the CURRENTLY focused entry's stop even when
+			// it isn't the one being replaced. So: remember which entry (by
+			// ID, not raw index) holds focus before the swap, and re-resolve
+			// its stop afterward, whether or not it was id itself.
+			var focusedID string
+			if fe := m.FocusedEntry(); fe != nil {
+				focusedID = fe.ID
+			}
 			m.entries[i].Block = b
 			m.entries[i].renderValid = false
+			if focusedID != "" {
+				m.focusIndex = m.StopForID(focusedID)
+			}
 			m.Rebuild(m.shouldAutoFollow())
 			return
 		}
 	}
 }
 
+// stopForEntryIndex is entryIndexForStop's inverse: the stop index entries
+// index entryIdx occupies, or -1 if that entry isn't focusable (or the
+// index is out of range).
 // Clear removes every entry and clears focus.
 func (m *Model) Clear() {
 	m.entries = nil
@@ -211,6 +234,26 @@ func (m *Model) entryIndexForStop(stop int) int {
 			if n == stop {
 				return i
 			}
+		}
+	}
+	return -1
+}
+
+// StopForID returns the focus-ring stop index of the focusable entry
+// identified by id, or -1 if there is no such entry, or it isn't focusable
+// (e.g. DataTug's Ctrl+G "jump to latest grid").
+func (m *Model) StopForID(id string) int {
+	if id == "" {
+		return -1
+	}
+	stop := -1
+	for _, e := range m.entries {
+		if !e.focusable() {
+			continue
+		}
+		stop++
+		if e.ID == id {
+			return stop
 		}
 	}
 	return -1
