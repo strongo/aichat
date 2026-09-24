@@ -11,6 +11,7 @@ import (
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/decision"
+	"github.com/strongo/aichat/ai/session"
 )
 
 func TestDecisionSchema_IsValidJSON(t *testing.T) {
@@ -280,5 +281,140 @@ func TestDecider_DecisionTimeoutIs4s(t *testing.T) {
 	dec := New(&fakeLLM{}, Options{})
 	if dec.DecisionTimeout() != 4*time.Second {
 		t.Errorf("DecisionTimeout() = %v, want 4s", dec.DecisionTimeout())
+	}
+}
+
+func TestDecide_UnmarshalErrorOnTypeMismatch(t *testing.T) {
+	// Valid JSON that doesn't fit wireDecision's shape (module must be an
+	// object, not a string) must surface as the "malformed decision JSON"
+	// error, distinct from the "no parseable text" case.
+	raw := json.RawMessage(`{"module":"not-an-object"}`)
+	llm := &fakeLLM{events: []ai.Event{
+		{Type: ai.EventStructured, Structured: raw},
+		{Type: ai.EventCompleted},
+	}}
+	dec := New(llm, Options{})
+	_, ok, err := dec.Decide(context.Background(), decision.Request{Text: "x", Taxonomy: taxonomy()})
+	if err == nil || !strings.Contains(err.Error(), "malformed decision JSON") {
+		t.Fatalf("err = %v, want malformed decision JSON", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false on error")
+	}
+}
+
+func TestDecide_ReferenceSlotsAndPresentationRoundTrip(t *testing.T) {
+	raw := json.RawMessage(`{
+		"module":{"value":"calendar","confidence":0.9},
+		"intent":{"value":"show","confidence":0.8},
+		"interaction":"command",
+		"reference":{"kind":"happening","expression":"my dentist appointment","pronoun":false},
+		"slots":[{"name":"","value":"ignored"},{"name":"when","value":"friday"}],
+		"presentation":"day_calendar"
+	}`)
+	llm := &fakeLLM{events: []ai.Event{
+		{Type: ai.EventStructured, Structured: raw},
+		{Type: ai.EventCompleted},
+	}}
+	dec := New(llm, Options{})
+	d, ok, err := dec.Decide(context.Background(), decision.Request{Text: "x", Taxonomy: taxonomy()})
+	if err != nil || !ok {
+		t.Fatalf("Decide: d=%v ok=%v err=%v", d, ok, err)
+	}
+	if d.Reference == nil || d.Reference.Kind != "happening" || d.Reference.Expression != "my dentist appointment" {
+		t.Fatalf("Reference = %+v", d.Reference)
+	}
+	if len(d.Slots) != 1 || d.Slots["when"] != "friday" {
+		t.Fatalf("Slots = %+v, want only the named slot (empty-name entry skipped)", d.Slots)
+	}
+	if d.Presentation != "day_calendar" {
+		t.Fatalf("Presentation = %q", d.Presentation)
+	}
+}
+
+func TestDecide_ReferenceWithEmptyKindOmitted(t *testing.T) {
+	raw := json.RawMessage(`{
+		"module":{"value":"calendar","confidence":0.9},
+		"intent":{"value":"show","confidence":0.8},
+		"interaction":"command",
+		"reference":{"kind":"","expression":"it"}
+	}`)
+	llm := &fakeLLM{events: []ai.Event{
+		{Type: ai.EventStructured, Structured: raw},
+		{Type: ai.EventCompleted},
+	}}
+	dec := New(llm, Options{})
+	d, ok, err := dec.Decide(context.Background(), decision.Request{Text: "x", Taxonomy: taxonomy()})
+	if err != nil || !ok {
+		t.Fatalf("Decide: d=%v ok=%v err=%v", d, ok, err)
+	}
+	if d.Reference != nil {
+		t.Fatalf("Reference = %+v, want nil for an empty Kind", d.Reference)
+	}
+}
+
+func TestSystemPrompt_AllTaxonomyDimensions(t *testing.T) {
+	tx := decision.Taxonomy{
+		Modules: []decision.ModuleSpec{
+			{Name: "calendar", Intents: []string{"show"}, Scopes: []string{"calendar"}},
+			{Name: "tasks", Intents: []string{"list"}}, // no Scopes: exercises the "no scopes" path too
+		},
+		Presentations: []string{"day_calendar"},
+		DataKinds:     []string{"relevant_happenings"},
+		EntityTypes:   []string{"happening"},
+	}
+	p := systemPrompt(tx)
+	for _, want := range []string{"Data kinds:", "relevant_happenings", "Entity types:", "happening", "Presentations:", "day_calendar"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("systemPrompt missing %q: %q", want, p)
+		}
+	}
+}
+
+func TestStateContextBlock_AllFields(t *testing.T) {
+	req := decision.Request{
+		Text: "x",
+		State: session.State{
+			Focused:   &session.EntityRef{Type: "happening", Title: "Dentist"},
+			Selection: []session.EntityRef{{Type: "happening", Title: "Sel1"}},
+			Sidebar:   []session.EntityRef{{Type: "happening", Title: "Side1"}},
+			Previous:  &session.Action{Kind: "created"},
+		},
+		Now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		TZ:  "Europe/London",
+	}
+	block := stateContextBlock(req, 8)
+	for _, want := range []string{"Focused: happening", "Selected: happening", "Sidebar: happening", "Previous action: created", "tz=Europe/London"} {
+		if !strings.Contains(block.Text, want) {
+			t.Errorf("stateContextBlock missing %q: %q", want, block.Text)
+		}
+	}
+}
+
+func TestStateContextBlock_NowDefaultsWhenZero(t *testing.T) {
+	req := decision.Request{Text: "x"}
+	block := stateContextBlock(req, 8)
+	if !strings.Contains(block.Text, "Now: ") {
+		t.Errorf("expected a Now: line even with a zero Request.Now: %q", block.Text)
+	}
+}
+
+func TestExtractJSON_FencedBlockAtStart(t *testing.T) {
+	// The fenced-block trim path only fires when the ``` marker is the
+	// very first thing in the (trimmed) text -- unlike prose that merely
+	// CONTAINS a fence later on.
+	got := extractJSON("```json\n{\"a\":1}\n```")
+	if got != `{"a":1}` {
+		t.Errorf("extractJSON = %q, want stripped JSON body", got)
+	}
+	got2 := extractJSON("```\n{\"a\":1}\n```")
+	if got2 != `{"a":1}` {
+		t.Errorf("extractJSON (no json tag) = %q", got2)
+	}
+}
+
+func TestExtractJSON_NoBraces(t *testing.T) {
+	if got := extractJSON("no json here"); got != "" {
+		t.Errorf("extractJSON = %q, want empty", got)
 	}
 }
