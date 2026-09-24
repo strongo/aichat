@@ -191,6 +191,13 @@ const (
 	// server-side tools). Not a stopping point a caller should treat as
 	// "done" the way StopReasonEnd is.
 	StopReasonPauseTurn = "pause_turn"
+	// StopReasonContentFilter: the provider stopped generation because a
+	// content filter flagged the response (e.g. ai/openairesponses'
+	// response.incomplete with incomplete_details.reason
+	// "content_filter"). Like StopReasonRefusal, not an ai.Error -- the
+	// response completed, just with content the provider declined to
+	// finish delivering.
+	StopReasonContentFilter = "content_filter"
 )
 
 // Event is one normalised stream event. Exactly the fields relevant to Type
@@ -357,7 +364,7 @@ func (e *Error) IsRetryable() bool { return e != nil && e.Retryable }
 // (never Retryable).
 type LLMProvider interface {
 	// Name identifies the provider in diagnostics ("cloud",
-	// "openai-compatible", "anthropic").
+	// "openai-compatible", "openai-responses", "anthropic").
 	Name() string
 	Stream(ctx context.Context, req ChatRequest) iter.Seq2[Event, error]
 }
