@@ -2,9 +2,8 @@
 
 This is a short, product-neutral reference for the Bubble Tea chat kit in
 `tui/`. It documents the keybindings and sidebar model shared by every
-`tui/chatshell`-based screen (`sneat chat`, `datatug chat`, ...). The
-`aichat-ai` lane folds this into the spec tree at landing; until then it
-lives here.
+`tui/chatshell`-based screen (`sneat chat`, `datatug chat`, ...). See
+`spec/features/tui-kit` for the full feature spec.
 
 ## Focus ring (`tui/focus`)
 
@@ -48,14 +47,18 @@ returns to wherever it was before `Shift+Right` (or the input).
 | `/` at start of input | Opens the slash-command menu |
 | `↑`/`↓` (menu open) | Move the menu selection |
 | `Enter`/`Tab` (menu open) | Insert the selected command |
+| `Esc` (menu open) | Closes the menu (stays closed until the input value changes); takes priority over every other Esc behaviour |
 | `F6` | Toggle sidebar visibility (moves focus back first if the sidebar held it) |
 | `Ctrl+Left`/`Ctrl+Right` | Shrink/grow the chat pane's split share (40–75%) |
-| `Esc` / `Ctrl+C` | While busy (a stream or `SetBusy(true)` phase): cancel it, rendering `(stopped)` — not an error — in the transcript |
-| `Ctrl+C` | While idle: quit |
+| `Esc` / `Ctrl+C` (busy, 1st press) | Cancel the in-flight stream or `SetBusy(true)` phase; renders `(stopped)` — not an error — in the transcript |
+| `Ctrl+C` (busy, 2nd consecutive press) | Quit anyway, even if the cancellation from the first press hasn't finished yet |
+| `Ctrl+C` (idle) | Quit |
 
 The composer stops accepting keystrokes entirely while `Busy()` is true
 (during `StartStream`, or a product's own `SetBusy(true)` phase such as a
-decision/query lookup); the spinner runs in its place.
+decision/query lookup); the spinner runs in its place. Esc's priority order
+is: close an open slash-command menu, then cancel if busy, then let a
+focused Block capture it (`EscCapturer`), then the default focus-ring Esc.
 
 ## Result grid (`tui/grid`)
 
@@ -151,21 +154,49 @@ an `EventMsg`, and the stream continues); a user-initiated cancellation
 surfaces as `ai.ErrCodeCanceled` once the `ai/` provider has translated it,
 or as `context.Canceled` from tui/stream's own ctx-race before that.
 
-`chatshell.Model.StartStream` wires this into the transcript: text deltas
-append progressively to the streaming entry, and a spinner runs until the
-stream produces its first delta or completes. It derives a cancellable
-context per stream `id`; `Esc`/`Ctrl+C` while busy cancels it, and the
-cancellation renders as a `(stopped)` transcript entry rather than an error
-(`chatshell.isCanceled` recognises both forms above). A superseded stream's
-late `DoneMsg` (a stale `id`) is ignored.
+`chatshell.Model.StartStream(id string, open func(ctx context.Context)
+iter.Seq2[ai.Event, error]) tea.Cmd` wires this into the transcript: text
+deltas append progressively to the streaming entry, and a spinner runs until
+the stream produces its first delta or completes.
 
-An optional `chatshell.StreamObserver` (`OnStreamEvent(id string, ev
-ai.Event) tea.Cmd`) on the product's `Handler` receives every event
-(Started/TextDelta/Structured/Usage/Completed/Error) in addition to
-chatshell's own built-in handling — e.g. to track usage or diagnostics.
+The **Model owns the per-stream context**: it creates a cancellable child of
+its own context (`WithContext`) and passes it to `open`, which must build
+the actual provider call from it —
+`open := func(ctx context.Context) iter.Seq2[ai.Event, error] { return
+provider.Stream(ctx, req) }` — so a cancellation reaches the live request,
+not just chatshell's local pump: an adapter observing `ctx.Done()` aborts
+its own call and yields `ai.ErrCodeCanceled`. The context is cancelled
+automatically when a new `StartStream` call supersedes this one, or by
+`Esc`/`Ctrl+C` while busy; the cancellation renders as a `(stopped)`
+transcript entry rather than an error (`chatshell.isCanceled` recognises
+both `ai.ErrCodeCanceled` and tui/stream's own `context.Canceled` ctx-race).
+
+An optional `chatshell.StreamObserver` on the product's `Handler`:
+
+```go
+type StreamObserver interface {
+	OnStreamEvent(id string, ev ai.Event) tea.Cmd
+	OnStreamDone(id string, err error) tea.Cmd
+}
+```
+
+`OnStreamEvent` receives every event (Started/TextDelta/Structured/Usage/
+Completed/Error) in addition to chatshell's own built-in handling — e.g. to
+track usage or diagnostics. `OnStreamDone` fires exactly once per
+`StartStream` call, whatever the outcome (success, a fatal error, or a
+cancellation) — including for a stream superseded by a later `StartStream`
+before it finished — so a product can roll back speculative state or record
+diagnostics for that stream `id`.
+
 `Model.SetBusy(bool) tea.Cmd` marks a product-driven pre-stream phase (a
-decision chain, a deterministic query) busy the same way: composer disabled,
-spinner running.
+decision chain, a deterministic query) busy the same way as a stream:
+composer disabled, spinner running. `Model.SetBusyCancel(cancel func())`
+registers that phase's own cancel func (e.g. a `context.CancelFunc`);
+`Esc`/`Ctrl+C` while busy and no stream is active call it directly and
+render `(stopped)` synchronously (unlike a stream, there is no `DoneMsg` to
+report it asynchronously). A **second, immediately-following** `Ctrl+C`
+always quits, whether or not the first press's cancellation has finished;
+any other key re-arms it back to "cancel on the next Ctrl+C".
 
 An optional `chatshell.MsgHandler` (`OnMsg(msg tea.Msg) tea.Cmd`) receives
 every message chatshell does not itself recognise — e.g. a product message,

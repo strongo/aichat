@@ -33,6 +33,13 @@ type item struct {
 // Start begins draining seq in a goroutine — never buffering the whole
 // response — and returns the tea.Cmd producing the first message. ctx
 // cancellation stops the goroutine promptly and the pump.
+//
+// For a cancellation to reach the underlying provider request (not just stop
+// this local pump), seq must itself have been built from ctx — e.g.
+// provider.Stream(ctx, req) — so an adapter observing ctx.Done() can abort
+// its own HTTP call and yield ai.ErrCodeCanceled. chatshell.Model.StartStream
+// does this: it hands its per-stream ctx to the caller's seq-opening func
+// before calling Start with that same ctx.
 func Start(ctx context.Context, id string, seq iter.Seq2[ai.Event, error]) tea.Cmd {
 	ch := make(chan item)
 	go func() {

@@ -23,6 +23,12 @@ type fakeHandler struct {
 	submitResult tea.Cmd
 	streamEvents []ai.Event
 	msgsSeen     []tea.Msg
+	streamDone   []streamDoneCall
+}
+
+type streamDoneCall struct {
+	id  string
+	err error
 }
 
 func (h *fakeHandler) Submit(text string) tea.Cmd {
@@ -36,6 +42,11 @@ func (h *fakeHandler) OnSidebarChange(refs []session.EntityRef) {
 
 func (h *fakeHandler) OnStreamEvent(id string, ev ai.Event) tea.Cmd {
 	h.streamEvents = append(h.streamEvents, ev)
+	return nil
+}
+
+func (h *fakeHandler) OnStreamDone(id string, err error) tea.Cmd {
+	h.streamDone = append(h.streamDone, streamDoneCall{id: id, err: err})
 	return nil
 }
 
@@ -130,6 +141,12 @@ func seqOf(events ...ai.Event) iter.Seq2[ai.Event, error] {
 	}
 }
 
+// openSeq adapts a fixed event list to StartStream's open func shape. Most
+// tests don't care about the ctx StartStream hands them.
+func openSeq(events ...ai.Event) func(context.Context) iter.Seq2[ai.Event, error] {
+	return func(context.Context) iter.Seq2[ai.Event, error] { return seqOf(events...) }
+}
+
 // drainCmd runs cmd and every tea.Cmd it (transitively) produces through
 // m.Update, unpacking tea.BatchMsg the way the real Bubble Tea runtime does,
 // until no command remains or max steps have run.
@@ -165,7 +182,7 @@ func TestStartStreamRendersDeltasProgressively(t *testing.T) {
 		{Type: ai.EventTextDelta, Text: "lo"},
 		{Type: ai.EventCompleted},
 	}
-	cmd := m.StartStream("turn-1", seqOf(events...))
+	cmd := m.StartStream("turn-1", openSeq(events...))
 	if !m.Busy() {
 		t.Fatal("StartStream did not set busy")
 	}
@@ -185,7 +202,7 @@ func TestStreamErrorAppendsSystemMessage(t *testing.T) {
 	events := []ai.Event{
 		{Type: ai.EventError, Error: &ai.Error{Code: ai.ErrCodeUpstream, Message: "boom"}},
 	}
-	cmd := m.StartStream("turn-1", seqOf(events...))
+	cmd := m.StartStream("turn-1", openSeq(events...))
 	drainCmd(t, m, cmd, 20)
 	found := false
 	for _, e := range m.transcript.Entries() {
@@ -402,22 +419,34 @@ func TestSlashCommandMenuInsertsOnEnter(t *testing.T) {
 func TestEscWhileBusyCancelsStreamAndRendersStopped(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
+	var openedCtx context.Context
 	block := make(chan struct{})
-	seq := func(yield func(ai.Event, error) bool) {
-		if !yield(ai.Event{Type: ai.EventStarted}, nil) {
-			return
+	open := func(ctx context.Context) iter.Seq2[ai.Event, error] {
+		openedCtx = ctx // S2: StartStream must hand its per-stream ctx to open
+		return func(yield func(ai.Event, error) bool) {
+			if !yield(ai.Event{Type: ai.EventStarted}, nil) {
+				return
+			}
+			<-block // blocks until the derived ctx is cancelled by Esc
 		}
-		<-block // blocks until the derived ctx is cancelled by Esc
 	}
-	cmd := m.StartStream("turn-1", seq)
+	cmd := m.StartStream("turn-1", open)
 	if !m.Busy() {
 		t.Fatal("StartStream did not set busy")
+	}
+	if openedCtx == nil {
+		t.Fatal("StartStream did not pass a ctx to open")
 	}
 	// Drain only the first message (EventStarted); the pump then blocks on
 	// the second yield until cancelled.
 	msg := firstFromBatch(t, cmd)
 	_, next := m.Update(msg)
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	// S2: cancellation must reach the actual ctx the provider call was
+	// opened with, not just chatshell's local bookkeeping.
+	if openedCtx.Err() == nil {
+		t.Fatal("Esc while busy did not cancel the ctx handed to open (the provider's own request)")
+	}
 	drainCmd(t, m, next, 20)
 	close(block)
 	if m.Busy() {
@@ -434,6 +463,9 @@ func TestEscWhileBusyCancelsStreamAndRendersStopped(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no (stopped) entry in transcript: %+v", m.transcript.Entries())
+	}
+	if len(h.streamDone) != 1 || h.streamDone[0].id != "turn-1" {
+		t.Fatalf("OnStreamDone not called for the cancelled stream: %+v", h.streamDone)
 	}
 }
 
@@ -474,7 +506,7 @@ func TestStreamObserverReceivesEveryEvent(t *testing.T) {
 		{Type: ai.EventUsage},
 		{Type: ai.EventCompleted},
 	}
-	cmd := m.StartStream("turn-1", seqOf(events...))
+	cmd := m.StartStream("turn-1", openSeq(events...))
 	drainCmd(t, m, cmd, 20)
 	if len(h.streamEvents) != len(events) {
 		t.Fatalf("observer saw %d events, want %d: %+v", len(h.streamEvents), len(events), h.streamEvents)
@@ -483,6 +515,58 @@ func TestStreamObserverReceivesEveryEvent(t *testing.T) {
 		if h.streamEvents[i].Type != ev.Type {
 			t.Errorf("event %d type = %v, want %v", i, h.streamEvents[i].Type, ev.Type)
 		}
+	}
+	if len(h.streamDone) != 1 || h.streamDone[0].id != "turn-1" || h.streamDone[0].err != nil {
+		t.Fatalf("OnStreamDone = %+v, want one success call for turn-1", h.streamDone)
+	}
+}
+
+func TestStreamObserverOnStreamDoneFiresForFatalError(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	boom := &ai.Error{Code: ai.ErrCodeUpstream, Message: "boom"}
+	seq := func(yield func(ai.Event, error) bool) {
+		yield(ai.Event{Type: ai.EventError, Error: boom}, boom)
+	}
+	cmd := m.StartStream("turn-1", func(context.Context) iter.Seq2[ai.Event, error] { return seq })
+	drainCmd(t, m, cmd, 20)
+	if len(h.streamDone) != 1 || h.streamDone[0].err == nil {
+		t.Fatalf("OnStreamDone = %+v, want one call with a non-nil error", h.streamDone)
+	}
+}
+
+func TestStreamObserverOnStreamDoneFiresEvenForASupersededStream(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	block := make(chan struct{})
+	first := func(context.Context) iter.Seq2[ai.Event, error] {
+		return func(yield func(ai.Event, error) bool) { <-block }
+	}
+	firstCmd := m.StartStream("turn-1", first)
+	// Superseding with a new StartStream cancels "turn-1" via cancelStream.
+	secondCmd := m.StartStream("turn-2", openSeq(ai.Event{Type: ai.EventCompleted}))
+	close(block)
+	drainCmd(t, m, firstCmd, 20)
+	drainCmd(t, m, secondCmd, 20)
+	sawFirst, sawSecond := false, false
+	for _, d := range h.streamDone {
+		if d.id == "turn-1" {
+			sawFirst = true
+		}
+		if d.id == "turn-2" {
+			sawSecond = true
+		}
+	}
+	if !sawFirst {
+		t.Fatal("OnStreamDone not called for the superseded stream turn-1")
+	}
+	if !sawSecond {
+		t.Fatal("OnStreamDone not called for the current stream turn-2")
+	}
+	// The superseded stream's belated Done must not touch the CURRENT
+	// stream's busy state.
+	if m.Busy() {
+		t.Fatal("still busy after the current stream (turn-2) completed")
 	}
 }
 
@@ -610,6 +694,118 @@ func TestWithTitleSetsTopBar(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	if !strings.Contains(m.View().Content, "datatug chat") {
 		t.Fatal("View() does not contain the configured title")
+	}
+}
+
+// --- S2/S3/n6 fix-round-2 tests ---------------------------------------------
+
+func TestSetBusyCancelIsCalledByEscAndRendersStoppedSynchronously(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	cancelled := false
+	if cmd := m.SetBusy(true); cmd == nil {
+		t.Fatal("SetBusy(true) should return a spinner-tick command")
+	}
+	m.SetBusyCancel(func() { cancelled = true })
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if !cancelled {
+		t.Fatal("Esc while a SetBusy(true) phase is active did not call SetBusyCancel")
+	}
+	if m.Busy() {
+		t.Fatal("still busy after Esc cancelled the busy phase")
+	}
+	found := false
+	for _, e := range m.transcript.Entries() {
+		if strings.Contains(e.Text, "(stopped)") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("Esc did not render (stopped) synchronously for a bare SetBusy phase")
+	}
+}
+
+func TestCtrlCCancelsSetBusyPhaseTooWithoutAnActiveStream(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	cancelled := false
+	m.SetBusy(true)
+	m.SetBusyCancel(func() { cancelled = true })
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if !cancelled || cmd != nil || m.quit {
+		t.Fatalf("first Ctrl+C should cancel, not quit: cancelled=%v cmd=%v quit=%v", cancelled, cmd, m.quit)
+	}
+}
+
+func TestSecondConsecutiveCtrlCAlwaysQuits(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.busy = true
+	m.streamID = "turn-1"
+	m.streamCancel = func() {}
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd != nil {
+		t.Fatal("first Ctrl+C should not quit")
+	}
+	// Still busy (the stream's cancellation is asynchronous); a second,
+	// immediately-following Ctrl+C must quit regardless.
+	_, cmd = m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd == nil || !m.quit {
+		t.Fatal("second consecutive Ctrl+C should always quit")
+	}
+}
+
+func TestCtrlCArmingResetsOnAnyOtherKey(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.busy = true
+	m.streamID = "turn-1"
+	m.streamCancel = func() {}
+	m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}) // arms (busy stays true: cancellation is async)
+	m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})        // any other key disarms
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd != nil {
+		t.Fatal("Ctrl+C after an intervening key should cancel again, not quit")
+	}
+}
+
+func TestEscClosesSlashCommandMenuFirst(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.commands = []Command{{Name: "/help", Help: "Show help"}}
+	m.input.SetValue("/he")
+	if len(m.commandMenuMatches()) != 1 {
+		t.Fatalf("matches = %v", m.commandMenuMatches())
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if len(m.commandMenuMatches()) != 0 {
+		t.Fatal("Esc did not close the slash-command menu")
+	}
+	// Esc must not have done anything else (e.g. moved focus): still input,
+	// and the typed text is untouched.
+	if m.focusRing.Zone() != focus.ZoneInput {
+		t.Fatalf("zone = %v, want input", m.focusRing.Zone())
+	}
+	if m.input.Value() != "/he" {
+		t.Fatalf("input = %q, want unchanged /he", m.input.Value())
+	}
+	// Editing the input re-shows the menu for the new value.
+	m.input.SetValue("/hel")
+	if len(m.commandMenuMatches()) != 1 {
+		t.Fatal("menu should reappear once the input value changes")
+	}
+}
+
+func TestEscOnEmptyInputStillReturnsFocusWhenNoMenu(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	blk := &fakeBlock{}
+	m.AppendBlock(blk)
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if m.focusRing.Zone() != focus.ZoneInput {
+		t.Fatalf("zone = %v, want input (no menu open, no CapturesEsc block)", m.focusRing.Zone())
 	}
 }
 

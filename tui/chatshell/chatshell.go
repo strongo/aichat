@@ -48,8 +48,15 @@ type SidebarObserver interface {
 // addition to chatshell's own built-in handling (rendering text deltas,
 // appending non-fatal errors). Its returned tea.Cmd, if any, is batched
 // alongside the stream's own re-arm command.
+//
+// OnStreamDone is called exactly once per StartStream call, whatever the
+// outcome — success (err nil), a fatal error, or a user/product
+// cancellation (err satisfying chatshell's isCanceled) — so a product can
+// roll back speculative state or record diagnostics. It fires even for a
+// stream that was superseded by a later StartStream call before finishing.
 type StreamObserver interface {
 	OnStreamEvent(id string, ev ai.Event) tea.Cmd
+	OnStreamDone(id string, err error) tea.Cmd
 }
 
 // MsgHandler is an optional Handler capability: when implemented, chatshell
@@ -96,8 +103,9 @@ type Model struct {
 	focusRing  *focus.Ring
 	spinner    spinner.Model
 
-	commands         []Command
-	commandMenuIndex int
+	commands             []Command
+	commandMenuIndex     int
+	commandMenuDismissed string // input value the menu was last Esc-dismissed for
 
 	title  string
 	status string
@@ -107,10 +115,22 @@ type Model struct {
 	quit   bool
 
 	// streamID/streamCancel identify and cancel the in-flight StartStream
-	// call, if any. A DoneMsg whose ID does not match streamID is stale (a
-	// superseded stream) and is ignored.
+	// call, if any. handleStreamDone still notifies StreamObserver for a
+	// stale (superseded) Done, but only a Done matching streamID clears busy
+	// and appends a transcript entry.
 	streamID     string
 	streamCancel context.CancelFunc
+
+	// busyCancel is the cancel func for a product's own SetBusy(true) phase
+	// (e.g. a decision chain), set via SetBusyCancel. Esc/Ctrl+C while busy
+	// and no stream is active calls it directly, since — unlike a stream —
+	// there is no DoneMsg to asynchronously report the cancellation.
+	busyCancel func()
+
+	// ctrlCArmed is set by a first Ctrl+C while busy (which cancels); a
+	// second, immediately-following Ctrl+C always quits instead of trying to
+	// cancel again. Any other key clears it.
+	ctrlCArmed bool
 }
 
 // New returns a chat screen driven by handler.
@@ -162,22 +182,28 @@ func (m *Model) AppendBlock(block transcript.Block) {
 	m.transcript.Append(transcript.Entry{Block: block})
 }
 
-// StartStream starts a streamed assistant entry from seq (see tui/stream)
-// and returns the tea.Cmd the caller must return from Update/Init to drive
-// it. id must be unique per turn; deltas render progressively into the
-// transcript, and a spinner runs until the first delta (or completion)
-// arrives.
+// StartStream starts a streamed assistant entry. id must be unique per
+// turn; deltas render progressively into the transcript, and a spinner runs
+// until the first delta (or completion) arrives.
 //
-// The stream runs under a context derived from the Model's context
-// (WithContext), cancelled automatically when a new StartStream call
-// supersedes it, or explicitly by the user (Esc or Ctrl+C while busy). A
-// cancelled stream ends with a "(stopped)" transcript entry, not an error.
-func (m *Model) StartStream(id string, seq iter.Seq2[ai.Event, error]) tea.Cmd {
+// The Model owns the per-stream context: it creates a cancellable child of
+// its own context (WithContext) and passes it to open, which must use it to
+// build the actual provider call (e.g. `return provider.Stream(ctx, req)`)
+// so a cancellation reaches the live request, not just this local pump — an
+// adapter observing ctx.Done() aborts its call and yields
+// ai.ErrCodeCanceled. The context is cancelled automatically when a new
+// StartStream call supersedes this one, or explicitly by the user (Esc or
+// Ctrl+C while busy). A cancelled stream ends with a "(stopped)" transcript
+// entry, not an error, and StreamObserver.OnStreamDone (if implemented)
+// always fires once the stream ends, however it ended.
+func (m *Model) StartStream(id string, open func(ctx context.Context) iter.Seq2[ai.Event, error]) tea.Cmd {
 	m.cancelStream()
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.streamID, m.streamCancel = id, cancel
 	m.busy = true
+	m.ctrlCArmed = false
 	m.transcript.Append(transcript.Entry{ID: id, Role: transcript.RoleAssistant, Text: ""})
+	seq := open(ctx)
 	return tea.Batch(stream.Start(ctx, id, seq), m.spinner.Tick)
 }
 
@@ -190,19 +216,48 @@ func (m *Model) cancelStream() {
 	}
 }
 
+// cancelBusy is Esc/Ctrl+C's "stop whatever is busy" action. A live stream
+// is cancelled through the usual context path (its DoneMsg renders
+// "(stopped)" asynchronously, see handleStreamDone); a bare SetBusy(true)
+// phase has no such message, so cancelBusy calls its registered
+// SetBusyCancel func (if any), clears busy and appends "(stopped)" itself,
+// right away.
+func (m *Model) cancelBusy() {
+	if m.streamCancel != nil {
+		m.cancelStream()
+		return
+	}
+	if m.busyCancel != nil {
+		m.busyCancel()
+		m.busyCancel = nil
+	}
+	m.busy = false
+	m.AppendSystem("(stopped)")
+}
+
 // SetBusy marks a product-driven phase that precedes (or stands in for) a
 // stream — e.g. a decision chain or a deterministic query — as in flight:
 // the composer stops accepting input and the spinner runs, exactly as while
 // a stream is in flight. The returned tea.Cmd starts the spinner and must be
 // returned from Update/a command chain when busy is true; it is nil when
-// busy is false.
+// busy is false. SetBusy(false) clears any SetBusyCancel func registered for
+// the phase that just ended.
 func (m *Model) SetBusy(busy bool) tea.Cmd {
 	m.busy = busy
-	if busy {
-		return m.spinner.Tick
+	if !busy {
+		m.busyCancel = nil
+		return nil
 	}
-	return nil
+	m.ctrlCArmed = false
+	return m.spinner.Tick
 }
+
+// SetBusyCancel registers the cancel func for the current SetBusy(true)
+// phase (e.g. a context.CancelFunc for the ctx a decision chain runs
+// under). Esc/Ctrl+C while busy and no stream is active calls it — see
+// cancelBusy. Products that call SetBusy(true) but have nothing cancellable
+// may leave this unset.
+func (m *Model) SetBusyCancel(cancel func()) { m.busyCancel = cancel }
 
 // SetStatus sets the status line text (provider/model/path/usage, etc.).
 func (m *Model) SetStatus(text string) { m.status = text }
@@ -358,18 +413,25 @@ func (m *Model) handleStreamEvent(msg stream.EventMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleStreamDone(msg stream.DoneMsg) (tea.Model, tea.Cmd) {
-	if msg.ID != m.streamID {
-		return m, nil // stale Done from a superseded/cancelled stream
+	// A stale Done (superseded by a later StartStream, or already handled by
+	// cancelBusy for the current one) still notifies StreamObserver, so a
+	// product can clean up per-id state, but must not touch the CURRENT
+	// stream's busy/transcript.
+	if msg.ID == m.streamID {
+		m.busy = false
+		m.streamCancel = nil
+		switch {
+		case isCanceled(msg.Err):
+			m.AppendSystem("(stopped)")
+		case msg.Err != nil:
+			m.AppendSystem("error: " + msg.Err.Error())
+		}
 	}
-	m.busy = false
-	m.streamCancel = nil
-	switch {
-	case isCanceled(msg.Err):
-		m.AppendSystem("(stopped)")
-	case msg.Err != nil:
-		m.AppendSystem("error: " + msg.Err.Error())
+	var cmd tea.Cmd
+	if obs, ok := m.handler.(StreamObserver); ok {
+		cmd = obs.OnStreamDone(msg.ID, msg.Err)
 	}
-	return m, nil
+	return m, cmd
 }
 
 // isCanceled reports whether err represents a user-initiated cancellation:
@@ -423,17 +485,36 @@ func (m *Model) statusLines() []string {
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if msg.String() != "ctrl+c" {
+		m.ctrlCArmed = false
+	}
 	switch msg.String() {
 	case "ctrl+c":
 		if m.busy {
-			m.cancelStream()
+			if m.ctrlCArmed {
+				// A second, immediately-following Ctrl+C always quits,
+				// whether or not the first one's cancellation has finished.
+				m.quit = true
+				return m, tea.Quit
+			}
+			m.ctrlCArmed = true
+			m.cancelBusy()
 			return m, nil
 		}
 		m.quit = true
 		return m, tea.Quit
 	case "esc":
+		// Esc's priority order: close an open slash-command menu first (it
+		// stays closed until the input value changes); then cancel if busy;
+		// then let a focused Block capture it (EscCapturer); then the
+		// default focus-ring Esc (return to the composer).
+		if m.focusRing.Zone() == focus.ZoneInput && len(m.commandMenuMatches()) > 0 {
+			m.commandMenuDismissed = m.input.Value()
+			m.commandMenuIndex = 0
+			return m, nil
+		}
 		if m.busy {
-			m.cancelStream()
+			m.cancelBusy()
 			return m, nil
 		}
 		if m.focusRing.Zone() == focus.ZoneTranscript && m.transcript.CapturesEsc() {
@@ -553,6 +634,7 @@ func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.input.Reset()
 		m.commandMenuIndex = 0
+		m.commandMenuDismissed = ""
 		m.AppendUser(text)
 		if m.handler == nil {
 			return m, nil
@@ -567,7 +649,7 @@ func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) commandMenuMatches() []Command {
 	value := m.input.Value()
-	if !strings.HasPrefix(value, "/") || strings.ContainsAny(value, " \t\n") {
+	if !strings.HasPrefix(value, "/") || strings.ContainsAny(value, " \t\n") || m.commandMenuDismissed == value {
 		return nil
 	}
 	matches := make([]Command, 0, len(m.commands))
