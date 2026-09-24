@@ -53,8 +53,42 @@ func (p *Provider) Name() string { return "openai-compatible" }
 // chat completion wire types (only the fields we use).
 
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string         `json:"role"`
+	Content    string         `json:"content"`
+	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+// wireToolCall is both the request-side (assistant history) and the
+// streamed-delta shape; Index is only present (and meaningful) in a delta.
+type wireToolCall struct {
+	Index    *int             `json:"index,omitempty"`
+	ID       string           `json:"id,omitempty"`
+	Type     string           `json:"type,omitempty"`
+	Function wireToolCallFunc `json:"function"`
+}
+
+type wireToolCallFunc struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+type toolFunctionDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+type toolDef struct {
+	Type     string          `json:"type"`
+	Function toolFunctionDef `json:"function"`
+}
+
+type namedToolChoice struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name string `json:"name"`
+	} `json:"function"`
 }
 
 type jsonSchemaFormat struct {
@@ -79,20 +113,31 @@ type chatRequestBody struct {
 	StreamOptions       *streamOptions  `json:"stream_options,omitempty"`
 	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
 	ResponseFormat      *responseFormat `json:"response_format,omitempty"`
+	Tools               []toolDef       `json:"tools,omitempty"`
+	// ToolChoice is either a bare string ("auto"|"none"|"required") or a
+	// namedToolChoice{"type":"function","function":{"name":...}}.
+	ToolChoice      any    `json:"tool_choice,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type promptTokensDetails struct {
 	CachedTokens int64 `json:"cached_tokens"`
 }
 
+type completionTokensDetails struct {
+	ReasoningTokens int64 `json:"reasoning_tokens"`
+}
+
 type chatUsage struct {
-	PromptTokens        int64                `json:"prompt_tokens"`
-	CompletionTokens    int64                `json:"completion_tokens"`
-	PromptTokensDetails *promptTokensDetails `json:"prompt_tokens_details,omitempty"`
+	PromptTokens            int64                    `json:"prompt_tokens"`
+	CompletionTokens        int64                    `json:"completion_tokens"`
+	PromptTokensDetails     *promptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *completionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
 type chatDelta struct {
-	Content string `json:"content"`
+	Content   string         `json:"content"`
+	ToolCalls []wireToolCall `json:"tool_calls,omitempty"`
 }
 
 type chatChoice struct {
@@ -149,6 +194,23 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 				},
 			}
 		}
+		if len(req.Tools) > 0 {
+			body.Tools = make([]toolDef, len(req.Tools))
+			for i, t := range req.Tools {
+				body.Tools[i] = toolDef{
+					Type: "function",
+					Function: toolFunctionDef{
+						Name:        t.Name,
+						Description: t.Description,
+						Parameters:  t.Schema,
+					},
+				}
+			}
+			body.ToolChoice = toolChoiceWire(req.ToolChoice)
+		}
+		if req.Reasoning != "" {
+			body.ReasoningEffort = req.Reasoning
+		}
 		payload, err := json.Marshal(body)
 		if err != nil {
 			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeInvalid, Message: err.Error()})
@@ -179,6 +241,8 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		sc.Split(sse.ScanLines)
 		var usage *ai.Usage
 		sawDone := false
+		finishReason := ""
+		asm := newToolCallAssembler()
 		for sc.Scan() {
 			line := sc.Text()
 			if !strings.HasPrefix(line, "data:") {
@@ -209,6 +273,9 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 				if chunk.Usage.PromptTokensDetails != nil {
 					u.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
 				}
+				if chunk.Usage.CompletionTokensDetails != nil {
+					u.ReasoningTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
+				}
 				usage = u
 				if !yield(ai.Event{Type: ai.EventUsage, Usage: usage}, nil) {
 					return
@@ -222,6 +289,12 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 					if !yield(ai.Event{Type: ai.EventTextDelta, Text: c.Delta.Content}, nil) {
 						return
 					}
+				}
+				for _, tc := range c.Delta.ToolCalls {
+					asm.addDelta(tc)
+				}
+				if c.FinishReason != "" {
+					finishReason = c.FinishReason
 				}
 				if c.FinishReason == "length" && wantStructured {
 					yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "openaicompat: response truncated at max_completion_tokens before a complete structured JSON object was produced"})
@@ -245,7 +318,84 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			}
 		}
 
-		yield(ai.Event{Type: ai.EventCompleted, Usage: usage}, nil)
+		for _, call := range asm.calls() {
+			c := call
+			if !yield(ai.Event{Type: ai.EventToolCall, ToolCall: &c}, nil) {
+				return
+			}
+		}
+
+		stopReason := ai.StopReasonEnd
+		switch finishReason {
+		case "tool_calls":
+			stopReason = ai.StopReasonToolCalls
+		case "length":
+			stopReason = ai.StopReasonLength
+		}
+		yield(ai.Event{Type: ai.EventCompleted, Usage: usage, StopReason: stopReason}, nil)
+	}
+}
+
+// toolCallAssembler accumulates streamed delta.tool_calls chunks (id/name
+// arrive on the first chunk for a given index, arguments arrive
+// concatenated across subsequent chunks) into complete ai.ToolCall values,
+// preserving index order.
+type toolCallAssembler struct {
+	order   []int
+	byIndex map[int]*ai.ToolCall
+}
+
+func newToolCallAssembler() *toolCallAssembler {
+	return &toolCallAssembler{byIndex: map[int]*ai.ToolCall{}}
+}
+
+func (a *toolCallAssembler) addDelta(tc wireToolCall) {
+	idx := 0
+	if tc.Index != nil {
+		idx = *tc.Index
+	}
+	call, ok := a.byIndex[idx]
+	if !ok {
+		call = &ai.ToolCall{}
+		a.byIndex[idx] = call
+		a.order = append(a.order, idx)
+	}
+	if tc.ID != "" {
+		call.ID = tc.ID
+	}
+	if tc.Function.Name != "" {
+		call.Name = tc.Function.Name
+	}
+	if tc.Function.Arguments != "" {
+		call.Arguments = append(call.Arguments, tc.Function.Arguments...)
+	}
+}
+
+func (a *toolCallAssembler) calls() []ai.ToolCall {
+	out := make([]ai.ToolCall, 0, len(a.order))
+	for _, idx := range a.order {
+		out = append(out, *a.byIndex[idx])
+	}
+	return out
+}
+
+// toolChoiceWire maps ai.ChatRequest.ToolChoice to the Chat Completions
+// tool_choice shape: "" (adapter default, so omit — handled by the caller
+// leaving it unset is not an option here since Tools is non-empty, so ""
+// maps to "auto"), "auto"/"none"/"required" pass through as bare strings,
+// and any other value names a specific tool.
+func toolChoiceWire(choice string) any {
+	switch choice {
+	case "", ai.ToolChoiceAuto:
+		return "auto"
+	case ai.ToolChoiceNone:
+		return "none"
+	case ai.ToolChoiceRequired:
+		return "required"
+	default:
+		nt := namedToolChoice{Type: "function"}
+		nt.Function.Name = choice
+		return nt
 	}
 }
 
@@ -368,7 +518,31 @@ func buildMessages(req ai.ChatRequest) []chatMessage {
 		msgs = append(msgs, chatMessage{Role: "system", Content: sys.String()})
 	}
 	for _, m := range req.Messages {
-		msgs = append(msgs, chatMessage{Role: string(m.Role), Content: m.Text})
+		if m.Role == ai.RoleTool {
+			for _, r := range m.ToolResults {
+				content := r.Content
+				if r.IsError && !strings.HasPrefix(content, "Error:") {
+					content = "Error: " + content
+				}
+				msgs = append(msgs, chatMessage{Role: "tool", Content: content, ToolCallID: r.CallID})
+			}
+			continue
+		}
+		wm := chatMessage{Role: string(m.Role), Content: m.Text}
+		if len(m.ToolCalls) > 0 {
+			wm.ToolCalls = make([]wireToolCall, len(m.ToolCalls))
+			for i, tc := range m.ToolCalls {
+				wm.ToolCalls[i] = wireToolCall{
+					ID:   tc.ID,
+					Type: "function",
+					Function: wireToolCallFunc{
+						Name:      tc.Name,
+						Arguments: string(tc.Arguments),
+					},
+				}
+			}
+		}
+		msgs = append(msgs, wm)
 	}
 
 	if dyn := renderDynamic(req.Context); dyn != "" && len(msgs) > 0 {

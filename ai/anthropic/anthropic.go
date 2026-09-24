@@ -56,10 +56,21 @@ func (p *Provider) Name() string { return "anthropic" }
 
 // wire types
 
-type textBlock struct {
+// contentBlock is the union of every Messages API content-block shape this
+// adapter produces or consumes (text, tool_use, tool_result, thinking).
+// Fields irrelevant to Type are omitted from the wire via omitempty.
+type contentBlock struct {
 	Type         string        `json:"type"`
-	Text         string        `json:"text"`
+	Text         string        `json:"text,omitempty"`
 	CacheControl *cacheControl `json:"cache_control,omitempty"`
+	// tool_use
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+	// tool_result (Content, not Text: the wire field is "content")
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	Content   string `json:"content,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
 }
 
 type cacheControl struct {
@@ -70,16 +81,64 @@ type cacheControl struct {
 // string shorthand) so a cache_control marker on the last history message
 // (see REQ: anthropic-history-cache) is uniform with every other message.
 type wireMessage struct {
-	Role    string      `json:"role"`
-	Content []textBlock `json:"content"`
+	Role    string         `json:"role"`
+	Content []contentBlock `json:"content"`
+}
+
+type toolDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+// toolChoiceWire: Type is "auto"|"any"|"none"|"tool"; Name is set only when
+// Type is "tool".
+type toolChoiceWire struct {
+	Type string `json:"type"`
+	Name string `json:"name,omitempty"`
+}
+
+// thinkingConfig requests extended thinking. BudgetTokens is required when
+// Type is "enabled".
+type thinkingConfig struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
 type messagesRequestBody struct {
-	Model     string        `json:"model"`
-	System    []textBlock   `json:"system,omitempty"`
-	Messages  []wireMessage `json:"messages"`
-	MaxTokens int           `json:"max_tokens"`
-	Stream    bool          `json:"stream"`
+	Model      string          `json:"model"`
+	System     []contentBlock  `json:"system,omitempty"`
+	Messages   []wireMessage   `json:"messages"`
+	MaxTokens  int             `json:"max_tokens"`
+	Stream     bool            `json:"stream"`
+	Tools      []toolDef       `json:"tools,omitempty"`
+	ToolChoice *toolChoiceWire `json:"tool_choice,omitempty"`
+	Thinking   *thinkingConfig `json:"thinking,omitempty"`
+}
+
+// reasoningBudgets maps ai.ChatRequest.Reasoning levels to Anthropic
+// extended-thinking budget_tokens.
+var reasoningBudgets = map[string]int{
+	ai.ReasoningLow:    1024,
+	ai.ReasoningMedium: 4096,
+	ai.ReasoningHigh:   16000,
+}
+
+// anthropicToolChoice maps ai.ChatRequest.ToolChoice to the Messages API
+// tool_choice shape.
+func anthropicToolChoice(choice string) *toolChoiceWire {
+	switch choice {
+	case "":
+		return nil
+	case ai.ToolChoiceAuto:
+		return &toolChoiceWire{Type: "auto"}
+	case ai.ToolChoiceNone:
+		return &toolChoiceWire{Type: "none"}
+	case ai.ToolChoiceRequired:
+		return &toolChoiceWire{Type: "any"}
+	default:
+		return &toolChoiceWire{Type: "tool", Name: choice}
+	}
 }
 
 type usagePayload struct {
@@ -91,10 +150,18 @@ type usagePayload struct {
 
 type sseEvent struct {
 	Type  string `json:"type"`
+	Index *int   `json:"index,omitempty"`
 	Delta *struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+		Type        string `json:"type"`
+		Text        string `json:"text"`
+		PartialJSON string `json:"partial_json"`
+		StopReason  string `json:"stop_reason"`
 	} `json:"delta,omitempty"`
+	ContentBlock *struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"content_block,omitempty"`
 	Message *struct {
 		Model string        `json:"model"`
 		Usage *usagePayload `json:"usage"`
@@ -134,6 +201,19 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			MaxTokens: maxTokens,
 			Stream:    true,
 		}
+		if len(req.Tools) > 0 {
+			body.Tools = make([]toolDef, len(req.Tools))
+			for i, t := range req.Tools {
+				body.Tools[i] = toolDef{Name: t.Name, Description: t.Description, InputSchema: t.Schema}
+			}
+			body.ToolChoice = anthropicToolChoice(req.ToolChoice)
+		}
+		if budget, ok := reasoningBudgets[req.Reasoning]; ok {
+			if body.MaxTokens <= budget {
+				body.MaxTokens = budget + defaultMax
+			}
+			body.Thinking = &thinkingConfig{Type: "enabled", BudgetTokens: budget}
+		}
 		payload, err := json.Marshal(body)
 		if err != nil {
 			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeInvalid, Message: err.Error()})
@@ -168,6 +248,16 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		sc.Split(sse.ScanLines)
 		var eventName string
 		sawStop := false
+		stopReasonWire := ""
+		// blockTypes/toolCalls track open content blocks by index so a
+		// content_block_delta (which carries only the index, not the type)
+		// can be routed to the right assembly (tool_use argument JSON is
+		// streamed as input_json_delta chunks; thinking/signature deltas are
+		// intentionally dropped — never emitted as text, per the tool-calling
+		// contract).
+		blockTypes := map[int]string{}
+		toolCalls := map[int]*ai.ToolCall{}
+		var toolOrder []int
 		for sc.Scan() {
 			line := sc.Text()
 			switch {
@@ -192,15 +282,44 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 					if se.Message != nil && se.Message.Usage != nil {
 						usage = mergeUsage(usage, toUsage(se.Message.Usage))
 					}
+				case "content_block_start":
+					if se.Index != nil && se.ContentBlock != nil {
+						idx := *se.Index
+						blockTypes[idx] = se.ContentBlock.Type
+						if se.ContentBlock.Type == "tool_use" {
+							toolCalls[idx] = &ai.ToolCall{ID: se.ContentBlock.ID, Name: se.ContentBlock.Name}
+							toolOrder = append(toolOrder, idx)
+						}
+					}
 				case "content_block_delta":
-					if se.Delta != nil && se.Delta.Type == "text_delta" && se.Delta.Text != "" {
+					if se.Delta == nil {
+						break
+					}
+					idx := 0
+					if se.Index != nil {
+						idx = *se.Index
+					}
+					switch se.Delta.Type {
+					case "text_delta":
+						if se.Delta.Text == "" {
+							break
+						}
 						if wantStructured {
 							textBuf.WriteString(se.Delta.Text)
 						}
 						if !yield(ai.Event{Type: ai.EventTextDelta, Text: se.Delta.Text}, nil) {
 							return
 						}
+					case "input_json_delta":
+						if call, ok := toolCalls[idx]; ok && se.Delta.PartialJSON != "" {
+							call.Arguments = append(call.Arguments, se.Delta.PartialJSON...)
+						}
+					case "thinking_delta", "signature_delta":
+						// Extended-thinking content: never emitted as text.
 					}
+				case "content_block_stop":
+					// Nothing to do: tool_use calls are emitted together,
+					// after message_stop, in stream order.
 				case "message_delta":
 					if se.Usage != nil {
 						usage = mergeUsage(usage, toUsage(se.Usage))
@@ -208,7 +327,10 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 							return
 						}
 					}
-					if stopReason(data) == "max_tokens" && wantStructured {
+					if se.Delta != nil && se.Delta.StopReason != "" {
+						stopReasonWire = se.Delta.StopReason
+					}
+					if stopReasonWire == "max_tokens" && wantStructured {
 						yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "anthropic: response truncated at max_tokens before a complete structured JSON object was produced"})
 						return
 					}
@@ -242,7 +364,21 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			}
 		}
 
-		yield(ai.Event{Type: ai.EventCompleted, Usage: usage}, nil)
+		for _, idx := range toolOrder {
+			call := *toolCalls[idx]
+			if !yield(ai.Event{Type: ai.EventToolCall, ToolCall: &call}, nil) {
+				return
+			}
+		}
+
+		stopReason := ai.StopReasonEnd
+		switch stopReasonWire {
+		case "tool_use":
+			stopReason = ai.StopReasonToolCalls
+		case "max_tokens":
+			stopReason = ai.StopReasonLength
+		}
+		yield(ai.Event{Type: ai.EventCompleted, Usage: usage, StopReason: stopReason}, nil)
 	}
 }
 
@@ -266,19 +402,6 @@ func toAIError(ctx context.Context, err error) *ai.Error {
 		return &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
 	}
 	return &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
-}
-
-// stopReason extracts message_delta.delta.stop_reason without a dedicated
-// struct field, since sseEvent's Delta shape is shared with
-// content_block_delta and stop_reason only ever appears on message_delta.
-func stopReason(rawData string) string {
-	var v struct {
-		Delta struct {
-			StopReason string `json:"stop_reason"`
-		} `json:"delta"`
-	}
-	_ = json.Unmarshal([]byte(rawData), &v)
-	return v.Delta.StopReason
 }
 
 // mergeUsage combines a running usage with a newer payload: message_delta
@@ -316,6 +439,13 @@ func toUsage(u *usagePayload) *ai.Usage {
 		CacheReadTokens:  u.CacheReadInputTokens,
 		CacheWriteTokens: u.CacheCreationInputTokens,
 	}
+}
+
+// toolResultBlock renders one ai.ToolResult as a tool_result content block.
+// IsError text is passed through unmodified — Anthropic's is_error flag
+// carries the signal, not a text prefix.
+func toolResultBlock(r ai.ToolResult) contentBlock {
+	return contentBlock{Type: "tool_result", ToolUseID: r.CallID, Content: r.Content, IsError: r.IsError}
 }
 
 // messagesURL builds the Messages API URL, tolerating a BaseURL that
@@ -416,10 +546,10 @@ func httpStatusError(status int, body []byte) *ai.Error {
 // block). Dynamic context is intentionally NOT rendered here -- it is
 // per-turn data and must never sit ahead of (or inside) the cached, stable
 // prefix; see buildMessages, which splices it into the current turn instead.
-func buildSystemBlocks(req ai.ChatRequest, wantStructured bool) []textBlock {
-	var blocks []textBlock
+func buildSystemBlocks(req ai.ChatRequest, wantStructured bool) []contentBlock {
+	var blocks []contentBlock
 	if req.System != "" {
-		blocks = append(blocks, textBlock{Type: "text", Text: req.System})
+		blocks = append(blocks, contentBlock{Type: "text", Text: req.System})
 	}
 	lastStaticIdx := -1
 	for _, b := range req.Context {
@@ -430,7 +560,7 @@ func buildSystemBlocks(req ai.ChatRequest, wantStructured bool) []textBlock {
 		if b.Name != "" {
 			text = "# " + b.Name + "\n" + text
 		}
-		blocks = append(blocks, textBlock{Type: "text", Text: text})
+		blocks = append(blocks, contentBlock{Type: "text", Text: text})
 		lastStaticIdx = len(blocks) - 1
 	}
 	if lastStaticIdx >= 0 {
@@ -441,7 +571,7 @@ func buildSystemBlocks(req ai.ChatRequest, wantStructured bool) []textBlock {
 		blocks[len(blocks)-1].CacheControl = &cacheControl{Type: "ephemeral"}
 	}
 	if wantStructured {
-		blocks = append(blocks, textBlock{
+		blocks = append(blocks, contentBlock{
 			Type: "text",
 			Text: "Respond with ONLY a single JSON object matching this JSON Schema, no prose, no markdown fences:\n" + string(req.ResponseSchema),
 		})
@@ -459,13 +589,40 @@ func buildSystemBlocks(req ai.ChatRequest, wantStructured bool) []textBlock {
 func buildMessages(req ai.ChatRequest) []wireMessage {
 	msgs := make([]wireMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
-		msgs = append(msgs, wireMessage{Role: string(m.Role), Content: []textBlock{{Type: "text", Text: m.Text}}})
+		if m.Role == ai.RoleTool {
+			blocks := make([]contentBlock, 0, len(m.ToolResults))
+			for _, r := range m.ToolResults {
+				blocks = append(blocks, toolResultBlock(r))
+			}
+			// Consecutive RoleTool source messages merge into one "user"
+			// message: Anthropic requires all tool_result blocks answering
+			// one assistant turn to arrive together.
+			if n := len(msgs); n > 0 && msgs[n-1].Role == "user" && isToolResultMessage(msgs[n-1]) {
+				msgs[n-1].Content = append(msgs[n-1].Content, blocks...)
+				continue
+			}
+			msgs = append(msgs, wireMessage{Role: "user", Content: blocks})
+			continue
+		}
+
+		var blocks []contentBlock
+		if m.Text != "" || len(m.ToolCalls) == 0 {
+			blocks = append(blocks, contentBlock{Type: "text", Text: m.Text})
+		}
+		for _, tc := range m.ToolCalls {
+			input := tc.Arguments
+			if len(input) == 0 {
+				input = json.RawMessage("{}")
+			}
+			blocks = append(blocks, contentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: input})
+		}
+		msgs = append(msgs, wireMessage{Role: string(m.Role), Content: blocks})
 	}
 
 	if dyn := renderDynamic(req.Context); dyn != "" && len(msgs) > 0 {
 		last := &msgs[len(msgs)-1]
-		if len(last.Content) > 0 {
-			last.Content[len(last.Content)-1].Text = dyn + last.Content[len(last.Content)-1].Text
+		if n := len(last.Content); n > 0 && last.Content[n-1].Type == "text" {
+			last.Content[n-1].Text = dyn + last.Content[n-1].Text
 		}
 	}
 
@@ -476,6 +633,21 @@ func buildMessages(req ai.ChatRequest) []wireMessage {
 		}
 	}
 	return msgs
+}
+
+// isToolResultMessage reports whether every block of msg is a tool_result,
+// i.e. it was built entirely from a RoleTool source message (never a mix —
+// buildMessages never places tool_result blocks alongside other content).
+func isToolResultMessage(msg wireMessage) bool {
+	if len(msg.Content) == 0 {
+		return false
+	}
+	for _, b := range msg.Content {
+		if b.Type != "tool_result" {
+			return false
+		}
+	}
+	return true
 }
 
 // renderDynamic renders the dynamic context blocks as a clearly delimited
