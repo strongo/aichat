@@ -147,20 +147,39 @@ func TestJittered_NegativeOffsetClampedToZero(t *testing.T) {
 	}
 }
 
+// failIfSlept installs a waitOnRetryAfterSleep that fails the test if it is
+// ever called, and returns a func to restore the original -- used by the
+// Noop tests below to prove they take the early-return path without
+// touching the sleep seam at all (rather than merely not panicking, which a
+// real-but-fast sleep would also satisfy).
+func failIfSlept(t *testing.T) func() {
+	t.Helper()
+	orig := waitOnRetryAfterSleep
+	waitOnRetryAfterSleep = func(time.Duration) <-chan time.Time {
+		t.Fatal("waitOnRetryAfterSleep must not be called on the noop path")
+		return nil
+	}
+	return func() { waitOnRetryAfterSleep = orig }
+}
+
 func TestWaitOnRetryAfter_EmptyHeaderNoop(t *testing.T) {
+	defer failIfSlept(t)()
 	WaitOnRetryAfter(context.Background(), "") // must return immediately, no panic
 }
 
 func TestWaitOnRetryAfter_UnparseableHeaderNoop(t *testing.T) {
+	defer failIfSlept(t)()
 	WaitOnRetryAfter(context.Background(), "not-a-duration-or-date")
 }
 
 func TestWaitOnRetryAfter_NonPositiveSecondsNoop(t *testing.T) {
+	defer failIfSlept(t)()
 	WaitOnRetryAfter(context.Background(), "0")
 	WaitOnRetryAfter(context.Background(), "-5")
 }
 
 func TestWaitOnRetryAfter_PastHTTPDateNoop(t *testing.T) {
+	defer failIfSlept(t)()
 	past := time.Now().Add(-1 * time.Hour).UTC().Format(http.TimeFormat)
 	WaitOnRetryAfter(context.Background(), past)
 }
