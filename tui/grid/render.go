@@ -19,6 +19,7 @@ func (m *Model) View(width int, focused bool) string {
 	if width != m.width || focused != m.focused {
 		m.width, m.focused = max(1, width), focused
 		m.rebuildTable()
+		m.syncSecondaryFocusForLayout()
 	}
 	// card prepends a 2-cell focus bullet ("● "/"○ ") to the header label
 	// before laying it into the border, so the label itself must be built 2
