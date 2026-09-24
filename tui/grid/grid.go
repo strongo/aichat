@@ -682,6 +682,16 @@ func (m *Model) SetExtraViews(views ...ExtraView) {
 	}
 }
 
+// SetKeyHandler registers (or replaces) the product key-handler hook after
+// construction — useful when the hook's closure needs context only
+// available once the Model itself exists (e.g. a dialog capturing its own
+// *Model to react to Space/Enter).
+func (m *Model) SetKeyHandler(fn KeyHandler) { m.keyHandler = fn }
+
+// SetFooterHook registers (or replaces) the product footer hook after
+// construction. See WithFooterHook.
+func (m *Model) SetFooterHook(fn FooterHook) { m.footerHook = fn }
+
 // Style is the grid's current border/header color preset.
 func (m *Model) Style() Style { return m.style }
 
