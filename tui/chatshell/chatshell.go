@@ -702,6 +702,53 @@ func (m *Model) PushOverlay(o Overlay) tea.Cmd {
 	return nil
 }
 
+// PopOverlay closes the top overlay PROGRAMMATICALLY -- without waiting for
+// its own Update to report done -- e.g. after an async round trip a
+// product's own Handler drove to completion. It is a no-op (returns nil)
+// when no overlay is open.
+//
+// Async-safe overlay pattern: an Overlay may need to stay open ACROSS an
+// async round trip (e.g. a form whose Enter submits to a server before it
+// can close). Its own Update returns done: false plus a product tea.Cmd on
+// submit -- exactly like any other command chatshell dispatches. The
+// product's own result message, once it arrives, is NOT itself overlay
+// input (isOverlayInputMsg only classifies key/paste/mouse messages), so it
+// takes the normal Update path and reaches an optional MsgHandler.OnMsg
+// (dispatchUnhandled's default routing) EVEN WHILE THE OVERLAY IS STILL
+// OPEN -- an open overlay only captures key/paste/mouse input, never this.
+// From there the product either calls PopOverlay on success, or -- to show
+// an error while keeping the user's draft -- updates the overlay in place
+// (e.g. via an optional `interface{ OnResult(any) }` capability the
+// product's own Overlay implements, or simply because the product holds
+// the same Overlay pointer it passed to PushOverlay and can mutate it
+// directly).
+func (m *Model) PopOverlay() tea.Cmd {
+	if len(m.overlays) == 0 {
+		return nil
+	}
+	m.overlays = m.overlays[:len(m.overlays)-1]
+	return nil
+}
+
+// Zone reports which focus zone currently has focus: the composer
+// (focus.ZoneInput), a transcript stop (focus.ZoneTranscript), or the
+// sidebar/SidePanel (focus.ZoneSidebar) -- e.g. for a product's
+// context-specific status hint.
+func (m *Model) Zone() focus.Zone { return m.focusRing.Zone() }
+
+// FocusedEntryID reports the transcript entry id currently under focus
+// (Zone() == focus.ZoneTranscript), or "" when the transcript isn't
+// focused, no entry is focused, or the focused entry was never given an id
+// (AppendBlockWithID/StartStream's id; a plain AppendUser/AppendAssistant/
+// AppendBlock entry has none).
+func (m *Model) FocusedEntryID() string {
+	e := m.transcript.FocusedEntry()
+	if e == nil {
+		return ""
+	}
+	return e.ID
+}
+
 // --- side panel / sidebar unification -------------------------------------
 
 // panelVisible reports whether the sidebar zone (SidePanel or the default

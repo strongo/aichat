@@ -82,6 +82,12 @@ An optional `SidePanelPinner` capability (`PinRef(ref session.EntityRef) bool`, 
 
 `chatshell.Model.PushOverlay(o Overlay) tea.Cmd` (`Overlay`: `View(width, height int) string`, `Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)`) MUST push a modal dialog onto an overlay stack. While the stack is non-empty, the TOP overlay MUST capture user INPUT ONLY — key presses, paste, and mouse events — until its `Update` returns `done: true`, at which point it is popped; an OLDER overlay beneath it MUST NOT receive any message while a newer one is on top. Every OTHER message (stream pump events, the spinner tick, sidebar/product messages, ...) takes chatshell's NORMAL path even while an overlay is open, so e.g. a stream keeps completing and clears `Busy()` behind an open dialog. A `tea.WindowSizeMsg` MUST still resize the shell (and forward to an active `SidePanel`) even while an overlay is open. The top overlay MUST be rendered centred over the rest of the screen, CLAMPED to the box it was asked to render into (`View`'s `width`/`height` arguments) regardless of what it actually draws.
 
+`chatshell.Model.PopOverlay() tea.Cmd` MUST close the TOP overlay PROGRAMMATICALLY, without waiting for its own `Update` to report `done: true`, and MUST be a no-op (return `nil`) when the overlay stack is empty. This exists for the ASYNC-SAFE overlay pattern: an `Overlay` that must stay open ACROSS an async round trip (e.g. a form whose submission posts to a server before the dialog can close) returns `done: false` plus a product `tea.Cmd` from its own `Update` on submit, exactly like any other command chatshell dispatches. The product's own async RESULT message, once it arrives, is NOT itself overlay input (`isOverlayInputMsg` classifies only key/paste/mouse messages) — it takes chatshell's normal `Update` path and reaches an optional `MsgHandler.OnMsg` EVEN WHILE THE OVERLAY IS STILL OPEN, the same as every other non-input message this REQ already routes around an open overlay. From there the product either calls `PopOverlay()` on success, or updates the overlay in place to show an error while keeping the user's draft (e.g. an optional `interface{ OnResult(any) }` capability the product's own `Overlay` implements, or simply because the product holds the same `Overlay` value it passed to `PushOverlay` and can mutate it directly) — `chatshell` itself defines no such result-routing interface; it only guarantees the message reaches `OnMsg` and that `PopOverlay` works.
+
+#### REQ: chatshell-focus-accessors
+
+`(m *Model) Zone() focus.Zone` MUST report the focus ring's current zone (`focus.ZoneInput`, `focus.ZoneTranscript`, or `focus.ZoneSidebar` — the sidebar zone covers both the built-in sidebar and an installed `SidePanel`), e.g. for a product's context-specific status hint. `(m *Model) FocusedEntryID() string` MUST report the `id` of the transcript entry currently under focus (`AppendBlockWithID`/`StartStream`'s id), and MUST return `""` when the transcript isn't the focused zone, no entry is focused, or the focused entry was never given an id (a plain `AppendUser`/`AppendAssistant`/`AppendBlock` entry).
+
 #### REQ: chatshell-global-keys
 
 `chatshell.WithGlobalKeys(func(tea.KeyPressMsg) (tea.Cmd, bool))` MUST be checked BEFORE chatshell's own key handling (Ctrl+C, Esc, F6, Shift+arrows, the composer, ...) on every `tea.KeyPressMsg` chatshell would otherwise process (i.e. when no `Overlay` is capturing it) -- returning `consumed: true` stops chatshell from handling that key at all this cycle; `consumed: false` lets chatshell's normal handling proceed as if the hook were absent.
@@ -241,6 +247,20 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a `chatshell.Model` with an in-flight `StartStream` and an `Overlay` pushed mid-stream, and separately an `Overlay` whose `View` renders far larger than the box it's given
 **When** the stream's events are drained
 **Then** the stream still completes and `Busy()` clears (its `EventMsg`/`DoneMsg` never reached the overlay, only key/paste/mouse would have); and every rendered line of `View()`'s output is no wider than the screen, whatever the oversized overlay tried to draw
+
+### AC: async-overlay-stays-open-on-failure-closes-on-success
+**Requirements:** tui-kit#req:chatshell-overlay
+
+**Given** a `chatshell.Model` with an `Overlay` pushed whose own `Update` never itself reports `done: true`, and a `Handler` that also implements `MsgHandler` and holds a reference to the `Model` and the overlay
+**When** a product-defined async result message carrying failure is sent through `Update`, and separately one carrying success
+**Then** the failure message reaches `MsgHandler.OnMsg` while the overlay is still open (it is not overlay input) and the overlay stays open (state on it can be mutated in place, e.g. to show an error); the success message likewise reaches `OnMsg`, whose handler calls `PopOverlay()`, and the overlay is thereafter removed from the stack; separately, `PopOverlay()` on an empty overlay stack returns `nil` and does not panic
+
+### AC: focus-accessors-report-zone-and-focused-entry-id
+**Requirements:** tui-kit#req:chatshell-focus-accessors
+
+**Given** a `chatshell.Model` with one `AppendBlockWithID`-appended transcript entry
+**When** `Zone()`/`FocusedEntryID()` are read at construction (composer focused), after `Shift+Up` focuses the transcript entry, and after `Shift+Right` moves focus to the sidebar
+**Then** they report `(focus.ZoneInput, "")`, `(focus.ZoneTranscript, "<that entry's id>")`, and `(focus.ZoneSidebar, "")` respectively — `FocusedEntryID()` only ever reports non-empty while `Zone() == focus.ZoneTranscript` AND the focused entry was given an id
 
 ### AC: global-keys-checked-before-shell-defaults
 **Requirements:** tui-kit#req:chatshell-global-keys

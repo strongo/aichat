@@ -2032,3 +2032,157 @@ func TestMouse_WheelBatchesMsgHandlerCmd(t *testing.T) {
 		t.Fatal("MsgHandler's returned cmd was not included in the batch")
 	}
 }
+
+// --- Zone / FocusedEntryID -------------------------------------------------
+
+func TestZone_ReflectsFocusRing(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	if got := m.Zone(); got != focus.ZoneInput {
+		t.Fatalf("Zone() = %v, want ZoneInput", got)
+	}
+
+	m.AppendBlock(&fakeBlock{})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift})
+	if got := m.Zone(); got != focus.ZoneTranscript {
+		t.Fatalf("Zone() = %v, want ZoneTranscript", got)
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift})
+	if got := m.Zone(); got != focus.ZoneSidebar {
+		t.Fatalf("Zone() = %v, want ZoneSidebar", got)
+	}
+}
+
+func TestFocusedEntryID_ReportsFocusedTranscriptEntry(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+
+	if got := m.FocusedEntryID(); got != "" {
+		t.Fatalf("FocusedEntryID() = %q, want \"\" before anything is focused", got)
+	}
+
+	if ok := m.AppendBlockWithID("blk-1", &fakeBlock{}); !ok {
+		t.Fatal("AppendBlockWithID failed")
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift})
+	if got := m.FocusedEntryID(); got != "blk-1" {
+		t.Fatalf("FocusedEntryID() = %q, want blk-1", got)
+	}
+
+	// Moving focus to the sidebar leaves the transcript unfocused again.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift})
+	if got := m.FocusedEntryID(); got != "" {
+		t.Fatalf("FocusedEntryID() = %q, want \"\" once focus left the transcript", got)
+	}
+}
+
+// --- PopOverlay / async-safe overlay pattern -------------------------------
+
+func TestPopOverlay_ClosesTopOverlay(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.PushOverlay(&fakeOverlay{name: "a"})
+	m.PushOverlay(&fakeOverlay{name: "b"})
+	if len(m.overlays) != 2 {
+		t.Fatalf("overlays = %d, want 2", len(m.overlays))
+	}
+	m.PopOverlay()
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays after PopOverlay = %d, want 1", len(m.overlays))
+	}
+	if name := m.overlays[0].(*fakeOverlay).name; name != "a" {
+		t.Fatalf("remaining overlay = %q, want a", name)
+	}
+	m.PopOverlay()
+	if len(m.overlays) != 0 {
+		t.Fatalf("overlays after 2nd PopOverlay = %d, want 0", len(m.overlays))
+	}
+}
+
+func TestPopOverlay_NoopWhenNoneOpen(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	if cmd := m.PopOverlay(); cmd != nil {
+		t.Fatal("expected nil cmd popping an empty overlay stack")
+	}
+	if len(m.overlays) != 0 {
+		t.Fatalf("overlays = %d, want 0", len(m.overlays))
+	}
+}
+
+// asyncResultMsg is a stand-in for a product's own async submit-result
+// message (e.g. a save-to-server response), used by
+// TestAsyncOverlay_StaysOpenOnFailureClosesOnSuccess below.
+type asyncResultMsg struct{ ok bool }
+
+// asyncFakeOverlay is a minimal Overlay whose own Update never itself
+// closes it (done is always false) -- exactly the async-safe pattern
+// PopOverlay documents: the PRODUCT closes it later, once an async result
+// message (routed through MsgHandler.OnMsg, per dispatchUnhandled -- never
+// overlay input) tells it the submit succeeded.
+type asyncFakeOverlay struct {
+	lastErr string
+}
+
+func (o *asyncFakeOverlay) View(width, height int) string { return "overlay" }
+
+func (o *asyncFakeOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd, bool) {
+	return o, nil, false
+}
+
+// asyncOverlayHandler is a Handler+MsgHandler that reacts to asyncResultMsg
+// by either closing the overlay it holds (success) or recording an error on
+// it while leaving it open (failure) -- the product-side half of the
+// async-safe overlay pattern PopOverlay documents.
+type asyncOverlayHandler struct {
+	model   *Model
+	overlay *asyncFakeOverlay
+}
+
+func (h *asyncOverlayHandler) Submit(text string) tea.Cmd { return nil }
+
+func (h *asyncOverlayHandler) OnMsg(msg tea.Msg) tea.Cmd {
+	res, ok := msg.(asyncResultMsg)
+	if !ok {
+		return nil
+	}
+	if res.ok {
+		h.model.PopOverlay()
+	} else {
+		h.overlay.lastErr = "submit failed"
+	}
+	return nil
+}
+
+func TestAsyncOverlay_StaysOpenOnFailureClosesOnSuccess(t *testing.T) {
+	overlay := &asyncFakeOverlay{}
+	h := &asyncOverlayHandler{overlay: overlay}
+	m := New(h)
+	h.model = m
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.PushOverlay(overlay)
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays = %d, want 1", len(m.overlays))
+	}
+
+	// A failed async result is NOT overlay input (isOverlayInputMsg only
+	// classifies key/paste/mouse messages), so it reaches OnMsg via
+	// dispatchUnhandled's default routing even while the overlay is open,
+	// and the product leaves the overlay open with an error recorded.
+	m.Update(asyncResultMsg{ok: false})
+	if len(m.overlays) != 1 {
+		t.Fatal("overlay closed on a failed async submit, want it to stay open")
+	}
+	if overlay.lastErr != "submit failed" {
+		t.Fatalf("overlay.lastErr = %q, want it updated in place", overlay.lastErr)
+	}
+
+	// A successful async result closes it via PopOverlay.
+	m.Update(asyncResultMsg{ok: true})
+	if len(m.overlays) != 0 {
+		t.Fatal("overlay still open after a successful async submit")
+	}
+}
