@@ -117,17 +117,41 @@ func abbreviate(name string, n int) string {
 // body renders the active view's content, applying the split-pane layout
 // (see WithSplitLayout) when one is registered and the active view isn't the
 // table itself. Ported from DataTug's gridState.recordsetView.
+//
+// A non-table view's own body is always clamped/padded to exactly
+// paneHeight() lines here (padOrClampHeight) — not left to card() as
+// before — because a split layout's primary pane (the table, stripped of
+// its header/data separator via stripHeaderSeparator) is one line TALLER
+// than that (its own header line plus paneHeight() data rows), and
+// card()'s old single view-independent height clamp (used for every
+// non-table view, split or not) truncated that taller combined block down
+// to paneHeight() total lines — silently clipping the table's own
+// bottommost data row(s), including the highlighted one (B1).
 func (m *Model) body(width int) string {
-	if m.view == ViewTable || m.layout == nil {
+	if m.view == ViewTable {
 		return m.viewBody(m.view, width, m.paneHeight())
+	}
+	if m.layout == nil {
+		return m.padOrClampHeight(m.viewBody(m.view, width, m.paneHeight()), m.paneHeight())
 	}
 	layout := m.layout(width, m.NaturalWidth(), m.view)
 	if !layout.Split {
-		return m.viewBody(m.view, width, m.paneHeight())
+		return m.padOrClampHeight(m.viewBody(m.view, width, m.paneHeight()), m.paneHeight())
 	}
-	primary := m.tableViewAt(layout.PrimaryWidth)
-	secondary := m.viewBody(m.view, layout.SecondaryWidth, m.paneHeight())
-	return lipgloss.JoinHorizontal(lipgloss.Top, primary, secondary)
+	primary := stripHeaderSeparator(m.tableViewAt(layout.PrimaryWidth))
+	// The secondary pane gets its own bordered card (title, ●/○ focus
+	// bullet) so a split layout's two panes are visually distinguishable —
+	// the primary (table) side's own focus cue is the outer card m.View
+	// wraps everything in, which only reflects overall grid focus, not
+	// which of the two panes Tab currently routes keys to. cardWidth
+	// reserves 1 cell (gapCol below) between the panes and 2 cells for the
+	// secondary card's own left/right border.
+	cardWidth := max(1, layout.SecondaryWidth-1)
+	contentWidth := max(1, cardWidth-2)
+	content := m.padOrClampHeight(m.viewBody(m.view, contentWidth, m.paneHeight()), m.paneHeight())
+	secondary := m.secondaryCard(content, cardWidth)
+	gapCol := strings.Repeat(" \n", max(0, lipgloss.Height(secondary)-1)) + " "
+	return lipgloss.JoinHorizontal(lipgloss.Top, primary, gapCol, secondary)
 }
 
 // paneHeight bounds a non-table view's rendered height (see the height clamp
@@ -139,6 +163,42 @@ func (m *Model) paneHeight() int {
 		return m.maxVisibleRows
 	}
 	return DefaultMaxVisibleRows
+}
+
+// padOrClampHeight blank-pads or truncates content to exactly height lines,
+// the sizing a non-table view's own body must have — matching the table's
+// own natural height (paneHeight() data rows, after stripHeaderSeparator
+// removes its header/data separator) so a split layout's two panes align
+// under lipgloss.JoinHorizontal, and so a standalone secondary view fills
+// its card the same way the table itself would.
+func (m *Model) padOrClampHeight(content string, height int) string {
+	lines := strings.Split(content, "\n")
+	if content == "" {
+		lines = []string{""}
+	}
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// stripHeaderSeparator removes bubble-table's header/data separator line
+// (its View() output's second line) — the same trim card() applies for a
+// standalone table view — from the table's own rendering wherever it is
+// embedded elsewhere, i.e. a split layout's primary pane (tableViewAt).
+// Without it that pane is 2 lines taller than the data-row count alone
+// suggests (a header line it keeps plus a separator line it shouldn't),
+// which used to throw off the combined pane's expected height and clip the
+// table's own bottommost row(s), including the highlighted one (B1).
+func stripHeaderSeparator(view string) string {
+	lines := strings.Split(view, "\n")
+	if len(lines) > 1 {
+		lines = append(lines[:1], lines[2:]...)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // tableViewAt renders the bare table at a specific width — used for the
@@ -216,38 +276,63 @@ func (m *Model) viewBody(view View, width, height int) string {
 	return m.table.View()
 }
 
+// secondaryCard wraps a split layout's secondary-pane content in its own
+// bordered card: a title bar (the active ExtraView's Label) with a ●/○
+// focus bullet and border color reflecting m.secondaryFocus specifically
+// (not the grid's own overall Focused, which the primary table's outer
+// m.card() already shows) — so a user can see at a glance which of the two
+// panes Tab currently routes keys to. Ported from DataTug's (pre-adoption)
+// recordsetCard.
+func (m *Model) secondaryCard(content string, width int) string {
+	label := ""
+	if i := int(m.view) - firstExtraView; i >= 0 && i < len(m.extraViews) {
+		label = m.extraViews[i].Label
+	}
+	focused := m.focused && m.secondaryFocus
+	titleStyle, borderStyle, bullet := inactiveTitleStyle, inactiveBorderStyle, "○ "
+	if focused {
+		titleStyle, borderStyle, bullet = activeTitleStyle, activeBorderStyle, "● "
+	}
+	title := titleStyle.Render(bullet) + titleStyle.Render(label)
+	innerWidth := max(1, width-2)
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines)+2)
+	out = append(out, padAnsiLine(borderStyle.Render(borderLine("╭", title, "╮", width)), width))
+	for _, line := range lines {
+		out = append(out, padAnsiLine(borderStyle.Render("│")+padAnsiLine(line, innerWidth)+borderStyle.Render("│"), width))
+	}
+	out = append(out, padAnsiLine(borderStyle.Render(borderLine("╰", "", "╯", width)), width))
+	return strings.Join(out, "\n")
+}
+
 // card wraps content in a bordered card with a title bar and a stats footer
 // in the bottom border, with a scrollbar down the right edge. Ported from
 // DataTug's gridState.viewWithTitle.
 func (m *Model) card(label, content string) string {
 	cardWidth := max(1, m.width)
 	innerWidth := m.tableWidth()
-	rawLines := strings.Split(content, "\n")
+	// bubble-table always emits a header/data separator with its outer
+	// border disabled. The card's own title bar already distinguishes the
+	// two regions. body() already strips this for a split layout's primary
+	// (table) sub-pane (stripHeaderSeparator) and already pads/clamps any
+	// non-table view's own body to its final height (padOrClampHeight), so
+	// this is the one remaining case: a standalone table view's content,
+	// straight off bubble-table's own View().
 	if m.view == ViewTable {
-		// bubble-table always emits a header/data separator with its outer
-		// border disabled. The card's own title bar already distinguishes
-		// the two regions.
-		if len(rawLines) > 1 {
-			rawLines = append(rawLines[:1], rawLines[2:]...)
-		}
+		content = stripHeaderSeparator(content)
 	}
+	rawLines := strings.Split(content, "\n")
 	if content == "" {
 		rawLines = []string{""}
 	}
-	if m.view != ViewTable {
-		// A non-table view (e.g. CardView over a wide row) is height-bound
-		// to paneHeight, same as the table itself; a taller ExtraView owns
-		// its own scrolling (see CardView/InspectorView's Update).
-		height := m.paneHeight()
-		if len(rawLines) > height {
-			rawLines = rawLines[:height]
-		}
-		for len(rawLines) < height {
-			rawLines = append(rawLines, "")
-		}
-	}
 	lines := make([]string, 0, len(rawLines)+2)
-	title := label
+	// label (headerLine's output) is already padded to its own width with
+	// trailing spaces (padAnsiLine); borderLine below re-truncates title to
+	// fit the bullet's 2 extra cells, and truncating a padded string can
+	// leave "… " (an ellipsis followed by dangling padding) right against
+	// the top-right corner — trim the padding first, like main did, so a
+	// re-truncation (if still needed) ends on real content or a clean "…".
+	title := strings.TrimRight(label, " ")
 	if m.focused {
 		title = activeTitleStyle.Render("● ") + title
 	} else {

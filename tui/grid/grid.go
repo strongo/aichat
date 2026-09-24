@@ -145,6 +145,21 @@ func rowFieldView(label, fallback string, raw bool) ExtraView {
 			case "down", "j":
 				offset += 2
 				return nil, true
+			case "pgup":
+				offset = max(0, offset-m.paneHeight())
+				return nil, true
+			case "pgdown":
+				offset += m.paneHeight()
+				return nil, true
+			case "home":
+				offset = 0
+				return nil, true
+			case "end":
+				// Render clamps this to the last page once it knows the
+				// content's actual line count; there is no height/width
+				// parameter here to compute an exact value from.
+				offset = 1 << 30
+				return nil, true
 			}
 			return nil, false
 		},
@@ -250,6 +265,15 @@ func WithInitialSort(column int, desc bool) Option {
 	return func(m *Model) { m.sortColumn, m.sortDesc = column, desc }
 }
 
+// WithFilterDisabled turns off bubble-table's built-in "/" row filter
+// entirely — no filter typing, no CapturesEsc-while-filtering state — for a
+// grid where that isn't a meaningful operation (e.g. DataTug's bookmark,
+// dock and parameter-lookup grids, which already show a narrow, purpose-
+// built row set) or where the product wants "/" for something else.
+func WithFilterDisabled() Option {
+	return func(m *Model) { m.filterDisabled = true }
+}
+
 // DefaultMaxVisibleRows is the page size a Model uses when WithMaxVisibleRows
 // is not supplied.
 const DefaultMaxVisibleRows = 12
@@ -280,6 +304,7 @@ type Model struct {
 	footerHook     FooterHook
 	style          Style
 	secondaryFocus bool
+	filterDisabled bool
 }
 
 // New builds a grid from columns and rows. Row order is preserved until the
@@ -302,8 +327,17 @@ func New(columns []Column, rows []Row, opts ...Option) *Model {
 	return m
 }
 
-func gridKeyMap() table.KeyMap {
+func (m *Model) gridKeyMap() table.KeyMap {
 	km := table.DefaultKeyMap()
+	if m.filterDisabled {
+		// A product that doesn't want bubble-table's built-in "/" filter
+		// (e.g. it isn't a meaningful operation for this particular grid,
+		// or the product has its own competing use for "/") disables it
+		// entirely — see WithFilterDisabled.
+		km.Filter = key.Binding{}
+		km.FilterBlur = key.Binding{}
+		km.FilterClear = key.Binding{}
+	}
 	// DataTug owns column navigation (h/l select a column; the grid
 	// auto-scrolls it into view). Row navigation defaults to up/k/down/j —
 	// "j" included, since a product's own KeyHandler is checked BEFORE this
@@ -427,7 +461,7 @@ func (m *Model) buildTable(width int, rowStyleFunc func(table.RowStyleFuncInput)
 		WithFooterVisibility(false).
 		WithHeaderVisibility(true).
 		Filtered(true).
-		WithKeyMap(gridKeyMap()).
+		WithKeyMap(m.gridKeyMap()).
 		Focused(focused && !m.secondaryFocus).
 		WithRowStyleFunc(rowStyleFunc)
 	if m.maxVisibleRows > 0 {
@@ -958,7 +992,14 @@ func currentRowContent(columns []Column, rows []Row, rowIndex, width int, raw bo
 			// that was never supplied for this row (Absent, above).
 			value = "NULL"
 		case raw:
-			value = sanitize(fmt.Sprintf("%#v", v))
+			if t, ok := v.(time.Time); ok {
+				// %#v on a time.Time dumps its unexported internal fields
+				// (wall/ext/loc), not a readable date — FormatValue's full
+				// RFC3339 rendering is what "raw" should mean for a date.
+				value = sanitize(FormatValue(t))
+			} else {
+				value = sanitize(fmt.Sprintf("%#v", v))
+			}
 		default:
 			value = sanitize(FormatValue(v))
 		}
