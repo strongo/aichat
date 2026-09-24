@@ -147,6 +147,10 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
+// IsRetryable reports whether the caller may retry the request that produced
+// this error. It lets *Error satisfy ai/internal/retry.Retryable.
+func (e *Error) IsRetryable() bool { return e != nil && e.Retryable }
+
 // LLMProvider streams one chat response.
 //
 // Stream yields events in order: EventStarted first, then any number of
