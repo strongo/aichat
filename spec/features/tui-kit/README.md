@@ -125,6 +125,18 @@ EXCEPT while an `Overlay` is on the stack (where it is already captured as overl
 
 The transcript receives a wheel event through AT MOST ONE mechanism per tick, never both: the focused-`Block` dispatch OR the direct viewport scroll in the chat column (never simultaneously), and NEITHER in the side column. Regardless of which column applies, a `tea.MouseWheelMsg` MUST ALSO always be forwarded to an optional `MsgHandler.OnMsg` (same as `dispatchUnhandled` forwards every other message chatshell does not itself fully own), and any non-nil `tea.Cmd` from the focused-`Block` dispatch, the `SidePanel`/sidebar routing, or `MsgHandler` MUST be included in the returned batch.
 
+#### REQ: chatshell-composer-chips
+
+`chatshell.Chip{ID, Label string; Ref *session.EntityRef}` is a product-neutral attachment shown as a removable pill above the composer input (ported from DataTug's `ContextReference`-backed attachment chips, datatug-cli#291). `WithChips(chips []Chip)` sets the composer's initial chips; `(m *Model) SetChips(chips []Chip)`/`Chips() []Chip` replace/read the current list at runtime (both take/return defensive copies). Chips render as one or more WRAPPED rows directly above the input -- each pill `"[Label ×]"`, truncated when a single label would overflow the available width -- and `historyHeight()` (the transcript viewport's fixed height) MUST shrink by exactly the number of chip rows currently rendered, and grow back as chips are removed, so the total layout never overflows `m.height`.
+
+Keyboard: `Tab`/`Shift+Tab`, from the input, cycle chip focus through every chip index plus one extra "no chip focused" state (`(focus+1)%(count+1)`, matching DataTug's `attachmentFocus` cycle) -- `Tab` from the input focuses the first chip, `Tab` from the last chip returns focus to the input, `Shift+Tab` is the same cycle in reverse; entering/leaving chip focus blurs/focuses the composer's textarea to match, since chip focus and text-input focus are mutually exclusive. While a chip is focused, `Left`/`Right` move focus to the adjacent chip (clamped at the first/last, no wrap). `Backspace`/`Delete`, while a chip is focused, remove exactly that chip. All chip key handling is a no-op while there are no chips, and the composer (chips included) is disabled while `Busy()` is true, same as the rest of the input.
+
+Mouse (only while `MouseEnabled()`): a left-button `tea.MouseClickMsg` landing exactly on a chip's `×` glyph removes that chip; any other click (wrong button, off-glyph, outside the chip row, or mouse reporting off) falls through to chatshell's normal unhandled-message path (`dispatchUnhandled`) exactly as a click did before this REQ (no chatshell-specific handling existed for `tea.MouseClickMsg` at all).
+
+`Shift+Esc` restores the chip list to how it stood immediately before the FIRST removal (keyboard or mouse) since the last successful restore or message submit -- a run of several removals with nothing in between is undone as ONE unit, not one chip at a time (mirrors DataTug's `rememberComposerDraft`/`restoreComposerDraft`). It is a no-op when there is nothing to restore, or while `Busy()` is true. Submitting a message (`Enter`) clears any pending restore snapshot -- Shift+Esc after a send no longer recovers chips removed before it.
+
+`ChipObserver{ OnChipsChange(chips []Chip) tea.Cmd }` is an optional `Handler` capability: chatshell calls it after every chip-list change IT PERFORMS (a removal or a Shift+Esc restore), so a product can keep its own attachment/context state in sync. It is deliberately NOT called from `WithChips`/`SetChips` -- those calls already come FROM the product. `SetChips` does NOT clear a pending Shift+Esc undo snapshot: the snapshot exists to let the user recover a removal THEY just performed, and a product-driven `SetChips` call for an unrelated reason (e.g. attaching something new from its own workspace UI) must not silently discard that recovery option.
+
 ### Sidebar
 
 #### REQ: sidebar-pin-and-notify
@@ -398,6 +410,36 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` with enough transcript entries to overflow the viewport, and separately: (a) a focused `transcript.Block` implementing `WheelConsumer` with `ConsumesWheel` returning `true`, (b) a focused `transcript.Block` implementing `WheelConsumer` with `ConsumesWheel` returning `false`, (c) a focused `transcript.Block` that does not implement `WheelConsumer` at all
 **When** a `tea.MouseWheelMsg` with `X` in the chat column is sent through `Update` in each case
 **Then** in case (a) the `Block`'s `Update` is called exactly once with the wheel message and the transcript viewport does NOT also scroll; in cases (b) and (c) the `Block`'s `Update` is NEVER called and the transcript viewport DOES scroll, identically to no `Block` being focused at all
+
+### AC: chip-tab-cycle-and-backspace-remove
+
+**Given** a `chatshell.Model` `WithChips` three chips, freshly constructed (no chip focused, the input holds keyboard focus)
+**When** `Tab` is pressed three times, then `Backspace`, then `Tab` once more
+**Then** the first two `Tab` presses move chip focus to index 0 then 1 (blurring the input each time); the third `Tab` press returns focus to the input (index -1); `Backspace` at that point does nothing (no chip is focused) and `Chips()` is unchanged; the final `Tab` focuses chip index 0 again
+
+### AC: chip-backspace-removes-focused-chip-and-notifies-observer
+
+**Given** a `chatshell.Model` `WithChips` three chips and a `Handler` implementing `ChipObserver`, with chip index 1 focused
+**When** `Backspace` is pressed
+**Then** `Chips()` has two entries (the middle chip removed, the other two in their original order) and `OnChipsChange` is called exactly once with that two-chip list; removing the LAST remaining chip the same way returns chip focus to -1 and keyboard focus to the input
+
+### AC: chip-shift-esc-restores-a-run-of-removals-as-one-unit
+
+**Given** a `chatshell.Model` `WithChips` three chips
+**When** two chips are removed one after another (no restore or submit in between), then `Shift+Esc` is pressed
+**Then** `Chips()` returns to the original three chips, in their original order, in a single `Shift+Esc`; a further `Shift+Esc` immediately after is a no-op (the snapshot was consumed); submitting a message via `Enter` after a removal, instead of restoring, clears the pending snapshot so a later `Shift+Esc` no longer recovers it
+
+### AC: chip-mouse-click-on-close-glyph-removes-else-falls-through
+
+**Given** a `chatshell.Model` `WithChips` three chips, `WithMouse(MouseCellMotion)`, `SetMouseEnabled(true)`, and a `Handler` implementing `MsgHandler`
+**When** a left-button `tea.MouseClickMsg` lands exactly on a chip's `×` glyph, and separately one lands one column to its left (still inside the pill, not on `×`)
+**Then** the first click removes that chip (and notifies `ChipObserver` if implemented); the second reaches `MsgHandler.OnMsg` via chatshell's normal unhandled-message path and leaves `Chips()` unchanged, exactly as any other click did before chip support existed
+
+### AC: chip-rows-shrink-history-height-and-grow-it-back
+
+**Given** a `chatshell.Model` sized via `WindowSizeMsg`, `historyHeight()` measured before any chips are set
+**When** `SetChips` is called with enough chips to wrap across two rows at the current width, then `SetChips(nil)` clears them
+**Then** `historyHeight()` after `SetChips` is exactly 2 less than before (one row subtracted per wrapped chip row); `historyHeight()` after clearing returns to its original value
 
 ## Open Questions
 

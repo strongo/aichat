@@ -298,6 +298,16 @@ type Model struct {
 	// forgotten MouseOff.
 	mouseMode    MouseMode
 	mouseEnabled bool
+
+	// chips are the composer's attachment chips, rendered above the input
+	// (see chip.go). chipFocus is the focused chip's index into chips, or -1
+	// when none is focused (the input itself holds keyboard focus). chipUndo,
+	// when non-nil, is the chip list as it stood immediately before the
+	// FIRST removal since the last successful Shift+Esc restore or submit —
+	// see snapshotChipUndo.
+	chips     []Chip
+	chipFocus int
+	chipUndo  *[]Chip
 }
 
 // New returns a chat screen driven by handler.
@@ -325,6 +335,7 @@ func New(handler Handler, opts ...Option) *Model {
 		// without ever calling WithMouse still gets a sensible mode rather
 		// than a silent no-op (MouseOff's tea.MouseMode is always None).
 		mouseMode: MouseCellMotion,
+		chipFocus: -1,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -935,6 +946,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseWheelMsg:
 		return m.handleMouseWheel(msg)
 
+	case tea.MouseClickMsg:
+		return m.handleMouseClick(msg)
+
 	default:
 		return m, m.dispatchUnhandled(msg)
 	}
@@ -1229,7 +1243,7 @@ func (m *Model) sidebarWidth() int {
 }
 
 func (m *Model) historyHeight() int {
-	return max(1, m.height-4-len(m.statusLines()))
+	return max(1, m.height-4-len(m.statusLines())-m.chipsHeight(m.chatWidth()))
 }
 
 func (m *Model) statusLines() []string {
@@ -1263,6 +1277,16 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.quit = true
 		return m, tea.Quit
+	case "shift+esc":
+		// Restores the chip list as it stood before the most recent run of
+		// removals (see snapshotChipUndo). A no-op (falls through to the
+		// zone dispatch below, same as any key chatshell doesn't claim) when
+		// busy or when there is nothing to restore.
+		if !m.busy {
+			if cmd, ok := m.restoreChipsCmd(); ok {
+				return m, cmd
+			}
+		}
 	case "esc":
 		// Esc's priority order: close an open slash-command menu first (it
 		// stays closed until the input value changes); then cancel if busy;
@@ -1372,12 +1396,21 @@ type markdownRenderTickMsg struct{ id string }
 func (m *Model) syncFocus() {
 	switch m.focusRing.Zone() {
 	case focus.ZoneTranscript:
+		m.chipFocus = -1
 		m.input.Blur()
 		m.transcript.Focus(m.focusRing.Stop())
 	case focus.ZoneSidebar:
+		m.chipFocus = -1
 		m.input.Blur()
 		m.transcript.Blur()
 	default:
+		// Any explicit zone-change back to the composer (Esc, Shift+Down
+		// past the last transcript stop, ...) hands keyboard focus to the
+		// input, so a stale chip focus (from before the zone changed away)
+		// is cleared too -- cycleChipFocus is the only other place that
+		// moves chip focus, and it manages input.Focus()/Blur() itself
+		// without going through syncFocus.
+		m.chipFocus = -1
 		m.transcript.Blur()
 		m.input.Focus()
 	}
@@ -1409,6 +1442,32 @@ func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	// Chip focus/removal is checked before the plain composer keys below: a
+	// chip row only exists above the input when there's at least one chip,
+	// and Tab/Shift+Tab must reach it before any other interpretation.
+	if len(m.chips) > 0 {
+		switch msg.String() {
+		case "tab", "shift+tab":
+			m.cycleChipFocus(msg.String() == "tab")
+			return m, nil
+		}
+		if m.chipFocus >= 0 {
+			switch msg.String() {
+			case "left":
+				if m.chipFocus > 0 {
+					m.chipFocus--
+				}
+				return m, nil
+			case "right":
+				if m.chipFocus < len(m.chips)-1 {
+					m.chipFocus++
+				}
+				return m, nil
+			case "backspace", "delete":
+				return m, m.removeChip(m.chipFocus)
+			}
+		}
+	}
 	switch msg.String() {
 	case "shift+enter":
 		m.input.InsertString("\n")
@@ -1421,6 +1480,7 @@ func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.input.Reset()
 		m.commandMenuIndex = 0
 		m.commandMenuDismissed = ""
+		m.chipUndo = nil
 		m.AppendUser(text)
 		if m.handler == nil {
 			return m, nil
@@ -1447,21 +1507,36 @@ func (m *Model) commandMenuMatches() []Command {
 	return matches
 }
 
-func (m *Model) View() tea.View {
-	top := lipgloss.NewStyle().Bold(true).Render(m.title)
+// topBarView renders the top bar: a product's WithTopBar function when set,
+// or the default bold title line. Factored out of View so chipsTopY (mouse
+// hit-testing) can measure its actual rendered height instead of assuming
+// one line -- a product's own top bar is free to render more than one.
+func (m *Model) topBarView() string {
 	if m.topBarFn != nil {
-		top = m.topBarFn(m.width)
+		return m.topBarFn(m.width)
 	}
+	return lipgloss.NewStyle().Bold(true).Render(m.title)
+}
+
+func (m *Model) View() tea.View {
+	top := m.topBarView()
 	history := m.transcript.View()
 	if m.busy {
 		history += "\n" + m.spinner.View() + " thinking…"
 	}
 	composer := m.input.View()
 	menu := m.commandMenuView()
-	chatParts := []string{history, composer}
+	chatParts := []string{history}
 	if menu != "" {
-		chatParts = []string{history, menu, composer}
+		chatParts = append(chatParts, menu)
 	}
+	if chips := m.chipsView(m.chatWidth()); chips != "" {
+		// Chips render above the input, closest to the composer -- after
+		// the slash-command menu (which sits directly above the input only
+		// while no chips are focused-adjacent) and before it.
+		chatParts = append(chatParts, chips)
+	}
+	chatParts = append(chatParts, composer)
 	chat := lipgloss.JoinVertical(lipgloss.Left, chatParts...)
 	body := chat
 	if m.splitEnabled() {
