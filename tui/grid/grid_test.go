@@ -650,3 +650,26 @@ func TestCardViewResetsScrollWhenHighlightedRowChanges(t *testing.T) {
 		t.Fatalf("card did not reset to the top after the highlighted row changed: %q", afterRowChange)
 	}
 }
+
+func TestRowNavigationDoesNotWrap(t *testing.T) {
+	cols := []Column{{Name: "n", Numeric: true}}
+	rows := make([]Row, 5)
+	for i := range rows {
+		rows[i] = Row{Key: strconv.Itoa(i), Values: []any{i}}
+	}
+	m := New(cols, rows)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	if m.CurrentIndex() != 0 {
+		t.Fatalf("up at first row wrapped to %d", m.CurrentIndex())
+	}
+	for range rows {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	}
+	if m.CurrentIndex() != len(rows)-1 {
+		t.Fatalf("down repeated past the last row = %d, want %d", m.CurrentIndex(), len(rows)-1)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if m.CurrentIndex() != len(rows)-1 {
+		t.Fatalf("down at last row wrapped to %d", m.CurrentIndex())
+	}
+}

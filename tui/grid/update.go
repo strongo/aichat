@@ -47,6 +47,22 @@ func (m *Model) Update(msg tea.Msg) (transcript.Block, tea.Cmd) {
 			m.SelectColumn(m.selectedColumn + 1)
 		}
 		return m, nil
+	case "up", "k":
+		// bubble-table's own RowUp always wraps to the last row; the grid
+		// itself does not, matching h/l's clamped column navigation above.
+		if m.view == ViewTable {
+			if i := m.CurrentIndex(); i > 0 {
+				m.SelectRow(i - 1)
+			}
+			return m, nil
+		}
+	case "down":
+		if m.view == ViewTable {
+			if i := m.CurrentIndex(); i >= 0 && i+1 < len(m.rows) {
+				m.SelectRow(i + 1)
+			}
+			return m, nil
+		}
 	case "1":
 		m.SetView(ViewTable)
 		return m, nil
