@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"reflect"
 	"strings"
 	"time"
 
@@ -87,6 +88,18 @@ type SidePanel interface {
 
 // Overlay is a modal dialog: once pushed (PushOverlay) it captures every key
 // event until its Update returns done, and renders centred over the screen.
+//
+// An Overlay implementation MUST be a POINTER type (r3 review, minor 1):
+// updateOverlay stores whatever value Update returns back into the stack
+// (m.overlays[top] = updated), so a value-typed Overlay's mutations inside
+// Update are trivially preserved that way regardless -- but CloseOverlay's
+// identity match (see its doc) can only ever find a POINTER back on the
+// stack, since Go's interface equality on a struct value compares fields,
+// not "is this the same logical dialog", and a value Overlay a product
+// still holds a copy of will never == the (possibly mutated, definitely
+// re-wrapped) value Update last returned. A product using the async-safe
+// overlay pattern (see PopOverlay/CloseOverlay) MUST hold and pass the same
+// *T it originally gave PushOverlay.
 type Overlay interface {
 	View(width, height int) string
 	Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)
@@ -702,10 +715,21 @@ func (m *Model) PushOverlay(o Overlay) tea.Cmd {
 	return nil
 }
 
-// PopOverlay closes the top overlay PROGRAMMATICALLY -- without waiting for
-// its own Update to report done -- e.g. after an async round trip a
-// product's own Handler drove to completion. It is a no-op (returns nil)
-// when no overlay is open.
+// PopOverlay closes the TOP overlay PROGRAMMATICALLY -- without waiting for
+// its own Update to report done. It is a no-op (returns nil) when no
+// overlay is open.
+//
+// PopOverlay is TOP-ONLY: it closes whatever happens to be on top at the
+// moment it is called, regardless of which overlay a caller "meant". That
+// is exactly right for the common case (at most one overlay is ever open at
+// a time), but WRONG for the async-safe pattern below once a SECOND overlay
+// can be stacked on top of the first before its async result arrives (r3
+// review, MAJOR) -- e.g. dialog A's submit is in flight, the user opens
+// dialog B on top of it, and A's result lands: PopOverlay would close B,
+// not A. Use CloseOverlay(o) instead whenever more than one overlay might
+// ever be on the stack at once; PopOverlay remains for the simpler
+// single-overlay case (or for closing "whatever's on top" on purpose, e.g.
+// an Esc-equivalent product action).
 //
 // Async-safe overlay pattern: an Overlay may need to stay open ACROSS an
 // async round trip (e.g. a form whose Enter submits to a server before it
@@ -716,18 +740,58 @@ func (m *Model) PushOverlay(o Overlay) tea.Cmd {
 // takes the normal Update path and reaches an optional MsgHandler.OnMsg
 // (dispatchUnhandled's default routing) EVEN WHILE THE OVERLAY IS STILL
 // OPEN -- an open overlay only captures key/paste/mouse input, never this.
-// From there the product either calls PopOverlay on success, or -- to show
-// an error while keeping the user's draft -- updates the overlay in place
-// (e.g. via an optional `interface{ OnResult(any) }` capability the
-// product's own Overlay implements, or simply because the product holds
-// the same Overlay pointer it passed to PushOverlay and can mutate it
-// directly).
+// From there the product calls CloseOverlay(o) with the SAME *T it passed
+// to PushOverlay on success (see Overlay's doc: it MUST be a pointer type),
+// or -- to show an error while keeping the user's draft -- updates the
+// overlay in place (e.g. via an optional `interface{ OnResult(any) }`
+// capability the product's own Overlay implements, or simply because the
+// product holds that same pointer and can mutate it directly).
 func (m *Model) PopOverlay() tea.Cmd {
 	if len(m.overlays) == 0 {
 		return nil
 	}
 	m.overlays = m.overlays[:len(m.overlays)-1]
 	return nil
+}
+
+// CloseOverlay removes o from the overlay stack WHEREVER IT IS -- not only
+// if it's on top -- matching by POINTER IDENTITY (see Overlay's doc: an
+// Overlay MUST be a pointer type for this to ever find it). It reports
+// whether o was found and removed; false is a no-op. This is the
+// identity-safe replacement for PopOverlay in the async-safe overlay
+// pattern once a second overlay might be stacked on top of the one an
+// async result is meant to close (r3 review, MAJOR -- see PopOverlay's
+// doc).
+//
+// A non-pointer Overlay (or a nil pointer) can never be matched -- o's
+// pointer identity is extracted via reflection rather than Go's `==`
+// specifically to avoid a runtime panic comparing two interface values
+// whose dynamic type is non-comparable (e.g. one holding a slice or map
+// field); CloseOverlay simply reports false for such an Overlay instead of
+// crashing.
+func (m *Model) CloseOverlay(o Overlay) bool {
+	target, ok := overlayIdentity(o)
+	if !ok {
+		return false
+	}
+	for i, existing := range m.overlays {
+		if id, ok := overlayIdentity(existing); ok && id == target {
+			m.overlays = append(m.overlays[:i], m.overlays[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// overlayIdentity extracts o's pointer identity for CloseOverlay's match,
+// or reports ok=false when o is not a non-nil pointer (reflect.Value.
+// Pointer panics on most other kinds, which this guards against).
+func overlayIdentity(o Overlay) (uintptr, bool) {
+	v := reflect.ValueOf(o)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return 0, false
+	}
+	return v.Pointer(), true
 }
 
 // Zone reports which focus zone currently has focus: the composer
@@ -906,21 +970,20 @@ func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 	// Update never returns a non-nil cmd for an Up/Down key).
 	var cmds []tea.Cmd
 
-	// A wheel event must still reach transcript Blocks via the normal
-	// broadcast path (e.g. a grid reacting to it), same as
-	// dispatchUnhandled does for every message chatshell does not itself
-	// fully own -- unconditionally, regardless of which routing branch
-	// below actually applies.
-	cmds = append(cmds, m.transcript.Update(msg))
-
 	switch {
 	case m.splitEnabled() && msg.X >= m.chatWidth()+splitSeparatorWidth:
-		// In the panel column: a product SidePanel gets the raw event
-		// (free to interpret X/Y/Button itself); the BUILT-IN sidebar has
-		// no scroll offset of its own -- it is a cursor list -- so a wheel
-		// tick moves its cursor the same way Up/Down would (r2 review
-		// minor: "scroll the sidebar" for a cursor list IS moving the
-		// cursor).
+		// Side column: the transcript viewport itself never moves here, so
+		// it is safe to ALSO broadcast to transcript Blocks (e.g. a grid
+		// reacting to it) -- unlike the chat-column case below, there is no
+		// second, chatshell-driven scroll for a Block's own handling to
+		// double against.
+		cmds = append(cmds, m.transcript.Update(msg))
+
+		// A product SidePanel gets the raw event (free to interpret
+		// X/Y/Button itself); the BUILT-IN sidebar has no scroll offset of
+		// its own -- it is a cursor list -- so a wheel tick moves its
+		// cursor the same way Up/Down would (r2 review minor: "scroll the
+		// sidebar" for a cursor list IS moving the cursor).
 		if m.sidePanel != nil {
 			var cmd tea.Cmd
 			m.sidePanel, cmd = m.sidePanel.Update(msg)
@@ -933,6 +996,17 @@ func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.sidebar.Update(key))
 		}
 	default:
+		// Chat column: chatshell itself scrolls the transcript viewport.
+		// r3 review minor 2: deliberately NOT ALSO broadcasting to
+		// transcript Blocks here (unlike the side-column case above) -- a
+		// focused Block that handles tea.MouseWheelMsg itself (e.g.
+		// scrolling its own internal view) would otherwise move TWICE for
+		// one wheel tick: once via its own Update from the broadcast, once
+		// via the outer viewport's ScrollUp/Down right below. The rule is
+		// simple and applies uniformly: the transcript receives a wheel
+		// event through EXACTLY ONE mechanism, never both -- the direct
+		// viewport scroll here, or the Block broadcast in the side-column
+		// case, never simultaneously.
 		switch msg.Button {
 		case tea.MouseWheelUp:
 			m.transcript.ScrollUp(mouseWheelScrollLines)

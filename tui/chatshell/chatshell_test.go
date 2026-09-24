@@ -2001,17 +2001,46 @@ func TestMouse_WheelOverBuiltInSidebarMovesCursorNotTranscript(t *testing.T) {
 // transcript Blocks via the normal broadcast path (restored -- it was
 // dropped when the dedicated tea.MouseWheelMsg case in Update stopped
 // falling through to dispatchUnhandled).
-func TestMouse_WheelReachesTranscriptBlocksViaBroadcast(t *testing.T) {
+// r3 review minor 2: a wheel event in the CHAT column must NOT also
+// broadcast to transcript Blocks -- only the direct viewport scroll fires
+// there. Broadcasting there too would move a Block that handles the wheel
+// itself (scrolling its own internal view) TWICE for one tick: once via its
+// own Update from the broadcast, once via the outer viewport's
+// ScrollUp/Down. See TestMouse_WheelInSideColumnReachesTranscriptBlocksViaBroadcast
+// for the complementary side-column case, where broadcasting IS safe
+// (nothing else moves the transcript there).
+func TestMouse_WheelInChatColumnDoesNotBroadcastToTranscriptBlocks(t *testing.T) {
 	h := &fakeHandler{}
 	m := New(h, WithMouse(MouseCellMotion))
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	block := &fakeBlock{}
 	m.AppendBlock(block)
 
-	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown, X: 2})
+
+	if block.updates != 0 {
+		t.Fatalf("transcript Block received the wheel event via broadcast in the chat column (updates=%d), want 0 -- this double-moves a Block that scrolls itself", block.updates)
+	}
+}
+
+// TestMouse_WheelInSideColumnReachesTranscriptBlocksViaBroadcast is the
+// complementary case: over the side column (sidebar/SidePanel), the
+// transcript viewport itself never moves, so broadcasting to its Blocks is
+// safe and still happens (dispatchUnhandled's usual guarantee, restored for
+// this branch only -- see TestMouse_WheelInChatColumnDoesNotBroadcastToTranscriptBlocks
+// for why the chat-column branch deliberately does not).
+func TestMouse_WheelInSideColumnReachesTranscriptBlocksViaBroadcast(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+	block := &fakeBlock{}
+	m.AppendBlock(block)
+
+	sideX := m.chatWidth() + splitSeparatorWidth + 1
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown, X: sideX})
 
 	if block.updates == 0 {
-		t.Fatal("transcript Block did not receive the wheel event via broadcast")
+		t.Fatal("transcript Block did not receive the wheel event via broadcast in the side column")
 	}
 	if _, ok := block.lastEvent.(tea.MouseWheelMsg); !ok {
 		t.Fatalf("block.lastEvent = %T, want tea.MouseWheelMsg", block.lastEvent)
@@ -2150,7 +2179,12 @@ func (h *asyncOverlayHandler) OnMsg(msg tea.Msg) tea.Cmd {
 		return nil
 	}
 	if res.ok {
-		h.model.PopOverlay()
+		// r3 review MAJOR: CloseOverlay(h.overlay), not PopOverlay() --
+		// PopOverlay closes whatever is CURRENTLY on top, which is wrong
+		// once a second overlay might have been stacked on top of this one
+		// before the async result arrived (see
+		// TestCloseOverlay_ClosesCorrectOverlayEvenWhenAnotherIsStackedOnTop).
+		h.model.CloseOverlay(h.overlay)
 	} else {
 		h.overlay.lastErr = "submit failed"
 	}
@@ -2180,9 +2214,88 @@ func TestAsyncOverlay_StaysOpenOnFailureClosesOnSuccess(t *testing.T) {
 		t.Fatalf("overlay.lastErr = %q, want it updated in place", overlay.lastErr)
 	}
 
-	// A successful async result closes it via PopOverlay.
+	// A successful async result closes it via CloseOverlay.
 	m.Update(asyncResultMsg{ok: true})
 	if len(m.overlays) != 0 {
 		t.Fatal("overlay still open after a successful async submit")
+	}
+}
+
+// TestCloseOverlay_ClosesCorrectOverlayEvenWhenAnotherIsStackedOnTop is the
+// r3 review MAJOR regression PopOverlay could not handle: dialog A's async
+// submit is in flight, the user opens dialog B on top of it, and A's result
+// lands -- CloseOverlay(A) must remove A specifically and leave B open,
+// where PopOverlay() would have wrongly closed B (whatever is on top).
+func TestCloseOverlay_ClosesCorrectOverlayEvenWhenAnotherIsStackedOnTop(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	a := &fakeOverlay{name: "a"}
+	b := &fakeOverlay{name: "b"}
+	m.PushOverlay(a)
+	m.PushOverlay(b)
+	if len(m.overlays) != 2 {
+		t.Fatalf("overlays = %d, want 2", len(m.overlays))
+	}
+
+	if ok := m.CloseOverlay(a); !ok {
+		t.Fatal("CloseOverlay(a) = false, want true")
+	}
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays after CloseOverlay(a) = %d, want 1", len(m.overlays))
+	}
+	if got := m.overlays[0].(*fakeOverlay).name; got != "b" {
+		t.Fatalf("remaining overlay = %q, want b (a was removed, not the top)", got)
+	}
+}
+
+func TestCloseOverlay_NotFoundReturnsFalse(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.PushOverlay(&fakeOverlay{name: "a"})
+	other := &fakeOverlay{name: "never pushed"}
+	if ok := m.CloseOverlay(other); ok {
+		t.Fatal("CloseOverlay of an overlay never pushed = true, want false")
+	}
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays = %d, want 1 (untouched)", len(m.overlays))
+	}
+}
+
+func TestCloseOverlay_EmptyStackReturnsFalse(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	if ok := m.CloseOverlay(&fakeOverlay{}); ok {
+		t.Fatal("CloseOverlay on an empty stack = true, want false")
+	}
+}
+
+// nonPointerOverlay is a VALUE-typed Overlay (never a *T), used to prove
+// CloseOverlay reports false rather than panicking or matching by value
+// equality -- see Overlay's doc: implementations MUST be pointer types.
+type nonPointerOverlay struct{}
+
+func (nonPointerOverlay) View(width, height int) string { return "" }
+func (nonPointerOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd, bool) {
+	return nonPointerOverlay{}, nil, false
+}
+
+func TestCloseOverlay_NonPointerOverlayNeverMatches(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.PushOverlay(nonPointerOverlay{})
+	if ok := m.CloseOverlay(nonPointerOverlay{}); ok {
+		t.Fatal("CloseOverlay matched a non-pointer Overlay, want false")
+	}
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays = %d, want 1 (untouched)", len(m.overlays))
+	}
+}
+
+func TestCloseOverlay_NilPointerOverlayNeverMatches(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	var nilOverlay *fakeOverlay
+	if ok := m.CloseOverlay(nilOverlay); ok {
+		t.Fatal("CloseOverlay matched a nil *fakeOverlay, want false")
 	}
 }
