@@ -464,6 +464,30 @@ func TestBuild_DecisionProviderCloudWithoutTokenErrors(t *testing.T) {
 	}
 }
 
+// TestBuild_CloudLLMAndExplicitDecisionShareOneClient covers newCloudClient's
+// own cache-hit branch (cloudClient != nil), which TestBuild_CloudLLMAndDecision
+// does not: that test's Decision.Provider is left at "auto", which calls
+// buildCloudClient directly rather than going back through newCloudClient a
+// second time. Requesting cloud LLM AND an EXPLICIT cloud decision provider
+// calls newCloudClient twice in the same Build(): once from the LLM switch
+// (cloudClient is nil, builds it), once from the decision.provider=cloud
+// case (cloudClient is now set, must return the cached one without
+// rebuilding).
+func TestBuild_CloudLLMAndExplicitDecisionShareOneClient(t *testing.T) {
+	cfg := defaults()
+	cfg.Decision.Provider = "cloud"
+	providers, err := Build(cfg, Deps{Product: "sneat", CloudToken: tokenFunc("t"), CloudBaseURL: "https://api.example.com/v0/"})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if providers.LLM == nil || providers.LLM.Name() != "cloud" {
+		t.Fatalf("LLM = %+v, want the cloud LLM provider", providers.LLM)
+	}
+	if len(providers.Decision) != 1 || providers.Decision[0].Name() != "cloud-decision" {
+		t.Fatalf("Decision = %+v, want 1 cloud-decision provider", providers.Decision)
+	}
+}
+
 func TestBuild_ExtraDecisionRunsBeforeCloud(t *testing.T) {
 	cfg := defaults()
 	extra := fakeDecider{name: "product-rules"}
