@@ -55,6 +55,17 @@ type Provider struct {
 	// start, rather than paying the extra round trip on every request.
 	// Mirrors ai/openaicompat.Provider.noReasoningEffort.
 	noReasoning map[string]bool
+
+	// noEncryptedContentMu guards noEncryptedContent.
+	noEncryptedContentMu sync.Mutex
+	// noEncryptedContent records, per MODEL, that this Provider has
+	// learned, from a live 400 response, that the endpoint rejects
+	// include:["reasoning.encrypted_content"] for that model (NB2, r2
+	// review: some models 400 with "Encrypted content is not supported
+	// with this model"). Once recorded, every later Stream call for that
+	// model omits `include` and drops any replayed reasoning item from
+	// `input` (it would be equally unreplayable there).
+	noEncryptedContent map[string]bool
 }
 
 // marshalJSON is json.Marshal, indirected so a test can force the
@@ -323,7 +334,6 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			Stream:          true,
 			MaxOutputTokens: req.MaxTokens,
 			Store:           false,
-			Include:         []string{responseIncludeReasoningEncryptedContent},
 		}
 		wantStructured := len(req.ResponseSchema) > 0
 		if wantStructured {
@@ -352,6 +362,20 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		if sentReasoning {
 			body.Reasoning = &reasoningOpt{Effort: req.Reasoning}
 		}
+		// NB2 (r2 review): include:["reasoning.encrypted_content"] itself
+		// 400s on a model that doesn't support encrypted reasoning content
+		// at all ("Encrypted content is not supported with this model").
+		// Once THAT is learned for a model, this adapter stops asking for
+		// it, and -- since a captured reasoning item is then unreplayable
+		// on that model regardless of what an earlier turn captured --
+		// also drops any replayed reasoning item from Input up front,
+		// rather than only reacting after a second failed request.
+		sentInclude := !p.encryptedContentUnsupported(model)
+		if sentInclude {
+			body.Include = []string{responseIncludeReasoningEncryptedContent}
+		} else {
+			body.Input = dropReasoningItems(body.Input)
+		}
 		payload, err := marshalJSON(body)
 		if err != nil {
 			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeInvalid, Message: err.Error()})
@@ -371,17 +395,32 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		}
 
 		resp, doErr := send(payload)
-		if doErr != nil && sentReasoning && isUnsupportedReasoningError(doErr) {
-			// M2 (r1 review): some deployments 400 on an unrecognised
-			// top-level `reasoning` field instead of ignoring it. Retry
-			// ONCE, before any byte of a response was seen, without it --
-			// and remember not to send it again on this Provider instance,
-			// per MODEL (mirrors ai/openaicompat's identical fallback for
-			// Chat Completions' reasoning_effort).
-			p.markReasoningUnsupported(model)
-			body.Reasoning = nil
-			if retryPayload, merr := marshalJSON(body); merr == nil {
-				resp, doErr = send(retryPayload)
+		if doErr != nil {
+			switch {
+			case sentInclude && isUnsupportedEncryptedContentError(doErr):
+				// NB2 (r2 review): retry ONCE, before any byte of a
+				// response was seen, without `include` -- and without any
+				// reasoning item that was about to be replayed, since this
+				// model can't accept one back either -- remembering not to
+				// send `include` again for this MODEL.
+				p.markEncryptedContentUnsupported(model)
+				body.Include = nil
+				body.Input = dropReasoningItems(body.Input)
+				if retryPayload, merr := marshalJSON(body); merr == nil {
+					resp, doErr = send(retryPayload)
+				}
+			case sentReasoning && isUnsupportedReasoningError(doErr):
+				// M2 (r1 review): some deployments 400 on an unrecognised
+				// top-level `reasoning` field instead of ignoring it. Retry
+				// ONCE, before any byte of a response was seen, without it
+				// -- and remember not to send it again on this Provider
+				// instance, per MODEL (mirrors ai/openaicompat's identical
+				// fallback for Chat Completions' reasoning_effort).
+				p.markReasoningUnsupported(model)
+				body.Reasoning = nil
+				if retryPayload, merr := marshalJSON(body); merr == nil {
+					resp, doErr = send(retryPayload)
+				}
 			}
 		}
 		if doErr != nil {
@@ -568,7 +607,12 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 
 		var providerState json.RawMessage
 		if len(providerItems) > 0 {
-			if b, err := json.Marshal(providerItems); err == nil {
+			callIDs := asm.synthesizedCallIDs()
+			sanitized := make([]json.RawMessage, len(providerItems))
+			for i, raw := range providerItems {
+				sanitized[i] = sanitizeProviderItem(raw, callIDs)
+			}
+			if b, err := json.Marshal(sanitized); err == nil {
 				providerState = b
 			}
 		}
@@ -590,6 +634,88 @@ func decodeOutputItem(raw json.RawMessage) *outputItem {
 		return nil
 	}
 	return &item
+}
+
+// sanitizeProviderItem prepares a captured output item (raw, exactly as
+// response.output_item.done sent it) for storage in Event.ProviderState /
+// eventual replay in buildInput:
+//
+//   - NB1 (r2 review): the item's top-level `id` and `status` are ALWAYS
+//     stripped. With Store:false, OpenAI never persists items server-side,
+//     and replaying an item's own `id` verbatim 400s ("Item with id
+//     'rs_...' not found. Items are not persisted when store is set to
+//     false") -- everything else, including a reasoning item's
+//     encrypted_content, is kept untouched.
+//   - minor (r2 review): for a function_call item, `call_id` is
+//     overwritten with callIDs' entry for this item's OWN `id` (looked up
+//     from raw BEFORE it's stripped) -- the same final call_id
+//     callAssembler.calls() assigned that call (real if the provider sent
+//     one, else the synthesized "call_N"). Without this, a call whose
+//     provider-sent call_id was empty would replay with an empty
+//     call_id, while the function_call_output ai/agent builds from the
+//     surfaced (synthesized) ai.ToolCall.ID would carry a DIFFERENT
+//     value -- an orphaned function_call/function_call_output pair on
+//     the wire.
+//
+// callIDs is keyed by item id (callAssembler.synthesizedCallIDs()), not by
+// call_id. A raw item that fails to parse as a JSON object is returned
+// unmodified (best-effort; still valid JSON, just not sanitized).
+func sanitizeProviderItem(raw json.RawMessage, callIDs map[string]string) json.RawMessage {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw
+	}
+	var head struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(raw, &head)
+
+	delete(fields, "id")
+	delete(fields, "status")
+	if head.Type == "function_call" {
+		if callID, ok := callIDs[head.ID]; ok {
+			if b, err := json.Marshal(callID); err == nil {
+				fields["call_id"] = b
+			}
+		}
+	}
+
+	b, err := marshalJSON(fields)
+	if err != nil {
+		return raw
+	}
+	return b
+}
+
+// isReasoningRawItem reports whether raw (a captured output item) is a
+// reasoning item, by its wire `type`.
+func isReasoningRawItem(raw json.RawMessage) bool {
+	var head struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &head); err != nil {
+		return false
+	}
+	return head.Type == "reasoning"
+}
+
+// dropReasoningItems returns items with every replayed (raw) reasoning item
+// removed -- see NB2 in Stream: once a model is known to reject
+// include:["reasoning.encrypted_content"], a captured reasoning item from
+// an earlier turn can't be replayed to it either, so it must not be sent at
+// all rather than triggering the same rejection a second time. Every other
+// item (message/function_call/function_call_output, replayed or freshly
+// built) is kept, in order.
+func dropReasoningItems(items []inputItem) []inputItem {
+	out := make([]inputItem, 0, len(items))
+	for _, it := range items {
+		if it.raw != nil && isReasoningRawItem(it.raw) {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 // callAssembler accumulates response.output_item.added/
@@ -664,13 +790,11 @@ func (a *callAssembler) calls() []ai.ToolCall {
 	out := make([]ai.ToolCall, 0, len(a.order))
 	for i, id := range a.order {
 		call := *a.byID[id]
-		if call.ID == "" {
-			// A malformed/absent call_id must not reach callers as "" --
-			// Handler dispatch and ToolResult.CallID pairing both key off
-			// it. Synthesize a stable, unique one (mirrors
-			// ai/openaicompat's toolCallAssembler.calls()).
-			call.ID = fmt.Sprintf("call_%d", i)
-		}
+		// A malformed/absent call_id must not reach callers as "" --
+		// Handler dispatch and ToolResult.CallID pairing both key off it.
+		// Synthesize a stable, unique one (mirrors ai/openaicompat's
+		// toolCallAssembler.calls()).
+		call.ID = synthesizedCallID(call.ID, i)
 		args := a.argsBuf[id].String()
 		if args == "" {
 			args = "{}"
@@ -679,6 +803,30 @@ func (a *callAssembler) calls() []ai.ToolCall {
 		out = append(out, call)
 	}
 	return out
+}
+
+// synthesizedCallIDs returns, for every item this assembler tracks (keyed
+// by item id, NOT call_id), the SAME final call_id calls() would assign it
+// -- real if the provider sent one, else the synthesized "call_N" -- so a
+// captured raw output item (see Stream's evOutputItemDone / minor r2
+// review) can have its own call_id field patched to match, keeping a
+// replayed function_call item and the function_call_output ai/agent builds
+// from the matching ai.ToolCall.ID in agreement.
+func (a *callAssembler) synthesizedCallIDs() map[string]string {
+	out := make(map[string]string, len(a.order))
+	for i, itemID := range a.order {
+		out[itemID] = synthesizedCallID(a.byID[itemID].ID, i)
+	}
+	return out
+}
+
+// synthesizedCallID returns callID unchanged when non-empty, else the same
+// stable "call_N" placeholder calls()/synthesizedCallIDs() use.
+func synthesizedCallID(callID string, index int) string {
+	if callID != "" {
+		return callID
+	}
+	return fmt.Sprintf("call_%d", index)
 }
 
 func usageFromWire(u *responseUsage) *ai.Usage {
@@ -756,14 +904,59 @@ func (p *Provider) markReasoningUnsupported(model string) {
 	p.noReasoning[model] = true
 }
 
+// encryptedContentUnsupported reports whether this Provider has already
+// learned (markEncryptedContentUnsupported) that model rejects
+// include:["reasoning.encrypted_content"].
+func (p *Provider) encryptedContentUnsupported(model string) bool {
+	p.noEncryptedContentMu.Lock()
+	defer p.noEncryptedContentMu.Unlock()
+	return p.noEncryptedContent[model]
+}
+
+// markEncryptedContentUnsupported records that model rejects
+// include:["reasoning.encrypted_content"] (NB2, r2 review), keyed by model
+// for the same reason as markReasoningUnsupported.
+func (p *Provider) markEncryptedContentUnsupported(model string) {
+	p.noEncryptedContentMu.Lock()
+	defer p.noEncryptedContentMu.Unlock()
+	if p.noEncryptedContent == nil {
+		p.noEncryptedContent = map[string]bool{}
+	}
+	p.noEncryptedContent[model] = true
+}
+
 // isUnsupportedReasoningError reports whether err is a 400 (ai.ErrCodeInvalid)
-// whose message names the `reasoning` field -- see M2 in Stream.
+// whose message NAMES the top-level `reasoning` PARAMETER specifically --
+// see M2 in Stream. NM1 (r2 review): this used to match ANY 400 whose
+// message merely contained the substring "reasoning", which also matched
+// unrelated, non-parameter errors (e.g. "missing required 'reasoning'
+// item") that have nothing to do with whether the field itself is
+// supported -- misclassifying one of those would incorrectly disable
+// `reasoning` for the model going forward. Narrowed to the two documented
+// phrasings a parameter-rejection 400 actually uses.
 func isUnsupportedReasoningError(err error) bool {
 	var aiErr *ai.Error
 	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeInvalid {
 		return false
 	}
-	return strings.Contains(strings.ToLower(aiErr.Message), "reasoning")
+	lower := strings.ToLower(aiErr.Message)
+	if strings.Contains(lower, "reasoning.effort") {
+		return true
+	}
+	return strings.Contains(lower, "unsupported parameter") && strings.Contains(lower, "'reasoning")
+}
+
+// isUnsupportedEncryptedContentError reports whether err is a 400
+// (ai.ErrCodeInvalid) whose message names encrypted reasoning content --
+// see NB2 in Stream (e.g. "Encrypted content is not supported with this
+// model").
+func isUnsupportedEncryptedContentError(err error) bool {
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeInvalid {
+		return false
+	}
+	lower := strings.ToLower(aiErr.Message)
+	return strings.Contains(lower, "encrypted content") || strings.Contains(lower, "encrypted_content")
 }
 
 // classifyStreamError maps a Responses API error `code` (from a

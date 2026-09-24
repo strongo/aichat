@@ -1185,24 +1185,35 @@ func TestStream_AlwaysSendsStoreFalseAndIncludeReasoningEncryptedContent(t *test
 // function_call and its function_call_output -- never rebuilt, never
 // dropped, and never requiring OpenAI's server-side Store.
 func TestAgentLoop_ReasoningItemReplayedBeforeToolUse(t *testing.T) {
+	// NB1 (r2 review): realistic OpenAI-style ids (rs_/fc_ prefixes) --
+	// this is exactly the shape a real response uses, and the bug this
+	// regression test protects against (replaying an item's own `id`) only
+	// 400s against the real API, never a test fixture with toy ids, which
+	// is why r1's fixtures didn't catch it.
+	const reasoningID = "rs_6710a1b2c3d4e5f6a7b8c9d0e1f2a3b4"
+	const funcCallItemID = "fc_6710a1b2c3d4e5f6a7b8c9d0e1f2a3b5"
+	const funcCallID = "call_6710a1b2c3d4e5f6a7b8c9d0e1f2a3b6"
+
 	var secondBody wireRequestBody
+	var secondRaw map[string]any
 	var requests int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddInt32(&requests, 1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		if n == 1 {
-			sseWrite(w, `{"type":"response.output_item.added","item":{"id":"rs1","type":"reasoning"}}`)
-			sseWrite(w, `{"type":"response.output_item.done","item":{"id":"rs1","type":"reasoning","encrypted_content":"enc-xyz","summary":[]}}`)
-			sseWrite(w, `{"type":"response.output_item.added","item":{"id":"fc1","type":"function_call","call_id":"call_1","name":"noop"}}`)
-			sseWrite(w, `{"type":"response.function_call_arguments.delta","item_id":"fc1","delta":"{}"}`)
-			sseWrite(w, `{"type":"response.function_call_arguments.done","item_id":"fc1","arguments":"{}"}`)
-			sseWrite(w, `{"type":"response.output_item.done","item":{"id":"fc1","type":"function_call","call_id":"call_1","name":"noop","arguments":"{}"}}`)
+			sseWrite(w, mustJSON(t, map[string]any{"type": "response.output_item.added", "item": map[string]any{"id": reasoningID, "type": "reasoning"}}))
+			sseWrite(w, mustJSON(t, map[string]any{"type": "response.output_item.done", "item": map[string]any{"id": reasoningID, "type": "reasoning", "status": "completed", "encrypted_content": "enc-xyz", "summary": []any{}}}))
+			sseWrite(w, mustJSON(t, map[string]any{"type": "response.output_item.added", "item": map[string]any{"id": funcCallItemID, "type": "function_call", "call_id": funcCallID, "name": "noop"}}))
+			sseWrite(w, `{"type":"response.function_call_arguments.delta","item_id":"`+funcCallItemID+`","delta":"{}"}`)
+			sseWrite(w, `{"type":"response.function_call_arguments.done","item_id":"`+funcCallItemID+`","arguments":"{}"}`)
+			sseWrite(w, mustJSON(t, map[string]any{"type": "response.output_item.done", "item": map[string]any{"id": funcCallItemID, "type": "function_call", "status": "completed", "call_id": funcCallID, "name": "noop", "arguments": "{}"}}))
 			sseWrite(w, `{"type":"response.completed","response":{"id":"r1","status":"completed"}}`)
 			return
 		}
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &secondBody)
+		_ = json.Unmarshal(b, &secondRaw)
 		sseWrite(w, `{"type":"response.output_text.delta","item_id":"m1","delta":"done"}`)
 		sseWrite(w, `{"type":"response.completed","response":{"id":"r2","status":"completed"}}`)
 	}))
@@ -1257,6 +1268,102 @@ func TestAgentLoop_ReasoningItemReplayedBeforeToolUse(t *testing.T) {
 	}
 	if outputIdx < 0 || callIdx > outputIdx {
 		t.Errorf("function_call (idx %d) must precede function_call_output (idx %d)", callIdx, outputIdx)
+	}
+	if secondBody.Input[callIdx].CallID != funcCallID || secondBody.Input[outputIdx].CallID != funcCallID {
+		t.Errorf("call_id mismatch: function_call=%q function_call_output=%q, want both %q",
+			secondBody.Input[callIdx].CallID, secondBody.Input[outputIdx].CallID, funcCallID)
+	}
+
+	// NB1: no replayed item may carry its own "id" (or "status") on the
+	// wire -- Store:false means OpenAI never persisted it, and replaying an
+	// item's own id 400s ("Item with id '...' not found. Items are not
+	// persisted when store is set to false").
+	rawInput, _ := secondRaw["input"].([]any)
+	if len(rawInput) < 4 {
+		t.Fatalf("raw input = %+v", rawInput)
+	}
+	for _, raw := range rawInput {
+		item, _ := raw.(map[string]any)
+		if _, hasID := item["id"]; hasID {
+			t.Errorf("item %+v carries its own \"id\" on the wire, want stripped", item)
+		}
+		if _, hasStatus := item["status"]; hasStatus {
+			t.Errorf("item %+v carries \"status\" on the wire, want stripped", item)
+		}
+	}
+}
+
+// TestAgentLoop_SynthesizedCallIDInjectedIntoReplayedFunctionCall is the
+// "minor" (r2 review): when the provider streams a function_call item with
+// NO call_id of its own (empty string -- ai.ToolCall.ID then gets this
+// adapter's synthesized "call_N"), the SAME synthesized id must be written
+// into the captured item's call_id before it is replayed, so the replayed
+// function_call and the function_call_output ai/agent builds from
+// ai.ToolCall.ID still reference each other correctly.
+func TestAgentLoop_SynthesizedCallIDInjectedIntoReplayedFunctionCall(t *testing.T) {
+	var secondBody wireRequestBody
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if n == 1 {
+			// No call_id anywhere in this fixture -- the provider omitted it.
+			sseWrite(w, `{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","name":"noop"}}`)
+			sseWrite(w, `{"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","name":"noop","arguments":"{}"}}`)
+			sseWrite(w, `{"type":"response.completed","response":{"id":"r1","status":"completed"}}`)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &secondBody)
+		sseWrite(w, `{"type":"response.output_text.delta","item_id":"m1","delta":"done"}`)
+		sseWrite(w, `{"type":"response.completed","response":{"id":"r2","status":"completed"}}`)
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	var handlerSawCallID string
+	l := agent.Loop{
+		Provider: p,
+		Handlers: map[string]agent.Handler{
+			"noop": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				handlerSawCallID = call.ID
+				return ai.ToolResult{CallID: call.ID, Content: "ok"}, nil
+			},
+		},
+	}
+	req := ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}, Tools: []ai.Tool{{Name: "noop"}}}
+	_, _, _, err := ai.Collect(l.Run(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Loop.Run: %v", err)
+	}
+	if atomic.LoadInt32(&requests) != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+	if handlerSawCallID == "" {
+		t.Fatal("handler never saw a call id")
+	}
+
+	var callIdx, outputIdx = -1, -1
+	for i, it := range secondBody.Input {
+		if it.Type == "function_call" && callIdx < 0 {
+			callIdx = i
+		}
+		if it.Type == "function_call_output" && outputIdx < 0 {
+			outputIdx = i
+		}
+	}
+	if callIdx < 0 || outputIdx < 0 {
+		t.Fatalf("Input = %+v, want a function_call and a function_call_output", secondBody.Input)
+	}
+	if secondBody.Input[callIdx].CallID != handlerSawCallID {
+		t.Errorf("replayed function_call.call_id = %q, want the synthesized %q", secondBody.Input[callIdx].CallID, handlerSawCallID)
+	}
+	if secondBody.Input[outputIdx].CallID != handlerSawCallID {
+		t.Errorf("function_call_output.call_id = %q, want the synthesized %q", secondBody.Input[outputIdx].CallID, handlerSawCallID)
+	}
+	if secondBody.Input[callIdx].CallID != secondBody.Input[outputIdx].CallID {
+		t.Errorf("function_call/function_call_output call_id mismatch: %q vs %q", secondBody.Input[callIdx].CallID, secondBody.Input[outputIdx].CallID)
 	}
 }
 
@@ -1469,6 +1576,159 @@ func TestStream_EmptyToolResultSendsEmptyOutput(t *testing.T) {
 
 // --- M2: reasoning-field-rejection retry, per model ---
 
+// --- NB2: encrypted-content-rejection retry, per model ---
+
+func TestStream_EncryptedContentRejectedRetriesWithoutIncludeAndReasoningItem(t *testing.T) {
+	var attempts []wireRequestBody
+	var rejected int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body wireRequestBody
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		attempts = append(attempts, body)
+		if len(body.Include) > 0 && atomic.CompareAndSwapInt32(&rejected, 0, 1) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"Encrypted content is not supported with this model."}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"type":"response.completed","response":{"id":"r1","status":"completed"}}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+
+	// A prior turn's captured reasoning item, replayed within the current
+	// loop -- the retry must drop it, not merely omit `include`.
+	providerState := json.RawMessage(`[{"type":"reasoning","encrypted_content":"enc-xyz"},{"type":"function_call","call_id":"call_1","name":"noop","arguments":"{}"}]`)
+	req := ai.ChatRequest{Messages: []ai.Message{
+		{Role: ai.RoleUser, Text: "hi"},
+		{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "noop", Arguments: json.RawMessage(`{}`)}}, ProviderState: providerState},
+		{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_1", Content: "ok"}}},
+	}}
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(attempts))
+	}
+	if len(attempts[0].Include) == 0 {
+		t.Errorf("first attempt Include = %+v, want set", attempts[0].Include)
+	}
+	if len(attempts[1].Include) != 0 {
+		t.Errorf("retry attempt Include = %+v, want empty", attempts[1].Include)
+	}
+	for _, it := range attempts[1].Input {
+		if it.Type == "reasoning" {
+			t.Errorf("retry attempt still replayed a reasoning item: %+v", it)
+		}
+	}
+
+	// Remembered per model: a second Stream call must not resend `include`
+	// or replay the reasoning item at all, making only one request.
+	attempts = nil
+	_, _, _, err = ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Stream (2nd call): %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("attempts on 2nd Stream call = %d, want 1 (remembered unsupported)", len(attempts))
+	}
+	if len(attempts[0].Include) != 0 {
+		t.Errorf("2nd call Include = %+v, want empty (remembered)", attempts[0].Include)
+	}
+	for _, it := range attempts[0].Input {
+		if it.Type == "reasoning" {
+			t.Errorf("2nd call still replayed a reasoning item: %+v", it)
+		}
+	}
+}
+
+func TestIsUnsupportedEncryptedContentError(t *testing.T) {
+	if isUnsupportedEncryptedContentError(errors.New("plain")) {
+		t.Error("plain error must not classify as unsupported-encrypted-content")
+	}
+	if isUnsupportedEncryptedContentError(&ai.Error{Code: ai.ErrCodeUpstream, Message: "encrypted content"}) {
+		t.Error("non-Invalid code must not classify")
+	}
+	if !isUnsupportedEncryptedContentError(&ai.Error{Code: ai.ErrCodeInvalid, Message: "Encrypted Content is not supported with this model."}) {
+		t.Error("case-insensitive 'encrypted content' match expected")
+	}
+	if !isUnsupportedEncryptedContentError(&ai.Error{Code: ai.ErrCodeInvalid, Message: "unknown value for reasoning.encrypted_content"}) {
+		t.Error("encrypted_content field-name match expected")
+	}
+}
+
+func TestSanitizeProviderItem_InvalidJSONReturnsRawUnchanged(t *testing.T) {
+	raw := json.RawMessage(`not json`)
+	if got := sanitizeProviderItem(raw, nil); string(got) != string(raw) {
+		t.Fatalf("got %s, want unchanged %s", got, raw)
+	}
+}
+
+func TestSanitizeProviderItem_MarshalErrorReturnsRawUnchanged(t *testing.T) {
+	orig := marshalJSON
+	marshalJSON = func(v any) ([]byte, error) { return nil, errors.New("boom") }
+	defer func() { marshalJSON = orig }()
+
+	raw := json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"enc"}`)
+	if got := sanitizeProviderItem(raw, nil); string(got) != string(raw) {
+		t.Fatalf("got %s, want unchanged %s", got, raw)
+	}
+}
+
+func TestSanitizeProviderItem_StripsIDAndStatusKeepsEverythingElse(t *testing.T) {
+	raw := json.RawMessage(`{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"enc","summary":[]}`)
+	got := sanitizeProviderItem(raw, nil)
+	var m map[string]any
+	if err := json.Unmarshal(got, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["id"]; ok {
+		t.Error("id not stripped")
+	}
+	if _, ok := m["status"]; ok {
+		t.Error("status not stripped")
+	}
+	if m["encrypted_content"] != "enc" {
+		t.Errorf("encrypted_content = %v, want enc", m["encrypted_content"])
+	}
+	if m["type"] != "reasoning" {
+		t.Errorf("type = %v, want reasoning", m["type"])
+	}
+}
+
+func TestSanitizeProviderItem_UnmatchedCallIDLeftUntouched(t *testing.T) {
+	raw := json.RawMessage(`{"id":"fc_1","type":"function_call","call_id":"call_orig","name":"f","arguments":"{}"}`)
+	got := sanitizeProviderItem(raw, map[string]string{"fc_other": "call_new"})
+	var m map[string]any
+	if err := json.Unmarshal(got, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["call_id"] != "call_orig" {
+		t.Errorf("call_id = %v, want unchanged call_orig (fc_1 not in callIDs)", m["call_id"])
+	}
+}
+
+func TestDropReasoningItems(t *testing.T) {
+	items := []inputItem{
+		messageItem("user", "hi"),
+		rawInputItem(json.RawMessage(`{"type":"reasoning","encrypted_content":"x"}`)),
+		functionCallItem("c1", "f", "{}"),
+		rawInputItem(json.RawMessage(`not json`)),
+	}
+	out := dropReasoningItems(items)
+	if len(out) != 3 {
+		t.Fatalf("len(out) = %d, want 3: %+v", len(out), out)
+	}
+	for _, it := range out {
+		if it.raw != nil && isReasoningRawItem(it.raw) {
+			t.Errorf("reasoning item survived: %+v", it)
+		}
+	}
+}
+
 func TestStream_ReasoningFieldRejectedRetriesWithoutIt(t *testing.T) {
 	var attempts []wireRequestBody
 	var rejected int32 // the mock only ever 400s the FIRST request that still carries `reasoning`
@@ -1479,7 +1739,7 @@ func TestStream_ReasoningFieldRejectedRetriesWithoutIt(t *testing.T) {
 		attempts = append(attempts, body)
 		if body.Reasoning != nil && atomic.CompareAndSwapInt32(&rejected, 0, 1) {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = io.WriteString(w, `{"error":{"message":"Unknown parameter: 'reasoning'."}}`)
+			_, _ = io.WriteString(w, `{"error":{"message":"Unsupported parameter: 'reasoning'."}}`)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1538,6 +1798,49 @@ func TestStream_UnrelatedBadRequestNotTreatedAsReasoningRejection(t *testing.T) 
 	}
 }
 
+// TestStream_ItemRelatedReasoningErrorDoesNotDisableReasoning is the NM1
+// regression: a 400 that merely NAMES "reasoning" in an item-related
+// context (not the parameter itself) must not be mistaken for a
+// reasoning-field rejection -- it must not retry, and must not remember
+// the model as unsupported (a later call on the same model/Provider must
+// still send `reasoning`).
+func TestStream_ItemRelatedReasoningErrorDoesNotDisableReasoning(t *testing.T) {
+	var attempts []wireRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body wireRequestBody
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		attempts = append(attempts, body)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"Invalid value: missing required 'reasoning' item in input."}}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	req := ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}, Reasoning: ai.ReasoningLow}
+
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("attempts = %d, want 1 (an item-related 400 must not trigger the reasoning-field retry)", len(attempts))
+	}
+	if attempts[0].Reasoning == nil {
+		t.Fatal("Reasoning was not sent on the first attempt")
+	}
+
+	// A later call on the SAME Provider/model must still send `reasoning`
+	// -- this error must not have been remembered as "unsupported".
+	attempts = nil
+	_, _, _, err = ai.Collect(p.Stream(context.Background(), req))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if len(attempts) != 1 || attempts[0].Reasoning == nil {
+		t.Fatalf("2nd call attempts = %+v, want Reasoning still sent", attempts)
+	}
+}
+
 func TestIsUnsupportedReasoningError(t *testing.T) {
 	if isUnsupportedReasoningError(errors.New("plain")) {
 		t.Error("plain error must not classify as unsupported-reasoning")
@@ -1545,8 +1848,14 @@ func TestIsUnsupportedReasoningError(t *testing.T) {
 	if isUnsupportedReasoningError(&ai.Error{Code: ai.ErrCodeUpstream, Message: "reasoning"}) {
 		t.Error("non-Invalid code must not classify as unsupported-reasoning")
 	}
-	if !isUnsupportedReasoningError(&ai.Error{Code: ai.ErrCodeInvalid, Message: "Unknown parameter: 'REASONING'"}) {
+	if !isUnsupportedReasoningError(&ai.Error{Code: ai.ErrCodeInvalid, Message: "Unsupported parameter: 'REASONING'"}) {
 		t.Error("case-insensitive match on 'reasoning' expected")
+	}
+	if !isUnsupportedReasoningError(&ai.Error{Code: ai.ErrCodeInvalid, Message: "invalid value for reasoning.effort"}) {
+		t.Error("reasoning.effort phrasing expected to match")
+	}
+	if isUnsupportedReasoningError(&ai.Error{Code: ai.ErrCodeInvalid, Message: "missing required 'reasoning' item in input"}) {
+		t.Error("NM1: an item-related 400 naming 'reasoning' must NOT classify as a parameter rejection")
 	}
 }
 
