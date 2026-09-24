@@ -20,7 +20,11 @@ func (m *Model) View(width int, focused bool) string {
 		m.width, m.focused = max(1, width), focused
 		m.rebuildTable()
 	}
-	return m.card(m.headerLine(m.width), m.body(m.width))
+	// card prepends a 2-cell focus bullet ("● "/"○ ") to the header label
+	// before laying it into the border, so the label itself must be built 2
+	// cells narrower than the card or the bullet pushes the rightmost view
+	// control (e.g. "3") out of the border and it gets clipped.
+	return m.card(m.headerLine(max(1, m.width-2)), m.body(m.width))
 }
 
 // headerLine is the card's title bar content: the title plus the view

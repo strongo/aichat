@@ -436,6 +436,7 @@ func FormatValue(value any) string {
 func (m *Model) SetWidth(width int) {
 	m.width = max(1, width)
 	m.rebuildTable()
+	m.syncSecondaryFocusForLayout()
 }
 
 // Width is the last width passed to SetWidth or View.
@@ -717,7 +718,18 @@ func (m *Model) SetView(v View) {
 		return
 	}
 	m.view = v
-	if v == ViewTable {
+	m.syncSecondaryFocusForLayout()
+}
+
+// syncSecondaryFocusForLayout re-derives secondary focus from the current
+// view and split state: the table view never has secondary focus, and a
+// non-table view that is NOT sharing the pane with the table (either because
+// it was just selected, or because a resize collapsed a wide split into a
+// narrow single-pane layout) always does, since the table isn't reachable to
+// focus. A still-split non-table view keeps whatever focus it already had
+// (Tab toggles it explicitly). Called from SetView and SetWidth.
+func (m *Model) syncSecondaryFocusForLayout() {
+	if m.view == ViewTable {
 		m.SetSecondaryFocus(false)
 		return
 	}
