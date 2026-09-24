@@ -2,6 +2,7 @@ package chatshell
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"strings"
 	"testing"
@@ -1734,5 +1735,111 @@ func TestStartStreamWithoutMarkdownRendererBehavesLikeStartStream(t *testing.T) 
 	entries := m.transcript.Entries()
 	if len(entries) != 1 || entries[0].Text != "hi" {
 		t.Fatalf("entries = %+v, want the plain accumulated text", entries)
+	}
+}
+
+// --- Mouse support -----------------------------------------------------
+
+func TestMouseMode_MouseTeaMode(t *testing.T) {
+	if got := MouseOff.mouseTeaMode(); got != tea.MouseModeNone {
+		t.Fatalf("MouseOff.mouseTeaMode() = %v, want MouseModeNone", got)
+	}
+	if got := MouseCellMotion.mouseTeaMode(); got != tea.MouseModeCellMotion {
+		t.Fatalf("MouseCellMotion.mouseTeaMode() = %v, want MouseModeCellMotion", got)
+	}
+}
+
+func TestMouse_DefaultIsOff(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	if m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = true, want false by default")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeNone {
+		t.Fatalf("View().MouseMode = %v, want MouseModeNone", view.MouseMode)
+	}
+}
+
+func TestMouse_WithMouseOffStaysOff(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseOff))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	if m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = true, want false")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeNone {
+		t.Fatalf("View().MouseMode = %v, want MouseModeNone", view.MouseMode)
+	}
+}
+
+func TestMouse_WithMouseCellMotionEnablesFromStart(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	if !m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = false, want true")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("View().MouseMode = %v, want MouseModeCellMotion", view.MouseMode)
+	}
+}
+
+func TestMouse_SetMouseEnabledToggle(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+
+	// SetMouseEnabled(true) without ever calling WithMouse falls back to
+	// MouseCellMotion (New's default mouseMode), not a silent no-op.
+	m.SetMouseEnabled(true)
+	if !m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = false after SetMouseEnabled(true)")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("View().MouseMode = %v, want MouseModeCellMotion", view.MouseMode)
+	}
+
+	m.SetMouseEnabled(false)
+	if m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = true after SetMouseEnabled(false)")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeNone {
+		t.Fatalf("View().MouseMode = %v, want MouseModeNone", view.MouseMode)
+	}
+}
+
+func TestMouse_WheelScrollsTranscript(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	before := m.transcript.View()
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	afterUp := m.transcript.View()
+	if afterUp == before {
+		t.Fatal("wheel up did not change the transcript view (already at top with room to scroll up? check fixture)")
+	}
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	afterDown := m.transcript.View()
+	if afterDown != before {
+		t.Fatalf("wheel down did not return to the original view:\nbefore=%q\nafterDown=%q", before, afterDown)
+	}
+}
+
+func TestMouse_WheelIgnoredWhileOverlayOpen(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	before := m.transcript.View()
+	m.PushOverlay(&fakeOverlay{})
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	if got := m.transcript.View(); got != before {
+		t.Fatal("wheel scrolled the transcript while an overlay was open")
 	}
 }

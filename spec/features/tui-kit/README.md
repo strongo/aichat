@@ -102,6 +102,10 @@ An optional `SidePanelPinner` capability (`PinRef(ref session.EntityRef) bool`, 
 
 Every delta's text MUST be accumulated onto the entry immediately (so the final `Text` is always complete), but re-running the renderer over that accumulated text on every single delta is NOT required and MUST be throttled: at most once per a bounded time window (`markdownRenderThrottle`, 100ms), PLUS any delta whose text crosses a newline (a likely-stable rendering point such as a completed list item or paragraph) forces an immediate re-render even inside that window, PLUS the stream's completion MUST always force one final re-render regardless of the window, so the displayed markdown is never stale once the stream ends. A delta that gets throttled out (m1, r3 review) MUST also schedule a ONE-SHOT `tea.Tick` follow-up render `markdownRenderThrottle` later, guaranteeing its trailing fragment still renders even if NO further delta ever arrives (a stalled or slow-trickling stream) -- not only "wait for the next delta or completion"; at most one such follow-up is pending at a time (a delta arriving before it fires does not schedule a second one). `chatshell.Model` exposes no way to disable this throttle; a product that needs every-delta rendering re-renders its own copy of the accumulated `Text` outside `chatshell`.
 
+#### REQ: chatshell-mouse-support
+
+`chatshell.WithMouse(mode MouseMode)` MUST set the chat screen's initial mouse-reporting state: `MouseOff` (the default when `WithMouse` is never called) requests no mouse reporting at all -- the terminal's own native text selection/copy keeps working -- and `MouseCellMotion` requests click/release/wheel events (`tea.MouseModeCellMotion`) from construction. `(m *Model) SetMouseEnabled(enabled bool)` MUST toggle mouse reporting at runtime -- e.g. DataTug's F2 capture toggle, since a terminal's native text selection is unusable while mouse reporting is on, so a product offering both needs a key to flip between them -- taking effect on the next `View()` (chatshell has no way to push a mode change to the terminal outside the normal render cycle); `enabled: true` restores the mode configured via `WithMouse` (`MouseCellMotion` if `WithMouse` was never called, never a silent no-op), `enabled: false` requests `tea.MouseModeNone` regardless of that configured mode. `(m *Model) MouseEnabled() bool` MUST report the current toggle state. `View()` MUST set the returned `tea.View`'s `MouseMode` from this state on every render. A `tea.MouseWheelMsg` MUST scroll the transcript viewport (`tea.MouseWheelUp`/`tea.MouseWheelDown` calling `transcript.Model.ScrollUp`/`ScrollDown`) via chatshell's normal `Update` path, EXCEPT while an `Overlay` is on the stack, where it is already captured as overlay input (per REQ: chatshell-overlay's existing `isOverlayInputMsg` classification, unchanged by this REQ) and never reaches the transcript.
+
 ### Sidebar
 
 #### REQ: sidebar-pin-and-notify
@@ -319,6 +323,13 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a `chatshell.Model` built `WithMarkdownRenderer(r)`, a fake clock, and a fake `tea.Tick` that the test fires by hand
 **When** a delta is rendered immediately, then a second delta arrives that the throttle window suppresses (no newline, no elapsed window) and NO further delta or completion ever arrives
 **Then** a one-shot follow-up tick is scheduled for `markdownRenderThrottle` out, and firing it (with no further stream activity) triggers exactly one more render carrying the full accumulated text, including the previously-suppressed fragment
+
+### AC: mouse-wheel-scrolls-transcript-and-toggle-restores-configured-mode
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` with enough transcript entries to overflow the viewport
+**When** a `tea.MouseWheelMsg{Button: tea.MouseWheelUp}` is sent through `Update`, followed by `tea.MouseWheelMsg{Button: tea.MouseWheelDown}`
+**Then** `View().MouseMode` is `tea.MouseModeCellMotion` throughout, the transcript's rendered view changes after the wheel-up and returns to its original rendering after the matching wheel-down; separately, `SetMouseEnabled(false)` then `View()` reports `tea.MouseModeNone`, and a later `SetMouseEnabled(true)` (with no further `WithMouse` call) restores `tea.MouseModeCellMotion` rather than staying off; separately again, pushing an `Overlay` and sending the same wheel-up leaves the transcript's rendered view unchanged (the overlay captures it first)
 
 ## Open Questions
 

@@ -159,6 +159,41 @@ func WithMarkdownRenderer(r transcript.MarkdownRenderer) Option {
 	return func(m *Model) { m.transcript.SetMarkdownRenderer(r) }
 }
 
+// MouseMode selects whether chatshell requests terminal mouse reporting and,
+// if so, which tea.MouseMode it asks for.
+type MouseMode int
+
+const (
+	// MouseOff requests no mouse reporting (the default: a terminal's own
+	// native text selection/copy keeps working).
+	MouseOff MouseMode = iota
+	// MouseCellMotion requests click, release and wheel events (but not
+	// plain motion/hover) -- enough to scroll the transcript with the wheel
+	// without giving up terminal-native text selection on most terminals.
+	MouseCellMotion
+)
+
+// mouseTeaMode maps a MouseMode to the tea.MouseMode View() sets.
+func (mm MouseMode) mouseTeaMode() tea.MouseMode {
+	if mm == MouseCellMotion {
+		return tea.MouseModeCellMotion
+	}
+	return tea.MouseModeNone
+}
+
+// WithMouse sets the initial mouse mode (see MouseMode). Products that want
+// a runtime toggle (e.g. DataTug's F2 capture toggle, which needs the
+// terminal's native mouse selection back while capturing) call
+// SetMouseEnabled after construction; WithMouse only sets the starting
+// state and, for MouseCellMotion, the mode SetMouseEnabled(true) re-enables
+// later. The default (no WithMouse call) is MouseOff.
+func WithMouse(mode MouseMode) Option {
+	return func(m *Model) {
+		m.mouseMode = mode
+		m.mouseEnabled = mode != MouseOff
+	}
+}
+
 // Model is the reusable chat screen.
 type Model struct {
 	ctx     context.Context
@@ -233,6 +268,14 @@ type Model struct {
 	// second, immediately-following Ctrl+C always quits instead of trying to
 	// cancel again. Any other key clears it.
 	ctrlCArmed bool
+
+	// mouseMode is the tea.MouseMode View() requests while mouseEnabled is
+	// true (see WithMouse/SetMouseEnabled); mouseEnabled false always
+	// reports tea.MouseModeNone regardless of mouseMode, so a later
+	// SetMouseEnabled(true) restores the configured mode rather than a
+	// forgotten MouseOff.
+	mouseMode    MouseMode
+	mouseEnabled bool
 }
 
 // New returns a chat screen driven by handler.
@@ -255,6 +298,11 @@ func New(handler Handler, opts ...Option) *Model {
 		title:      "aichat",
 		width:      80,
 		height:     24,
+		// mouseEnabled defaults false (MouseOff); mouseMode defaults to
+		// MouseCellMotion so a product that calls SetMouseEnabled(true)
+		// without ever calling WithMouse still gets a sensible mode rather
+		// than a silent no-op (MouseOff's tea.MouseMode is always None).
+		mouseMode: MouseCellMotion,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -263,6 +311,20 @@ func New(handler Handler, opts ...Option) *Model {
 }
 
 // --- Product-facing API -----------------------------------------------
+
+// SetMouseEnabled toggles mouse reporting at runtime, e.g. DataTug's F2
+// capture toggle (a terminal's own native text-selection/copy is unusable
+// while mouse reporting is on, so a product that wants both needs a key to
+// flip between them). enabled true requests the mode configured via
+// WithMouse (MouseCellMotion by default if WithMouse was never called);
+// enabled false requests no mouse reporting at all. The new mode takes
+// effect on the next View() -- chatshell has no way to push it to the
+// terminal outside the normal render cycle.
+func (m *Model) SetMouseEnabled(enabled bool) { m.mouseEnabled = enabled }
+
+// MouseEnabled reports whether mouse reporting is currently requested (see
+// SetMouseEnabled).
+func (m *Model) MouseEnabled() bool { return m.mouseEnabled }
 
 // AppendUser appends a user message to the transcript.
 func (m *Model) AppendUser(text string) {
@@ -750,9 +812,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 
+	case tea.MouseWheelMsg:
+		return m.handleMouseWheel(msg)
+
 	default:
 		return m, m.dispatchUnhandled(msg)
 	}
+}
+
+// mouseWheelScrollLines is how many transcript lines one wheel tick moves,
+// matching a typical terminal's own default scroll step.
+const mouseWheelScrollLines = 3
+
+// handleMouseWheel scrolls the transcript viewport. It is reachable only
+// while mouse reporting is on (View's MouseMode gates whether the terminal
+// ever sends these events at all), but does not itself re-check
+// mouseEnabled -- a wheel event that already arrived is honoured
+// regardless, same as chatshell honours a key press it happens to receive.
+func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	switch msg.Button {
+	case tea.MouseWheelUp:
+		m.transcript.ScrollUp(mouseWheelScrollLines)
+	case tea.MouseWheelDown:
+		m.transcript.ScrollDown(mouseWheelScrollLines)
+	}
+	return m, nil
 }
 
 // isOverlayInputMsg reports whether msg is user input an open Overlay
@@ -1210,6 +1294,9 @@ func (m *Model) View() tea.View {
 	}
 	view := tea.NewView(content)
 	view.AltScreen = true
+	if m.mouseEnabled {
+		view.MouseMode = m.mouseMode.mouseTeaMode()
+	}
 	return view
 }
 
