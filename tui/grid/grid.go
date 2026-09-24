@@ -101,24 +101,54 @@ type ExtraView struct {
 // "Current row" when empty. Ported from DataTug's recordset_views.go
 // currentRowContent (raw=false).
 func CardView(label string) ExtraView {
-	if label == "" {
-		label = "Current row"
-	}
-	return ExtraView{Label: label, Render: func(m *Model, width, _ int) string {
-		return currentRowContent(m.columns, m.rows, m.CurrentIndex(), width, false)
-	}}
+	return rowFieldView(label, "Current row", false)
 }
 
 // InspectorView is CardView's raw-value counterpart: it renders each field's
 // Go value (%#v) instead of FormatValue's terminal-safe text. label defaults
 // to "Inspector" when empty.
 func InspectorView(label string) ExtraView {
+	return rowFieldView(label, "Inspector", true)
+}
+
+// rowFieldView builds CardView/InspectorView: the highlighted row's fields as
+// a vertical list, scrollable with up/down when the row has more fields than
+// fit the pane (each field is two lines: name, then value), and reset to the
+// top whenever the highlighted row changes.
+func rowFieldView(label, fallback string, raw bool) ExtraView {
 	if label == "" {
-		label = "Inspector"
+		label = fallback
 	}
-	return ExtraView{Label: label, Render: func(m *Model, width, _ int) string {
-		return currentRowContent(m.columns, m.rows, m.CurrentIndex(), width, true)
-	}}
+	offset := 0
+	lastRow := -1
+	return ExtraView{
+		Label: label,
+		Render: func(m *Model, width, height int) string {
+			rowIndex := m.CurrentIndex()
+			if rowIndex != lastRow {
+				offset, lastRow = 0, rowIndex
+			}
+			content := currentRowContent(m.columns, m.rows, rowIndex, width, raw)
+			if content == "" || height <= 0 {
+				return content
+			}
+			lines := strings.Split(content, "\n")
+			offset = max(0, min(offset, max(0, len(lines)-height)))
+			end := min(len(lines), offset+height)
+			return strings.Join(lines[offset:end], "\n")
+		},
+		Update: func(m *Model, msg tea.KeyPressMsg) (tea.Cmd, bool) {
+			switch msg.String() {
+			case "up", "k":
+				offset = max(0, offset-2)
+				return nil, true
+			case "down", "j":
+				offset += 2
+				return nil, true
+			}
+			return nil, false
+		},
+	}
 }
 
 // KeyHandler lets a product own specific key presses (e.g. DataTug's

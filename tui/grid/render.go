@@ -108,15 +108,26 @@ func abbreviate(name string, n int) string {
 // table itself. Ported from DataTug's gridState.recordsetView.
 func (m *Model) body(width int) string {
 	if m.view == ViewTable || m.layout == nil {
-		return m.viewBody(m.view, width)
+		return m.viewBody(m.view, width, m.paneHeight())
 	}
 	layout := m.layout(width, m.NaturalWidth(), m.view)
 	if !layout.Split {
-		return m.viewBody(m.view, width)
+		return m.viewBody(m.view, width, m.paneHeight())
 	}
 	primary := m.tableViewAt(layout.PrimaryWidth)
-	secondary := m.viewBody(m.view, layout.SecondaryWidth)
+	secondary := m.viewBody(m.view, layout.SecondaryWidth, m.paneHeight())
 	return lipgloss.JoinHorizontal(lipgloss.Top, primary, secondary)
+}
+
+// paneHeight bounds a non-table view's rendered height (see the height clamp
+// in card), so a view with many lines (e.g. CardView over a wide row) never
+// renders taller than the table itself would. Ported from DataTug's fixed
+// recordsetPaneHeight = maxGridHeight.
+func (m *Model) paneHeight() int {
+	if m.maxVisibleRows > 0 {
+		return m.maxVisibleRows
+	}
+	return DefaultMaxVisibleRows
 }
 
 // tableViewAt renders the bare table at a specific width without disturbing
@@ -135,12 +146,12 @@ func (m *Model) tableViewAt(width int) string {
 	return view
 }
 
-func (m *Model) viewBody(view View, width int) string {
+func (m *Model) viewBody(view View, width, height int) string {
 	if view == ViewTable {
 		return m.table.View()
 	}
 	if i := int(view) - firstExtraView; i >= 0 && i < len(m.extraViews) {
-		return m.extraViews[i].Render(m, width, 0)
+		return m.extraViews[i].Render(m, width, height)
 	}
 	return m.table.View()
 }
@@ -162,6 +173,18 @@ func (m *Model) card(label, content string) string {
 	}
 	if content == "" {
 		rawLines = []string{""}
+	}
+	if m.view != ViewTable {
+		// A non-table view (e.g. CardView over a wide row) is height-bound
+		// to paneHeight, same as the table itself; a taller ExtraView owns
+		// its own scrolling (see CardView/InspectorView's Update).
+		height := m.paneHeight()
+		if len(rawLines) > height {
+			rawLines = rawLines[:height]
+		}
+		for len(rawLines) < height {
+			rawLines = append(rawLines, "")
+		}
 	}
 	lines := make([]string, 0, len(rawLines)+2)
 	title := label

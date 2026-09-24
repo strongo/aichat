@@ -516,3 +516,82 @@ func TestSetFocusedTogglesRebuild(t *testing.T) {
 		t.Fatal("Focused() false after SetFocused(true)")
 	}
 }
+
+func TestSimpleAccessors(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithTitle("Cities"))
+	m.SetWidth(50)
+	if m.Width() != 50 {
+		t.Fatalf("Width() = %d, want 50", m.Width())
+	}
+	if len(m.Columns()) != len(cols) {
+		t.Fatalf("Columns() len = %d, want %d", len(m.Columns()), len(cols))
+	}
+	if len(m.Rows()) != len(rows) {
+		t.Fatalf("Rows() len = %d, want %d", len(m.Rows()), len(rows))
+	}
+}
+
+func TestExtraViewsGetterAndSetters(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(CardView("")))
+	if len(m.ExtraViews()) != 1 {
+		t.Fatalf("ExtraViews() len = %d, want 1", len(m.ExtraViews()))
+	}
+	claimed := false
+	m.SetKeyHandler(func(m *Model, msg tea.KeyPressMsg) (tea.Cmd, bool) {
+		if msg.String() == "z" {
+			claimed = true
+			return nil, true
+		}
+		return nil, false
+	})
+	m.Update(tea.KeyPressMsg{Text: "z", Code: 'z'})
+	if !claimed {
+		t.Fatal("SetKeyHandler's hook did not see 'z'")
+	}
+	appended := false
+	m.SetFooterHook(func(m *Model, builtin string) string {
+		appended = true
+		return builtin
+	})
+	m.View(60, true)
+	if !appended {
+		t.Fatal("SetFooterHook's hook was not called")
+	}
+}
+
+func TestCardViewScrollsWithManyColumns(t *testing.T) {
+	cols := make([]Column, 20)
+	values := make([]any, 20)
+	for i := range cols {
+		cols[i] = Column{Name: "col" + strconv.Itoa(i)}
+		values[i] = "v" + strconv.Itoa(i)
+	}
+	rows := []Row{{Key: "0", Values: values}}
+	m := New(cols, rows, WithExtraViews(CardView("")), WithMaxVisibleRows(4))
+	m.SetView(View(firstExtraView))
+	first := ansi.Strip(m.View(40, true))
+	if strings.Contains(first, "col19") {
+		t.Fatalf("first page should not show the last column yet: %q", first)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	scrolled := ansi.Strip(m.View(40, true))
+	if scrolled == first {
+		t.Fatal("down did not scroll the card view")
+	}
+	// Scrolling back up returns toward the top.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	backAtTop := ansi.Strip(m.View(40, true))
+	if backAtTop != first {
+		t.Fatalf("scrolling back to the top did not match the original page:\nfirst=%q\nback=%q", first, backAtTop)
+	}
+}
