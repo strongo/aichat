@@ -85,7 +85,11 @@ Every HTTP-backed adapter (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`) MUST m
 
 #### REQ: reasoning-maps-to-provider-knob
 
-`ChatRequest.Reasoning` (`""`/`"low"`/`"medium"`/`"high"`) MUST map to `reasoning_effort` on `ai/openaicompat` (set only when non-empty) and to Anthropic extended thinking (`thinking: {type: "enabled", budget_tokens: 1024/4096/16000}`) on `ai/anthropic`, with `MaxTokens` raised above `budget_tokens` when the request's own `MaxTokens` would not clear it. Thinking/signature deltas from `ai/anthropic` MUST NOT be emitted as `EventTextDelta` -- they are dropped.
+`ChatRequest.Reasoning` (`""`/`"low"`/`"medium"`/`"high"`) MUST map to `reasoning_effort` on `ai/openaicompat` (set only when non-empty) and to Anthropic extended thinking (`thinking: {type: "enabled", budget_tokens: 1024/4096/16000}`) on `ai/anthropic`, with `MaxTokens` raised above `budget_tokens` when the request's own `MaxTokens` would not clear it. Thinking/signature deltas from `ai/anthropic` MUST NOT be emitted as `EventTextDelta` -- they are dropped from the text stream (they are still captured -- see REQ: anthropic-thinking-block-replay).
+
+#### REQ: anthropic-thinking-block-replay
+
+Anthropic requires the `thinking`/`redacted_thinking` blocks of the LAST assistant turn that contains `tool_use` to be replayed UNMODIFIED (text and `signature`/`data` byte-for-byte, in original order, preceding the `tool_use` block) on the next request that includes that turn -- this applies to plain extended thinking, not only the interleaved-thinking beta; omitting them 400s the following request. `ai.Message` gains an ADDITIVE, opaque `ProviderState json.RawMessage` field for this: `ai/anthropic.Provider.Stream` MUST capture every `thinking`/`redacted_thinking` content block it streams (`content_block_start` type, `thinking_delta`/`signature_delta` chunks assembled by index, `redacted_thinking`'s whole `data` payload) and surface them, JSON-encoded in stream order, as `ai.Event.ProviderState` on the terminal `EventCompleted`. `ai/anthropic.buildMessages` MUST, when an assistant `ai.Message.ProviderState` is set, unmarshal and prepend those blocks to the wire message's content BEFORE any text/`tool_use` block, verbatim (a `ProviderState` that fails to unmarshal is dropped, never sent malformed). `ai/openaicompat` MUST ignore `Message.ProviderState`/`Event.ProviderState` entirely (it never reads or writes the field). Whoever appends an assistant tool-call message to a transcript across steps (`ai/agent.Loop`) MUST carry `Event.ProviderState` from that step's terminal `EventCompleted` onto the `ai.Message.ProviderState` it appends.
 
 #### REQ: cloudproto-and-cloud-pass-tools-through
 
@@ -353,6 +357,13 @@ A BYOK adapter (`ai/openaicompat` or `ai/anthropic`, selected by `BYOK.Protocol`
 **Given** `ChatRequest.Reasoning: "medium"` and a `MaxTokens` at or below the medium budget (4096)
 **When** `ai/anthropic` builds the request
 **Then** `thinking` is `{type: "enabled", budget_tokens: 4096}` and the request's `MaxTokens` is raised strictly above 4096; separately, `ai/openaicompat` sets `reasoning_effort: "medium"` and omits the field entirely when `Reasoning` is unset
+
+### AC: thinking-block-replayed-before-tool-use-with-signature-intact
+**Requirements:** ai-layer#req:anthropic-thinking-block-replay
+
+**Given** `ai/agent.Loop` over the REAL `ai/anthropic.Provider` against an httptest server that, with `Reasoning: "medium"` requested, streams a `thinking` block (with a `signature_delta`) followed by a `tool_use` call on step 1, then a plain text completion on step 2
+**When** the Loop's registered `Handler` answers the tool call and the Loop issues its second request
+**Then** the second request's assistant message content is `[thinking, tool_use, ...]` in that order, the `thinking` block's `signature` and `thinking` text are byte-identical to what step 1 streamed, and `thinking: {type: "enabled", budget_tokens: 4096}` is still set on that request
 
 ### AC: agent-loop-two-step-tool-use-sums-usage
 **Requirements:** ai-layer#req:agent-loop-contract

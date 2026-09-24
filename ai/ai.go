@@ -37,6 +37,17 @@ type Message struct {
 	ToolCalls []ToolCall `json:"toolCalls,omitempty"`
 	// ToolResults is set on a RoleTool message answering prior ToolCalls.
 	ToolResults []ToolResult `json:"toolResults,omitempty"`
+	// ProviderState is opaque, provider-specific extra content an adapter
+	// attached to an assistant message it produced (e.g. ai/anthropic's
+	// extended-thinking/redacted-thinking blocks, signature included) and
+	// that same adapter MUST replay unmodified on a later request that
+	// includes this message — some providers 400 a tool-use continuation
+	// that drops or edits the thinking blocks from the turn that requested
+	// the tool call. Populated from Event.ProviderState (see EventCompleted)
+	// by whoever appends the assistant message (e.g. ai/agent.Loop). An
+	// adapter that doesn't understand another adapter's ProviderState MUST
+	// ignore it rather than error.
+	ProviderState json.RawMessage `json:"providerState,omitempty"`
 }
 
 // Tool is a function the model may call. Schema is the JSON Schema of the
@@ -194,6 +205,11 @@ type Event struct {
 	ToolResult *ToolResult `json:"toolResult,omitempty"`
 	// StopReason: set on EventCompleted; "tool_calls" | "end" | "length".
 	StopReason string `json:"stopReason,omitempty"`
+	// ProviderState: set on EventCompleted when the adapter captured
+	// provider-specific state (e.g. ai/anthropic's thinking/
+	// redacted_thinking blocks with signatures) that MUST be attached to the
+	// assistant message this turn produces — see Message.ProviderState.
+	ProviderState json.RawMessage `json:"providerState,omitempty"`
 }
 
 // Usage is token and allowance accounting for one response.

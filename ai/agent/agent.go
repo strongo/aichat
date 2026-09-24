@@ -6,6 +6,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"iter"
 	"sync"
@@ -104,6 +105,7 @@ func (l *Loop) Run(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, 
 
 			var stepCalls []ai.ToolCall
 			var stepUsage *ai.Usage
+			var stepProviderState json.RawMessage
 			stopReason := ""
 			fatalErr := (*ai.Error)(nil)
 
@@ -150,6 +152,7 @@ func (l *Loop) Run(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, 
 						stepUsage = ev.Usage
 					}
 					stopReason = ev.StopReason
+					stepProviderState = ev.ProviderState
 					// Swallow the per-step Completed: Run yields exactly one,
 					// at the very end.
 				case ai.EventError:
@@ -191,8 +194,16 @@ func (l *Loop) Run(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, 
 				return
 			}
 
-			// Append the assistant's tool-call message.
-			messages = append(messages, ai.Message{Role: ai.RoleAssistant, ToolCalls: append([]ai.ToolCall(nil), stepCalls...)})
+			// Append the assistant's tool-call message. ProviderState (e.g.
+			// ai/anthropic's thinking/redacted_thinking blocks with
+			// signatures) rides along unmodified so a later step that
+			// re-sends this message satisfies the provider's replay
+			// requirement — see ai.Message.ProviderState.
+			messages = append(messages, ai.Message{
+				Role:          ai.RoleAssistant,
+				ToolCalls:     append([]ai.ToolCall(nil), stepCalls...),
+				ProviderState: stepProviderState,
+			})
 
 			results := make([]ai.ToolResult, 0, len(stepCalls))
 			for _, call := range stepCalls {

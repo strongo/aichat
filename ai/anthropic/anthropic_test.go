@@ -669,3 +669,85 @@ func TestStream_ToolResultMessagesMergedAndReasoningSetsThinkingBudget(t *testin
 		t.Errorf("MaxTokens = %d, want > budget_tokens %d", gotBody.MaxTokens, gotBody.Thinking.BudgetTokens)
 	}
 }
+
+func TestStream_ThinkingBlockCapturedAndReplayedVerbatim(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm, "}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let's see."}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-xyz"}}`)
+		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"noop"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}`)
+		sseWrite(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-haiku-4-5-20251001"})
+	req := ai.ChatRequest{
+		Reasoning: ai.ReasoningLow,
+		Messages:  []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+		Tools:     []ai.Tool{{Name: "noop"}},
+	}
+
+	var providerState json.RawMessage
+	for ev, err := range p.Stream(context.Background(), req) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventCompleted {
+			providerState = ev.ProviderState
+		}
+		// thinking_delta/signature_delta must never surface as text.
+		if ev.Type == ai.EventTextDelta {
+			t.Errorf("unexpected EventTextDelta: %q (thinking must not be emitted as text)", ev.Text)
+		}
+	}
+	if len(providerState) == 0 {
+		t.Fatal("expected Event.ProviderState to carry the captured thinking block")
+	}
+
+	// Feed it back on a follow-up assistant message and confirm buildMessages
+	// replays it verbatim, ahead of the tool_use block.
+	followUp := ai.ChatRequest{
+		Reasoning: ai.ReasoningLow,
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{
+				Role:          ai.RoleAssistant,
+				ToolCalls:     []ai.ToolCall{{ID: "call_1", Name: "noop", Arguments: json.RawMessage(`{}`)}},
+				ProviderState: providerState,
+			},
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_1", Content: "ok"}}},
+		},
+	}
+	msgs := buildMessages(followUp)
+	var assistant *wireMessage
+	for i := range msgs {
+		if msgs[i].Role == "assistant" {
+			assistant = &msgs[i]
+			break
+		}
+	}
+	if assistant == nil {
+		t.Fatal("no assistant wire message")
+	}
+	if len(assistant.Content) < 2 {
+		t.Fatalf("assistant.Content = %+v, want [thinking, tool_use]", assistant.Content)
+	}
+	if assistant.Content[0].Type != "thinking" {
+		t.Fatalf("Content[0].Type = %q, want thinking (must precede tool_use)", assistant.Content[0].Type)
+	}
+	if assistant.Content[0].Signature != "sig-xyz" {
+		t.Errorf("Signature = %q, want unmodified sig-xyz", assistant.Content[0].Signature)
+	}
+	if assistant.Content[0].Thinking != "hmm, let's see." {
+		t.Errorf("Thinking = %q, want the concatenated deltas unmodified", assistant.Content[0].Thinking)
+	}
+	if assistant.Content[1].Type != "tool_use" {
+		t.Errorf("Content[1].Type = %q, want tool_use", assistant.Content[1].Type)
+	}
+}

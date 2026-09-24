@@ -71,6 +71,14 @@ type contentBlock struct {
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	Content   string `json:"content,omitempty"`
 	IsError   bool   `json:"is_error,omitempty"`
+	// thinking / redacted_thinking: captured verbatim off the stream into
+	// Message.ProviderState and replayed unmodified by buildMessages — never
+	// built directly from a ChatRequest. Signature/Data are opaque and MUST
+	// travel byte-for-byte; the API 400s a tool-use continuation whose
+	// thinking blocks were dropped or edited.
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Data      string `json:"data,omitempty"`
 }
 
 type cacheControl struct {
@@ -156,11 +164,17 @@ type sseEvent struct {
 		Text        string `json:"text"`
 		PartialJSON string `json:"partial_json"`
 		StopReason  string `json:"stop_reason"`
+		// Thinking/Signature: thinking_delta/signature_delta payloads.
+		Thinking  string `json:"thinking"`
+		Signature string `json:"signature"`
 	} `json:"delta,omitempty"`
 	ContentBlock *struct {
 		Type string `json:"type"`
 		ID   string `json:"id"`
 		Name string `json:"name"`
+		// Data: redacted_thinking's opaque payload, delivered whole (no
+		// deltas follow).
+		Data string `json:"data"`
 	} `json:"content_block,omitempty"`
 	Message *struct {
 		Model string        `json:"model"`
@@ -258,6 +272,12 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		blockTypes := map[int]string{}
 		toolCalls := map[int]*ai.ToolCall{}
 		var toolOrder []int
+		// reasoningBlocks/reasoningOrder capture thinking/redacted_thinking
+		// blocks verbatim (text+signature, or the opaque redacted payload),
+		// in stream order, for Event.ProviderState (see REQ:
+		// anthropic-thinking-block-replay). They are never emitted as text.
+		reasoningBlocks := map[int]*contentBlock{}
+		var reasoningOrder []int
 		for sc.Scan() {
 			line := sc.Text()
 			switch {
@@ -286,9 +306,16 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 					if se.Index != nil && se.ContentBlock != nil {
 						idx := *se.Index
 						blockTypes[idx] = se.ContentBlock.Type
-						if se.ContentBlock.Type == "tool_use" {
+						switch se.ContentBlock.Type {
+						case "tool_use":
 							toolCalls[idx] = &ai.ToolCall{ID: se.ContentBlock.ID, Name: se.ContentBlock.Name}
 							toolOrder = append(toolOrder, idx)
+						case "thinking":
+							reasoningBlocks[idx] = &contentBlock{Type: "thinking"}
+							reasoningOrder = append(reasoningOrder, idx)
+						case "redacted_thinking":
+							reasoningBlocks[idx] = &contentBlock{Type: "redacted_thinking", Data: se.ContentBlock.Data}
+							reasoningOrder = append(reasoningOrder, idx)
 						}
 					}
 				case "content_block_delta":
@@ -314,8 +341,15 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 						if call, ok := toolCalls[idx]; ok && se.Delta.PartialJSON != "" {
 							call.Arguments = append(call.Arguments, se.Delta.PartialJSON...)
 						}
-					case "thinking_delta", "signature_delta":
-						// Extended-thinking content: never emitted as text.
+					case "thinking_delta":
+						// Never emitted as text; captured for replay.
+						if blk, ok := reasoningBlocks[idx]; ok {
+							blk.Thinking += se.Delta.Thinking
+						}
+					case "signature_delta":
+						if blk, ok := reasoningBlocks[idx]; ok {
+							blk.Signature += se.Delta.Signature
+						}
 					}
 				case "content_block_stop":
 					// Nothing to do: tool_use calls are emitted together,
@@ -378,7 +412,17 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		case "max_tokens":
 			stopReason = ai.StopReasonLength
 		}
-		yield(ai.Event{Type: ai.EventCompleted, Usage: usage, StopReason: stopReason}, nil)
+		var providerState json.RawMessage
+		if len(reasoningOrder) > 0 {
+			blocks := make([]contentBlock, 0, len(reasoningOrder))
+			for _, idx := range reasoningOrder {
+				blocks = append(blocks, *reasoningBlocks[idx])
+			}
+			if b, err := json.Marshal(blocks); err == nil {
+				providerState = b
+			}
+		}
+		yield(ai.Event{Type: ai.EventCompleted, Usage: usage, StopReason: stopReason, ProviderState: providerState}, nil)
 	}
 }
 
@@ -606,6 +650,20 @@ func buildMessages(req ai.ChatRequest) []wireMessage {
 		}
 
 		var blocks []contentBlock
+		// Thinking/redacted_thinking blocks MUST precede text/tool_use in the
+		// assistant turn that produced them, and MUST be replayed unmodified
+		// (see REQ: anthropic-thinking-block-replay) — the API 400s a
+		// tool-use continuation whose thinking blocks were dropped or
+		// edited. m.ProviderState round-trips exactly what this adapter
+		// itself captured off the stream (see Stream); an adapter-neutral
+		// or foreign ProviderState that fails to unmarshal is dropped
+		// rather than sent malformed.
+		if len(m.ProviderState) > 0 {
+			var reasoning []contentBlock
+			if err := json.Unmarshal(m.ProviderState, &reasoning); err == nil {
+				blocks = append(blocks, reasoning...)
+			}
+		}
 		if m.Text != "" || len(m.ToolCalls) == 0 {
 			blocks = append(blocks, contentBlock{Type: "text", Text: m.Text})
 		}
