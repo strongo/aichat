@@ -144,20 +144,20 @@ func New(opts ...Option) *Model {
 // keystroke, SetBusy, SetStatus -- stays in sync) may well call SetSize
 // with the SAME width/height on every single frame. Unconditionally
 // re-Rebuilding on every such call, even with nothing to resize, had two
-// user-visible side effects: it silently snapped an UNFOCUSED,
-// manually-scrolled-up viewport back to the bottom every frame
-// (shouldAutoFollow() returns true whenever nothing is focused, regardless
-// of where the viewport itself currently sits -- so a wheel-up immediately
-// got undone by the next render's SetSize call), and it re-forced a
-// FOCUSED entry back into view (ensureBlockVisible) every frame too, both
-// on top of the wasted re-render cost of a no-op resize.
+// user-visible side effects: it silently snapped a manually-scrolled-up
+// viewport back to the bottom every frame, and it re-forced a FOCUSED
+// entry back into view (ensureBlockVisible) every frame too, both on top
+// of the wasted re-render cost of a no-op resize.
 //
 // When the size DOES change, the viewport's scroll position is preserved
-// UNLESS it was already at the bottom before the resize, in which case it
-// keeps following -- deliberately NOT the same rule Append/ReplaceBlock use
-// (shouldAutoFollow: unfocused OR at bottom), since a genuine resize with
-// no NEW content to show has no reason to jump an unfocused-but-scrolled-up
-// viewport back to the bottom the way new content arriving does.
+// UNLESS it was already at the bottom before the resize (checked BEFORE
+// applying the new dimensions, since AtBottom() itself depends on them), in
+// which case it keeps following -- the same "at the bottom" rule
+// shouldAutoFollow applies for Append/ReplaceBlock/AppendDelta (r4 review
+// folded the two rules back into one: shouldAutoFollow no longer treats
+// "unfocused" as its own reason to follow, so a resize with no NEW content
+// and a stream delta that IS new content now agree on exactly when
+// following is appropriate).
 func (m *Model) SetSize(width, height int) {
 	width, height = max(1, width), max(1, height)
 	if width == m.width && height == m.height {
@@ -174,9 +174,11 @@ func (m *Model) SetSize(width, height int) {
 func (m *Model) Entries() []Entry { return m.entries }
 
 // Append adds a new entry to the end of the transcript. It scrolls to the
-// bottom only when the transcript is unfocused or was already at the
-// bottom, so focusing an earlier stop to read it is not disturbed by new
-// content arriving.
+// bottom only when the viewport was already at the bottom (r4 review: NOT
+// merely "unfocused" -- an unfocused but manually scrolled-up viewport is
+// left alone too), so focusing an earlier stop to read it, or simply
+// having scrolled up to re-read something, is not disturbed by new content
+// arriving.
 func (m *Model) Append(e Entry) {
 	m.entries = append(m.entries, e)
 	m.Rebuild(m.shouldAutoFollow())
@@ -269,11 +271,23 @@ func (m *Model) InvalidateAndRebuild(id string) {
 	}
 }
 
-// shouldAutoFollow reports whether new content should scroll the viewport to
-// the bottom: when nothing in the transcript is focused (focus is on the
-// composer or sidebar) or the viewport was already scrolled to the bottom.
+// shouldAutoFollow reports whether new content (a streamed delta, a plain
+// Append, ...) should scroll the viewport to the bottom: ONLY when the
+// viewport was already at the bottom -- regardless of whether an earlier
+// stop is focused (r4 review, folding in a pre-existing gap: focus being
+// unset, i.e. focusIndex < 0, used to short-circuit this to true
+// unconditionally, which meant an UNFOCUSED but manually wheel-scrolled-up
+// viewport got yanked back to the bottom by every single streamed delta --
+// exactly the scroll-position bug REQ: transcript-setsize-idempotent-and-
+// preserves-scroll already fixed for SetSize, but this path (AppendDelta/
+// Append/ReplaceBlock/InvalidateAndRebuild) was still wrong). Being at the
+// bottom already implies nothing EARLIER is meaningfully in view either
+// way, so this one check now covers both cases correctly: focused on an
+// earlier stop and scrolled away -> false (unchanged); unfocused and
+// scrolled up -> false (the fix); either state and actually at the bottom
+// -> true (keeps following, unchanged).
 func (m *Model) shouldAutoFollow() bool {
-	return m.focusIndex < 0 || m.viewport.AtBottom()
+	return m.viewport.AtBottom()
 }
 
 // Stops returns the number of focusable entries.

@@ -86,6 +86,49 @@ func TestAppendDeltaCreatesAndAppends(t *testing.T) {
 	}
 }
 
+// --- r4 review: shouldAutoFollow must follow ONLY when the viewport was
+// already at the bottom, not whenever nothing happens to be focused --
+// otherwise a streamed delta (AppendDelta, the exact path a live response
+// uses) yanks an UNFOCUSED but manually wheel-scrolled-up reader back to
+// the bottom on every single delta. ------------------------------------------
+
+func TestAppendDeltaDoesNotAutoFollowWhenUnfocusedButScrolledUp(t *testing.T) {
+	m := New()
+	m.SetSize(20, 3)
+	m.AppendDelta("turn-1", strings.Repeat("line\n", 40))
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected to be at bottom after the initial delta")
+	}
+	bottom := m.viewport.YOffset()
+	m.ScrollUp(3) // e.g. a mouse wheel tick, nothing focused throughout
+	off := m.viewport.YOffset()
+	if off == bottom {
+		t.Fatal("ScrollUp did not move the viewport off the bottom")
+	}
+
+	// A further streamed delta must NOT yank the (still unfocused) reader
+	// back to the bottom just because nothing is focused.
+	m.AppendDelta("turn-1", "more text")
+	if got := m.viewport.YOffset(); got != off {
+		t.Fatalf("YOffset = %d after a delta while scrolled up and unfocused, want unchanged %d", got, off)
+	}
+}
+
+func TestAppendDeltaKeepsFollowingWhenAtBottom(t *testing.T) {
+	m := New()
+	m.SetSize(20, 3)
+	m.AppendDelta("turn-1", strings.Repeat("line\n", 40))
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected to be at bottom after the initial delta")
+	}
+
+	// A further delta while still at the bottom keeps following.
+	m.AppendDelta("turn-1", strings.Repeat("more\n", 5))
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected to still be at bottom after a delta arriving while already at the bottom")
+	}
+}
+
 func TestStopsCountsOnlyFocusable(t *testing.T) {
 	m := New()
 	m.SetSize(40, 10)

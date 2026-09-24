@@ -87,8 +87,11 @@ slash-command menu's height, and the busy spinner's own trailing line, so
 events firing. `transcript.Model.SetSize` is a no-op when neither dimension
 actually changed, and otherwise preserves the current scroll position
 unless the viewport was already at the bottom — without that, calling it on
-every render would itself re-snap an unfocused, wheel-scrolled-up
-transcript back to the bottom on every frame.
+every render would itself re-snap a wheel-scrolled-up transcript back to
+the bottom on every frame. The same "follow only when already at the
+bottom" rule applies to a streamed delta arriving (`AppendDelta`): being
+unfocused is no longer, by itself, a reason to snap back to the bottom, so
+scrolling up mid-stream to re-read something stays put.
 
 Chatshell keeps a single composer-draft snapshot covering BOTH the
 composer's text and its chip list together (mirroring DataTug's own
