@@ -595,3 +595,18 @@ func TestCardViewScrollsWithManyColumns(t *testing.T) {
 		t.Fatalf("scrolling back to the top did not match the original page:\nfirst=%q\nback=%q", first, backAtTop)
 	}
 }
+
+func TestSetTitleAndTitle(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithTitle("Cities"))
+	if m.Title() != "Cities" {
+		t.Fatalf("Title() = %q, want Cities", m.Title())
+	}
+	m.SetTitle("changed · Cities")
+	if m.Title() != "changed · Cities" {
+		t.Fatalf("Title() after SetTitle = %q", m.Title())
+	}
+	if view := ansi.Strip(m.View(60, true)); !strings.Contains(view, "changed") {
+		t.Fatalf("view missing updated title: %q", view)
+	}
+}

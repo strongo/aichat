@@ -190,6 +190,14 @@ func WithTitle(title string) Option {
 	return func(m *Model) { m.title = title }
 }
 
+// SetTitle changes the grid's header title after construction (e.g. a
+// version badge DataTug prefixes onto it once an HTTP refresh is compared
+// against its parent).
+func (m *Model) SetTitle(title string) { m.title = title }
+
+// Title returns the grid's current header title.
+func (m *Model) Title() string { return m.title }
+
 // WithExtraViews registers product-specific secondary views (e.g. DataTug's
 // Charts/Current-row/Raw/Headers) after the built-in table view, in the
 // given order. They are selected the same way: number keys and the header
