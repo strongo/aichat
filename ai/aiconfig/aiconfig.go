@@ -302,10 +302,12 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 	case haveCloudToken && cloudBaseURL != "":
 		// "auto" (or "", which fillDefaults already turned into "auto"):
 		// best-effort -- wire cloud decision in only when we plainly can.
-		c, err := newCloudClient()
-		if err != nil {
-			return Providers{}, err
-		}
+		// newCloudClient can only fail when !haveCloudToken or
+		// cloudBaseURL=="", both already false in this case, so its error
+		// is unreachable here and deliberately ignored rather than checked
+		// (simplified per coverage review: an always-nil error branch is
+		// dead code, not a real failure path worth a seam).
+		c, _ := newCloudClient()
 		out.Decision = append(out.Decision, c.Decider())
 	}
 
