@@ -137,12 +137,37 @@ func New(opts ...Option) *Model {
 	return m
 }
 
-// SetSize resizes the viewport and re-renders.
+// SetSize resizes the viewport and re-renders. It is a NO-OP when neither
+// dimension actually changed (r3 review, B1): a caller (e.g. chatshell's
+// View(), which re-applies its own resize() on every render so chrome that
+// changes without a WindowSizeMsg -- the slash-command menu opening by
+// keystroke, SetBusy, SetStatus -- stays in sync) may well call SetSize
+// with the SAME width/height on every single frame. Unconditionally
+// re-Rebuilding on every such call, even with nothing to resize, had two
+// user-visible side effects: it silently snapped an UNFOCUSED,
+// manually-scrolled-up viewport back to the bottom every frame
+// (shouldAutoFollow() returns true whenever nothing is focused, regardless
+// of where the viewport itself currently sits -- so a wheel-up immediately
+// got undone by the next render's SetSize call), and it re-forced a
+// FOCUSED entry back into view (ensureBlockVisible) every frame too, both
+// on top of the wasted re-render cost of a no-op resize.
+//
+// When the size DOES change, the viewport's scroll position is preserved
+// UNLESS it was already at the bottom before the resize, in which case it
+// keeps following -- deliberately NOT the same rule Append/ReplaceBlock use
+// (shouldAutoFollow: unfocused OR at bottom), since a genuine resize with
+// no NEW content to show has no reason to jump an unfocused-but-scrolled-up
+// viewport back to the bottom the way new content arriving does.
 func (m *Model) SetSize(width, height int) {
-	m.width, m.height = max(1, width), max(1, height)
+	width, height = max(1, width), max(1, height)
+	if width == m.width && height == m.height {
+		return
+	}
+	wasAtBottom := m.viewport.AtBottom()
+	m.width, m.height = width, height
 	m.viewport.SetWidth(m.width)
 	m.viewport.SetHeight(m.height)
-	m.Rebuild(m.shouldAutoFollow())
+	m.Rebuild(wasAtBottom)
 }
 
 // Entries returns the current entries (read-only use expected).

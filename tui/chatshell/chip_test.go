@@ -1,6 +1,7 @@
 package chatshell
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -797,6 +798,33 @@ func TestViewHeightMatchesTerminalHeightWithChipsAndMenu(t *testing.T) {
 // transcript's ACTUAL viewport size stale until the next one of those
 // events. View() now re-applies resize() on every call, and historyHeight
 // reserves the busy spinner's own trailing line. -----------------------------
+
+// TestWheelScrollSurvivesTheNextViewCall (r3 review, B1, closing #6's
+// regression) confirms the fix at the integration level chatshell's own
+// View() operates at: a wheel-scrolled-up transcript must stay exactly
+// where the user left it across a SUBSEQUENT View() call (the per-frame
+// resize() this REQ introduced, calling transcript.SetSize with the SAME
+// dimensions every render, must not silently snap it back to the bottom).
+func TestWheelScrollSurvivesTheNextViewCall(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	m.View() // an initial render, matching a real Bubble Tea loop
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	afterWheel := m.transcript.View()
+
+	// The next render, with nothing else having changed, must not undo
+	// the wheel scroll.
+	m.View()
+	afterNextView := m.transcript.View()
+	if afterNextView != afterWheel {
+		t.Fatalf("the transcript view changed across a same-size View() call after a wheel scroll:\nafterWheel=%q\nafterNextView=%q", afterWheel, afterNextView)
+	}
+}
 
 func TestViewHeightMatchesAfterOpeningMenuByKeystroke(t *testing.T) {
 	h := &fakeHandler{}

@@ -84,7 +84,11 @@ slash-command menu's height, and the busy spinner's own trailing line, so
 — and `View()` re-applies this sizing on every call (not only after
 `WindowSizeMsg`/`F6`/a chip change), since typing `/`, `SetBusy(true)`, and
 `SetStatus` can all change how much chrome is drawn without any of those
-events firing.
+events firing. `transcript.Model.SetSize` is a no-op when neither dimension
+actually changed, and otherwise preserves the current scroll position
+unless the viewport was already at the bottom — without that, calling it on
+every render would itself re-snap an unfocused, wheel-scrolled-up
+transcript back to the bottom on every frame.
 
 Chatshell keeps a single composer-draft snapshot covering BOTH the
 composer's text and its chip list together (mirroring DataTug's own
