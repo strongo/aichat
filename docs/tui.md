@@ -59,17 +59,29 @@ decision/query lookup); the spinner runs in its place.
 
 ## Result grid (`tui/grid`)
 
+One grid implementation, used by DataTug and Sneat Chat alike — this package
+now owns the table rendering, per-cell column selection, scrollbar, style
+presets and footer/stats that used to be duplicated in DataTug's own
+`gridState`; DataTug's `gridState` is a thin wrapper embedding a
+`*grid.Model`.
+
 | Key | Effect |
 |---|---|
-| `↑`/`↓`, `j`/`k` | Move the highlighted row |
-| `←`/`→`, `h`/`l` | Scroll columns horizontally |
-| `1`/`2`/`3` | Switch view: Table / Card / Inspector |
-| `4`.. | Switch to a `WithExtraViews`-registered view, in registration order |
-| `Tab` | Cycle the column `s` sorts by |
-| `s` | Sort (toggle ascending/descending) by the Tab-selected column |
+| `↑`/`↓`, `k` | Move the highlighted row (no `j` binding — reserved for a product's own use, e.g. DataTug's join-candidate navigation) |
+| `←`/`→`, `h`/`l` | Select a column, auto-scrolling it into view (`Model.SelectedColumn()`) |
+| `1` | Switch to the table (always view 0) |
+| `2`.. | Switch to a `WithExtraViews`/`SetExtraViews`-registered view, in registration order |
+| `Tab` | Toggle focus between the table and a split secondary view (`Model.ToggleSecondaryFocusIfSplit()`) |
+| `s` | Sort (toggle ascending/descending) by the selected column |
 | `Enter` | Emit `grid.RowActivatedMsg` for the highlighted row |
 | `+` | Emit `tui.AddToSidebarMsg` for the highlighted row's `Ref` |
 | `/` | Open bubble-table's built-in filter |
+
+`grid.WithKeyHandler(fn)` registers a product hook checked *first*, for every
+key the filter input isn't consuming; it can claim any key above (DataTug's
+Enter opens a cell-detail dialog instead of emitting `RowActivatedMsg`) plus
+its own actions with no generic-grid meaning (DataTug's
+c/r/a/d/b/B/e/q/space workspace keys).
 
 `Model.CapturesEsc()` reports true while the filter input is focused, so a
 surrounding chatshell should let Esc clear/blur the filter before treating
@@ -79,8 +91,16 @@ Esc as its own (e.g. closing the block).
 slice a `Model` was built from), not a map keyed by column name — two
 columns sharing a name (e.g. `SELECT a.id, b.id`) each keep their own value.
 Use `grid.Absent` for a cell with no value at all (a sparse selection); it
-renders differently from an explicit `nil` ("NULL"). This is a breaking
-change from the earlier `map[string]any` shape.
+renders differently from an explicit `nil` ("NULL"). A value may be a raw Go
+value (formatted by `grid.FormatValue`) or a product's own pre-formatted
+display string.
+
+There is no fixed Card/Inspector view: the table is always view 0, and
+everything else is a `WithExtraViews`/`SetExtraViews`-registered `ExtraView`,
+in whatever order a product wants. `grid.CardView`/`grid.InspectorView` are
+ready-made `ExtraView` constructors (a formatted field list and a raw-value
+dump of the highlighted row) for a product that wants one — DataTug
+registers `CardView("Current row")` third, after its own Charts view.
 
 A large result is capped to `grid.DefaultMaxVisibleRows` rows per page
 (override with `grid.WithMaxVisibleRows`) so it never renders fully into a
@@ -92,6 +112,12 @@ split-pane policy — generalising DataTug's `chooseRecordsetLayout` — with
 `grid.WithSplitLayout(...)`; `Model.NaturalWidth()` gives a `LayoutFunc` the
 table's natural (unclipped) content width to compare against the pane's
 total width.
+
+`grid.WithStyle`/`Model.SetStyle` pick a border/header color preset
+(`grid.StyleLines`/`StyleSoft`/`StyleMinimal`; `grid.ParseStyle` recovers one
+by name). `grid.WithFooterHook` lets a product append text (e.g. a
+save-status badge) to the built-in stats footer (row/column range, sort
+indicator).
 
 ## Sidebar (`tui/sidebar`)
 

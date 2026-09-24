@@ -24,7 +24,6 @@ func sampleRows() ([]Column, []Row) {
 func TestNewAndView(t *testing.T) {
 	cols, rows := sampleRows()
 	m := New(cols, rows, WithTitle("Cities"))
-	m.SetWidth(60)
 	view := ansi.Strip(m.View(60, true))
 	if !strings.Contains(view, "Cities") {
 		t.Fatalf("view missing title: %q", view)
@@ -56,6 +55,20 @@ func TestSortTogglesAscDesc(t *testing.T) {
 	m.Sort(0) // descending
 	if m.rows[0].Values[0] != 10 {
 		t.Fatalf("descending first row = %+v", m.rows[0])
+	}
+	column, desc := m.SortState()
+	if column != 0 || !desc {
+		t.Fatalf("SortState() = %d,%v want 0,true", column, desc)
+	}
+}
+
+func TestSKeySortsBySelectedColumn(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.SelectColumn(0)
+	m.Update(tea.KeyPressMsg{Text: "s", Code: 's'})
+	if m.rows[0].Values[0] != 2 {
+		t.Fatalf("ascending first row after s = %+v", m.rows[0])
 	}
 }
 
@@ -110,32 +123,54 @@ func TestUpdatePlusEmitsAddToSidebar(t *testing.T) {
 	}
 }
 
-func TestUpdateViewSwitch(t *testing.T) {
+func TestColumnNavigationSelectsAndAutoScrolls(t *testing.T) {
 	cols, rows := sampleRows()
 	m := New(cols, rows)
+	if m.SelectedColumn() != 0 {
+		t.Fatalf("initial SelectedColumn() = %d, want 0", m.SelectedColumn())
+	}
+	m.Update(tea.KeyPressMsg{Text: "l", Code: 'l'})
+	if m.SelectedColumn() != 1 {
+		t.Fatalf("SelectedColumn() after l = %d, want 1", m.SelectedColumn())
+	}
+	m.Update(tea.KeyPressMsg{Text: "h", Code: 'h'})
+	if m.SelectedColumn() != 0 {
+		t.Fatalf("SelectedColumn() after h = %d, want 0", m.SelectedColumn())
+	}
+	// h at column 0 does not go negative.
+	m.Update(tea.KeyPressMsg{Text: "h", Code: 'h'})
+	if m.SelectedColumn() != 0 {
+		t.Fatalf("SelectedColumn() clamps at 0, got %d", m.SelectedColumn())
+	}
+}
+
+func TestSelectColumnClampsAndRebuilds(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.SelectColumn(99)
+	if m.SelectedColumn() != len(cols)-1 {
+		t.Fatalf("SelectColumn(99) = %d, want %d", m.SelectedColumn(), len(cols)-1)
+	}
+}
+
+func TestCardAndInspectorViewsViaExtraViews(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(CardView(""), InspectorView("")))
 	m.Update(tea.KeyPressMsg{Text: "2", Code: '2'})
-	if m.view != ViewCard {
-		t.Fatalf("view = %v, want ViewCard", m.view)
+	if m.CurrentView() != View(firstExtraView) {
+		t.Fatalf("view after 2 = %v, want first extra view", m.CurrentView())
 	}
 	view := ansi.Strip(m.View(40, true))
 	if !strings.Contains(view, "id") {
 		t.Fatalf("card view missing field name: %q", view)
 	}
 	m.Update(tea.KeyPressMsg{Text: "3", Code: '3'})
-	if m.view != ViewInspector {
-		t.Fatalf("view = %v, want ViewInspector", m.view)
+	if m.CurrentView() != View(firstExtraView+1) {
+		t.Fatalf("view after 3 = %v, want second extra view", m.CurrentView())
 	}
-}
-
-func TestUpdateTabCyclesSortTarget(t *testing.T) {
-	cols, rows := sampleRows()
-	m := New(cols, rows)
-	if m.sortTarget != 0 {
-		t.Fatalf("initial sortTarget = %d, want 0", m.sortTarget)
-	}
-	m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
-	if m.sortTarget != 1 {
-		t.Fatalf("sortTarget after Tab = %d, want 1", m.sortTarget)
+	raw := ansi.Strip(m.View(40, true))
+	if !strings.Contains(raw, "2") {
+		t.Fatalf("inspector view missing raw value: %q", raw)
 	}
 }
 
@@ -160,7 +195,7 @@ func TestEmptyGridCurrentIndex(t *testing.T) {
 func TestRowValuesAbsentVsNull(t *testing.T) {
 	cols := []Column{{Name: "a"}, {Name: "b"}, {Name: "c"}}
 	rows := []Row{{Key: "0", Values: []any{"x", nil, Absent}}}
-	m := New(cols, rows)
+	m := New(cols, rows, WithExtraViews(CardView("")))
 	if m.cells[0][0] != "x" {
 		t.Fatalf("present value cell = %q", m.cells[0][0])
 	}
@@ -230,7 +265,6 @@ func TestMaxVisibleRowsCapsPageSize(t *testing.T) {
 	m := New(cols, rows, WithMaxVisibleRows(5))
 	m.SetWidth(20)
 	view := ansi.Strip(m.View(20, true))
-	// The 5-row page never reaches the tail of a 50-row result.
 	if strings.Contains(view, "49") {
 		t.Fatalf("view rendered rows beyond a 5-row page size cap: %q", view)
 	}
@@ -262,14 +296,13 @@ func TestExtraViewsRegisterAndSwitch(t *testing.T) {
 		},
 	}
 	m := New(cols, rows, WithExtraViews(extra))
-	m.SetWidth(60)
 	header := ansi.Strip(m.headerLine(60))
-	if !strings.Contains(header, "4 Charts") {
+	if !strings.Contains(header, "2 Charts") {
 		t.Fatalf("header missing extra view label: %q", header)
 	}
-	m.Update(tea.KeyPressMsg{Text: "4", Code: '4'})
-	if m.view != View(firstExtraView) {
-		t.Fatalf("view after pressing 4 = %v, want first extra view", m.view)
+	m.Update(tea.KeyPressMsg{Text: "2", Code: '2'})
+	if m.CurrentView() != View(firstExtraView) {
+		t.Fatalf("view after pressing 2 = %v, want first extra view", m.CurrentView())
 	}
 	view := ansi.Strip(m.View(60, true))
 	if !rendered || !strings.Contains(view, "chart body") {
@@ -292,10 +325,102 @@ func TestExtraViewUpdateHandlesKeys(t *testing.T) {
 		},
 	}
 	m := New(cols, rows, WithExtraViews(extra))
-	m.view = View(firstExtraView)
+	m.SetView(View(firstExtraView))
 	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if !handled {
 		t.Fatal("ExtraView.Update did not see the key press")
+	}
+}
+
+func TestKeyHandlerClaimsKeyFirst(t *testing.T) {
+	cols, rows := sampleRows()
+	var seen []string
+	m := New(cols, rows, WithKeyHandler(func(m *Model, msg tea.KeyPressMsg) (tea.Cmd, bool) {
+		if msg.String() == "b" {
+			seen = append(seen, "b")
+			return nil, true
+		}
+		return nil, false
+	}))
+	m.Update(tea.KeyPressMsg{Text: "b", Code: 'b'})
+	if len(seen) != 1 {
+		t.Fatalf("KeyHandler did not see 'b': %v", seen)
+	}
+	// A key it declines still reaches the grid's own default handling.
+	m.Update(tea.KeyPressMsg{Text: "s", Code: 's'})
+	if col, _ := m.SortState(); col != 0 {
+		t.Fatalf("declined key did not fall through to default sort: SortState col=%d", col)
+	}
+}
+
+func TestFooterHookAppendsToBuiltinFooter(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithFooterHook(func(m *Model, builtin string) string {
+		return builtin + " • badge"
+	}))
+	view := ansi.Strip(m.View(60, true))
+	if !strings.Contains(view, "badge") {
+		t.Fatalf("footer hook text missing: %q", view)
+	}
+}
+
+func TestStylePresetsChangeBorderColor(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithStyle(StyleMinimal))
+	if m.Style().Name != "Minimal" {
+		t.Fatalf("Style().Name = %q, want Minimal", m.Style().Name)
+	}
+	m.SetStyle(StyleSoft)
+	if m.Style().Name != "Soft" {
+		t.Fatalf("Style().Name after SetStyle = %q, want Soft", m.Style().Name)
+	}
+}
+
+func TestParseStyleFallsBackToLines(t *testing.T) {
+	if got := ParseStyle("Soft"); got.Name != "Soft" {
+		t.Fatalf("ParseStyle(Soft) = %q", got.Name)
+	}
+	if got := ParseStyle("unknown"); got.Name != "Lines" {
+		t.Fatalf("ParseStyle(unknown) = %q, want Lines", got.Name)
+	}
+}
+
+func TestIndexForKeySurvivesSort(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	if i := m.IndexForKey("0"); i != 1 {
+		t.Fatalf("IndexForKey(0) before sort = %d, want 1", i)
+	}
+	m.Sort(0) // ascending by id: Key "1" (id 2) first, then Key "0" (id 10)
+	if i := m.IndexForKey("0"); i != 1 {
+		t.Fatalf("IndexForKey(0) after sort = %d, want 1", i)
+	}
+	if i := m.IndexForKey("missing"); i != -1 {
+		t.Fatalf("IndexForKey(missing) = %d, want -1", i)
+	}
+}
+
+func TestSelectRowClamps(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.SelectRow(99)
+	if m.CurrentIndex() != len(rows)-1 {
+		t.Fatalf("SelectRow(99) CurrentIndex() = %d, want %d", m.CurrentIndex(), len(rows)-1)
+	}
+	m.SelectRow(-5)
+	if m.CurrentIndex() != 0 {
+		t.Fatalf("SelectRow(-5) CurrentIndex() = %d, want 0", m.CurrentIndex())
+	}
+}
+
+func TestCellReturnsFormattedText(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	if got := m.Cell(0, 1); got != "Prague" {
+		t.Fatalf("Cell(0,1) = %q, want Prague", got)
+	}
+	if got := m.Cell(-1, 0); got != "" {
+		t.Fatalf("Cell out of bounds = %q, want empty", got)
 	}
 }
 
@@ -319,7 +444,8 @@ func TestSplitLayoutSideBySideWhenRoomy(t *testing.T) {
 			return SplitLayout{Split: true, PrimaryWidth: 40, SecondaryWidth: totalWidth - 40}
 		}),
 	)
-	m.view = View(firstExtraView)
+	m.SetView(View(firstExtraView)) // itself consults the layout once, to decide initial secondary focus
+	layoutCalls = 0
 	body := m.body(100)
 	if layoutCalls != 1 || gotView != View(firstExtraView) {
 		t.Fatalf("layout func calls=%d view=%v", layoutCalls, gotView)
@@ -335,10 +461,58 @@ func TestSplitLayoutSideBySideWhenRoomy(t *testing.T) {
 	}
 }
 
+func TestToggleSecondaryFocusIfSplit(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows,
+		WithExtraViews(ExtraView{Label: "Charts", Render: func(m *Model, w, h int) string { return "" }}),
+		WithSplitLayout(func(totalWidth, naturalWidth int, view View) SplitLayout {
+			return SplitLayout{Split: true, PrimaryWidth: totalWidth / 2, SecondaryWidth: totalWidth / 2}
+		}),
+	)
+	m.SetWidth(100)
+	m.SetView(View(firstExtraView))
+	if m.SecondaryFocus() {
+		t.Fatal("SecondaryFocus() true right after SetView with a split layout")
+	}
+	if !m.ToggleSecondaryFocusIfSplit() {
+		t.Fatal("ToggleSecondaryFocusIfSplit() = false, want true (view is split)")
+	}
+	if !m.SecondaryFocus() {
+		t.Fatal("SecondaryFocus() false after toggling on")
+	}
+	// On the table view, toggling is always a no-op.
+	m.SetView(ViewTable)
+	if m.ToggleSecondaryFocusIfSplit() {
+		t.Fatal("ToggleSecondaryFocusIfSplit() = true on the table view")
+	}
+}
+
+func TestSetExtraViewsResetsViewIfOutOfRange(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(CardView(""), InspectorView("")))
+	m.SetView(View(firstExtraView + 1))
+	m.SetExtraViews(CardView(""))
+	if m.CurrentView() != ViewTable {
+		t.Fatalf("CurrentView() after shrinking ExtraViews = %v, want ViewTable", m.CurrentView())
+	}
+}
+
 func TestNaturalWidth(t *testing.T) {
 	cols, rows := sampleRows()
 	m := New(cols, rows)
 	if got := m.NaturalWidth(); got <= 0 {
 		t.Fatalf("NaturalWidth() = %d, want > 0", got)
+	}
+}
+
+func TestSetFocusedTogglesRebuild(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	if m.Focused() {
+		t.Fatal("Focused() true before SetFocused")
+	}
+	m.SetFocused(true)
+	if !m.Focused() {
+		t.Fatal("Focused() false after SetFocused(true)")
 	}
 }
