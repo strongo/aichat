@@ -87,6 +87,15 @@ const firstExtraView = 1
 type ExtraView struct {
 	// Label is shown in the view switcher header, e.g. "Charts".
 	Label string
+	// ShortLabel is shown instead of Label once the header is too narrow
+	// for the full text (see viewLabels) — main's own fixed forms
+	// ("Charts" → "C", "Current row" → "Row") rather than a generic
+	// N-character truncation of Label, which can make two labels
+	// indistinguishable once both are cut to the same length (e.g.
+	// "Charts"/"Current row" both truncating to "Ch"/"Cu" reads fine, but
+	// a runt truncation of arbitrary text has no such guarantee). Falls
+	// back to Label's own generic truncation when empty.
+	ShortLabel string
 	// Render draws the view's body at the given content width/height.
 	Render func(m *Model, width, height int) string
 	// Update optionally handles a key press while this view is active and
@@ -98,31 +107,32 @@ type ExtraView struct {
 
 // CardView returns an ExtraView rendering the highlighted row as a formatted
 // vertical field list (Column name / FormatValue'd value). label defaults to
-// "Current row" when empty. Ported from DataTug's recordset_views.go
-// currentRowContent (raw=false).
+// "Current row" when empty; its ShortLabel is main's own "Row". Ported from
+// DataTug's recordset_views.go currentRowContent (raw=false).
 func CardView(label string) ExtraView {
-	return rowFieldView(label, "Current row", false)
+	return rowFieldView(label, "Current row", "Row", false)
 }
 
 // InspectorView is CardView's raw-value counterpart: it renders each field's
 // Go value (%#v) instead of FormatValue's terminal-safe text. label defaults
-// to "Inspector" when empty.
+// to "Inspector" when empty, ShortLabel to "Insp".
 func InspectorView(label string) ExtraView {
-	return rowFieldView(label, "Inspector", true)
+	return rowFieldView(label, "Inspector", "Insp", true)
 }
 
 // rowFieldView builds CardView/InspectorView: the highlighted row's fields as
 // a vertical list, scrollable with up/down when the row has more fields than
 // fit the pane (each field is two lines: name, then value), and reset to the
 // top whenever the highlighted row changes.
-func rowFieldView(label, fallback string, raw bool) ExtraView {
+func rowFieldView(label, fallback, shortLabel string, raw bool) ExtraView {
 	if label == "" {
 		label = fallback
 	}
 	offset := 0
 	lastRow := -1
 	return ExtraView{
-		Label: label,
+		Label:      label,
+		ShortLabel: shortLabel,
 		Render: func(m *Model, width, height int) string {
 			rowIndex := m.CurrentIndex()
 			if rowIndex != lastRow {
@@ -144,6 +154,21 @@ func rowFieldView(label, fallback string, raw bool) ExtraView {
 				return nil, true
 			case "down", "j":
 				offset += 2
+				return nil, true
+			case "pgup":
+				offset = max(0, offset-m.paneHeight())
+				return nil, true
+			case "pgdown":
+				offset += m.paneHeight()
+				return nil, true
+			case "home":
+				offset = 0
+				return nil, true
+			case "end":
+				// Render clamps this to the last page once it knows the
+				// content's actual line count; there is no height/width
+				// parameter here to compute an exact value from.
+				offset = 1 << 30
 				return nil, true
 			}
 			return nil, false
@@ -250,6 +275,24 @@ func WithInitialSort(column int, desc bool) Option {
 	return func(m *Model) { m.sortColumn, m.sortDesc = column, desc }
 }
 
+// WithFilterDisabled turns off bubble-table's built-in "/" row filter
+// entirely — no filter typing, no CapturesEsc-while-filtering state — for a
+// grid where that isn't a meaningful operation (e.g. DataTug's bookmark,
+// dock and parameter-lookup grids, which already show a narrow, purpose-
+// built row set) or where the product wants "/" for something else.
+func WithFilterDisabled() Option {
+	return func(m *Model) { m.filterDisabled = true }
+}
+
+// WithoutViewSwitcher hides the "1 Table [· 2 Charts ...]" view-switcher
+// text from the header entirely — main's own title-only header for a grid
+// with no other views worth advertising (DataTug's bookmark, dock and
+// parameter-lookup grids). Digit keys still switch views if any are
+// registered; this only affects what the header displays.
+func WithoutViewSwitcher() Option {
+	return func(m *Model) { m.viewSwitcherHidden = true }
+}
+
 // DefaultMaxVisibleRows is the page size a Model uses when WithMaxVisibleRows
 // is not supplied.
 const DefaultMaxVisibleRows = 12
@@ -273,13 +316,15 @@ type Model struct {
 	sortDesc       bool
 	selectedColumn int
 
-	extraViews     []ExtraView
-	layout         LayoutFunc
-	maxVisibleRows int
-	keyHandler     KeyHandler
-	footerHook     FooterHook
-	style          Style
-	secondaryFocus bool
+	extraViews         []ExtraView
+	layout             LayoutFunc
+	maxVisibleRows     int
+	keyHandler         KeyHandler
+	footerHook         FooterHook
+	style              Style
+	secondaryFocus     bool
+	filterDisabled     bool
+	viewSwitcherHidden bool
 }
 
 // New builds a grid from columns and rows. Row order is preserved until the
@@ -302,8 +347,17 @@ func New(columns []Column, rows []Row, opts ...Option) *Model {
 	return m
 }
 
-func gridKeyMap() table.KeyMap {
+func (m *Model) gridKeyMap() table.KeyMap {
 	km := table.DefaultKeyMap()
+	if m.filterDisabled {
+		// A product that doesn't want bubble-table's built-in "/" filter
+		// (e.g. it isn't a meaningful operation for this particular grid,
+		// or the product has its own competing use for "/") disables it
+		// entirely — see WithFilterDisabled.
+		km.Filter = key.Binding{}
+		km.FilterBlur = key.Binding{}
+		km.FilterClear = key.Binding{}
+	}
 	// DataTug owns column navigation (h/l select a column; the grid
 	// auto-scrolls it into view). Row navigation defaults to up/k/down/j —
 	// "j" included, since a product's own KeyHandler is checked BEFORE this
@@ -427,7 +481,7 @@ func (m *Model) buildTable(width int, rowStyleFunc func(table.RowStyleFuncInput)
 		WithFooterVisibility(false).
 		WithHeaderVisibility(true).
 		Filtered(true).
-		WithKeyMap(gridKeyMap()).
+		WithKeyMap(m.gridKeyMap()).
 		Focused(focused && !m.secondaryFocus).
 		WithRowStyleFunc(rowStyleFunc)
 	if m.maxVisibleRows > 0 {
@@ -958,7 +1012,14 @@ func currentRowContent(columns []Column, rows []Row, rowIndex, width int, raw bo
 			// that was never supplied for this row (Absent, above).
 			value = "NULL"
 		case raw:
-			value = sanitize(fmt.Sprintf("%#v", v))
+			if t, ok := v.(time.Time); ok {
+				// %#v on a time.Time dumps its unexported internal fields
+				// (wall/ext/loc), not a readable date — FormatValue's full
+				// RFC3339 rendering is what "raw" should mean for a date.
+				value = sanitize(FormatValue(t))
+			} else {
+				value = sanitize(fmt.Sprintf("%#v", v))
+			}
 		default:
 			value = sanitize(FormatValue(v))
 		}

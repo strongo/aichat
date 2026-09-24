@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -452,8 +453,18 @@ func TestSplitLayoutSideBySideWhenRoomy(t *testing.T) {
 	if layoutCalls != 1 || gotView != View(firstExtraView) {
 		t.Fatalf("layout func calls=%d view=%v", layoutCalls, gotView)
 	}
-	if !strings.Contains(body, strings.Repeat("x", 60)) {
-		t.Fatalf("split body missing secondary content at expected width: %q", body)
+	// The secondary pane now gets its own bordered card (M4): a 1-cell gap
+	// plus its own 2-cell left/right border eat into the 60 cells
+	// SplitLayout allotted it, leaving 57 for the ExtraView's own content.
+	plain := ansi.Strip(body)
+	if !strings.Contains(plain, strings.Repeat("x", 57)) {
+		t.Fatalf("split body missing secondary content at expected width: %q", plain)
+	}
+	if !strings.Contains(plain, "Charts") {
+		t.Fatalf("secondary card missing its title: %q", plain)
+	}
+	if !strings.Contains(plain, "╭") || !strings.Contains(plain, "╯") {
+		t.Fatalf("secondary card missing its own border: %q", plain)
 	}
 
 	// Below the layout's own threshold, it reports no split: full width.
@@ -900,5 +911,341 @@ func TestFilterFocusSurvivesResizeWhileTyping(t *testing.T) {
 	_ = cmd
 	if got := m.table.GetCurrentFilter(); got != "Pra" {
 		t.Fatalf("filter text after typing post-resize = %q, want %q", got, "Pra")
+	}
+}
+
+// TestSplitLayoutTableShowsHighlightedRowAtPageBoundary is the regression
+// test for B1: a split layout's combined primary(table)+secondary content
+// used to be clamped to paneHeight() total lines regardless of the table's
+// own naturally-taller rendering (a header line plus paneHeight() data
+// rows, once its header/data separator is stripped) — silently clipping
+// the table's own bottommost row(s), including the highlighted one, off
+// the page. With WithMaxVisibleRows(10) and the cursor moved down to row
+// index 9 (the last row of the first 10-row page), switching to a split
+// secondary view must still show row 9 in the table pane.
+func TestSplitLayoutTableShowsHighlightedRowAtPageBoundary(t *testing.T) {
+	cols := []Column{{Name: "n"}}
+	rows := make([]Row, 20)
+	for i := range rows {
+		rows[i] = Row{Key: strconv.Itoa(i), Values: []any{"Row" + strconv.Itoa(i)}}
+	}
+	m := New(cols, rows,
+		WithMaxVisibleRows(10),
+		WithExtraViews(ExtraView{Label: "Charts", Render: func(m *Model, w, h int) string { return "chart" }}),
+		WithSplitLayout(func(totalWidth, naturalWidth int, view View) SplitLayout {
+			return SplitLayout{Split: true, PrimaryWidth: 60, SecondaryWidth: totalWidth - 60}
+		}),
+	)
+	for range 9 {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	}
+	if i := m.CurrentIndex(); i != 9 {
+		t.Fatalf("CurrentIndex() after 9x down = %d, want 9", i)
+	}
+	m.Update(tea.KeyPressMsg{Text: "2", Code: '2'})
+	if m.CurrentView() != View(firstExtraView) {
+		t.Fatalf("CurrentView() after 2 = %v, want first extra view", m.CurrentView())
+	}
+	view := ansi.Strip(m.View(160, true))
+	if !strings.Contains(view, "Row9") {
+		t.Fatalf("highlighted row 9 clipped from split table pane:\n%s", view)
+	}
+}
+
+// TestWithFilterDisabledBlocksSlash is the regression test for M3: a grid
+// built with WithFilterDisabled() must not open bubble-table's built-in
+// filter on "/" at all — restoring DataTug's pre-adoption main behaviour,
+// where "/" is deliberately not a filter shortcut for grids like bookmark/
+// dock/parameter-lookup views that already show a narrow, purpose-built
+// row set.
+func TestWithFilterDisabledBlocksSlash(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithFilterDisabled())
+	m.table = m.table.Focused(true)
+	m.table, _ = m.table.Update(tea.KeyPressMsg{Text: "/", Code: '/'})
+	if m.table.GetIsFilterInputFocused() {
+		t.Fatal("/ opened the filter despite WithFilterDisabled()")
+	}
+	if m.CapturesEsc() {
+		t.Fatal("CapturesEsc() true despite the filter never having opened")
+	}
+}
+
+// TestSecondaryCardShowsFocusBullet is the regression test for M4: a split
+// layout's secondary pane gets its own bordered card with a ●/○ focus
+// bullet reflecting m.secondaryFocus specifically — distinct from the
+// primary (table) pane's own focus cue, the outer card m.View wraps
+// everything in — so a user can tell which of the two panes Tab currently
+// routes keys to.
+func TestSecondaryCardShowsFocusBullet(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows,
+		WithExtraViews(ExtraView{Label: "Charts", Render: func(m *Model, w, h int) string { return "" }}),
+		WithSplitLayout(func(totalWidth, naturalWidth int, view View) SplitLayout {
+			return SplitLayout{Split: true, PrimaryWidth: totalWidth / 2, SecondaryWidth: totalWidth / 2}
+		}),
+	)
+	m.SetFocused(true)
+	m.SetView(View(firstExtraView))
+
+	unfocused := ansi.Strip(m.View(100, true))
+	if !strings.Contains(unfocused, "○ Charts") {
+		t.Fatalf("secondary card should show the inactive bullet while table has focus: %q", unfocused)
+	}
+	if strings.Contains(unfocused, "● Charts") {
+		t.Fatalf("secondary card should not show the active bullet while table has focus: %q", unfocused)
+	}
+
+	m.ToggleSecondaryFocusIfSplit()
+	focused := ansi.Strip(m.View(100, true))
+	if !strings.Contains(focused, "● Charts") {
+		t.Fatalf("secondary card should show the active bullet once it has focus: %q", focused)
+	}
+}
+
+// TestSortLargeIntegersExactly, TestNumericSortKeepsEqualValuesStable and
+// TestSortHandlesPartialRows are M5: 3 of the 4 sort tests ported from
+// DataTug's pre-adoption GridModel.Sort test suite (pkg/chat/grid_test.go)
+// when that logic moved into Model.Sort — the 4th
+// (TestGridModelSortTogglesAndHandlesEmpty) is already covered here by
+// TestSortTogglesAscDesc.
+
+// TestSortLargeIntegersExactly guards against float64 precision loss:
+// Sort's numeric comparator must use big.Rat on the exact display string,
+// not a float64 conversion, or values above 2^53 (where float64 can no
+// longer represent every integer exactly) can compare equal or invert.
+func TestSortLargeIntegersExactly(t *testing.T) {
+	cols := []Column{{Name: "id", Numeric: true}}
+	rows := []Row{
+		{Key: "a", Values: []any{int64(9007199254740993)}}, // 2^53 + 1
+		{Key: "b", Values: []any{int64(9007199254740992)}}, // 2^53
+	}
+	m := New(cols, rows)
+	m.Sort(0) // ascending
+	if m.rows[0].Values[0] != int64(9007199254740992) {
+		t.Fatalf("ascending rows = %+v", m.rows)
+	}
+	m.Sort(0) // descending
+	if m.rows[0].Values[0] != int64(9007199254740993) {
+		t.Fatalf("descending rows = %+v", m.rows)
+	}
+}
+
+// TestNumericSortKeepsEqualValuesStable: "2" and "2.0" are the same numeric
+// value under big.Rat comparison but different display text; sort.SliceStable
+// must keep their original relative order rather than treating a big.Rat
+// tie as license to reorder them.
+func TestNumericSortKeepsEqualValuesStable(t *testing.T) {
+	cols := []Column{{Name: "n", Numeric: true}}
+	rows := []Row{
+		{Key: "a", Values: []any{"2"}},
+		{Key: "b", Values: []any{"2.0"}},
+		{Key: "c", Values: []any{"10"}},
+	}
+	m := New(cols, rows)
+	m.Sort(0) // ascending
+	m.Sort(0) // descending
+	if m.rows[0].Values[0] != "10" || m.rows[1].Values[0] != "2" || m.rows[2].Values[0] != "2.0" {
+		t.Fatalf("descending stable rows = %+v", m.rows)
+	}
+}
+
+// TestSortHandlesPartialRows is the generalised equivalent of DataTug's
+// RawRows-desync guard: a row with fewer Values than columns (Row.value
+// returns Absent for the missing ones, sanitized to an empty display cell)
+// must sort without panicking, and — the actual regression the original
+// test caught — reordering must never desync a row's Key from its own
+// Values (each row carries both together, unlike the pre-adoption
+// GridModel's parallel Rows/RawRows arrays that could drift apart).
+func TestSortHandlesPartialRows(t *testing.T) {
+	cols := []Column{{Name: "n", Numeric: true}}
+	rows := []Row{
+		{Key: "a", Values: []any{2}},
+		{Key: "b", Values: []any{}}, // partial/sparse: no value for column 0
+		{Key: "c", Values: []any{1}},
+	}
+	m := New(cols, rows)
+	m.Sort(0) // ascending: "" (absent) sorts before any numeric text
+	if m.rows[0].Key != "b" || m.rows[1].Key != "c" || m.rows[2].Key != "a" {
+		t.Fatalf("partial-row sort order = %+v", m.rows)
+	}
+	for _, row := range m.rows {
+		switch row.Key {
+		case "a":
+			if row.value(0) != 2 {
+				t.Fatalf("row a lost its value after sort: %+v", row)
+			}
+		case "c":
+			if row.value(0) != 1 {
+				t.Fatalf("row c lost its value after sort: %+v", row)
+			}
+		case "b":
+			if row.value(0) != Absent {
+				t.Fatalf("row b should stay Absent after sort: %+v", row)
+			}
+		}
+	}
+}
+
+// TestHeaderTitleTrimmedBeforeBorder is the regression test for m7: a long
+// title truncated by headerLine (padded to width-2 for the focus bullet)
+// used to carry its own trailing padding into card()'s second truncation
+// pass (which re-fits the bulleted title against the border, 2 cells
+// narrower still), leaving a stray "… " immediately before the top-right
+// corner instead of a clean "…╮".
+func TestHeaderTitleTrimmedBeforeBorder(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithTitle(strings.Repeat("very long generated title ", 8)))
+	top := strings.Split(ansi.Strip(m.View(22, true)), "\n")[0]
+	if !strings.HasSuffix(top, "╮") {
+		t.Fatalf("top border should end at the corner: %q", top)
+	}
+	if strings.HasSuffix(strings.TrimSuffix(top, "╮"), " ") {
+		t.Fatalf("stray padding between the truncated title and the border corner: %q", top)
+	}
+}
+
+// TestCardViewPagingAndHomeEndKeys is part of m8: the current-row card
+// view must support pgup/pgdown/home/end scrolling for a row with many
+// fields, not just up/down by 2 lines at a time.
+func TestCardViewPagingAndHomeEndKeys(t *testing.T) {
+	cols := make([]Column, 20)
+	values := make([]any, 20)
+	for i := range cols {
+		cols[i] = Column{Name: "col" + strconv.Itoa(i)}
+		values[i] = "v" + strconv.Itoa(i)
+	}
+	rows := []Row{{Key: "0", Values: values}}
+	m := New(cols, rows, WithExtraViews(CardView("")), WithMaxVisibleRows(4))
+	m.SetView(View(firstExtraView))
+
+	first := ansi.Strip(m.View(40, true))
+	m.Update(tea.KeyPressMsg{Text: "end", Code: tea.KeyEnd})
+	end := ansi.Strip(m.View(40, true))
+	if end == first {
+		t.Fatal("end did not scroll the card view")
+	}
+	if !strings.Contains(end, "col19") {
+		t.Fatalf("end did not reach the last field: %q", end)
+	}
+	m.Update(tea.KeyPressMsg{Text: "home", Code: tea.KeyHome})
+	backAtTop := ansi.Strip(m.View(40, true))
+	if backAtTop != first {
+		t.Fatalf("home did not return to the top:\nfirst=%q\nback=%q", first, backAtTop)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	pagedDown := ansi.Strip(m.View(40, true))
+	if pagedDown == first {
+		t.Fatal("pgdown did not scroll the card view")
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+	pagedUp := ansi.Strip(m.View(40, true))
+	if pagedUp != first {
+		t.Fatalf("pgup did not return to the top:\nfirst=%q\nback=%q", first, pagedUp)
+	}
+}
+
+// TestInspectorViewShowsFullDateNotGoDump is part of m8: the raw/Inspector
+// view's "raw" formatting (%#v) is meant for arbitrary Go values, but for a
+// time.Time it dumps unexported internal fields instead of a readable date.
+// It should show FormatValue's full RFC3339 rendering for dates specifically.
+func TestInspectorViewShowsFullDateNotGoDump(t *testing.T) {
+	when := time.Date(2024, time.March, 5, 13, 30, 0, 0, time.UTC)
+	cols := []Column{{Name: "created"}}
+	rows := []Row{{Key: "0", Values: []any{when}}}
+	content := currentRowContent(cols, rows, 0, 60, true)
+	if !strings.Contains(content, when.Format(time.RFC3339)) {
+		t.Fatalf("raw date content = %q, want it to contain %q", content, when.Format(time.RFC3339))
+	}
+	if strings.Contains(content, "wall:") || strings.Contains(content, "time.Time{") {
+		t.Fatalf("raw date content leaked Go's internal struct dump: %q", content)
+	}
+}
+
+// TestSplitLayoutPadsNarrowTablePaneToPrimaryWidth is the regression test
+// for m2: a table with few/narrow columns renders narrower than
+// SplitLayout's PrimaryWidth budget — without padding, JoinHorizontal
+// positions the secondary pane right after that narrower content, shifting
+// it left and leaving a gap of blank cells between the secondary card and
+// the outer card's own right border, instead of the secondary card sitting
+// flush there.
+func TestSplitLayoutPadsNarrowTablePaneToPrimaryWidth(t *testing.T) {
+	cols := []Column{{Name: "id", Numeric: true}, {Name: "ok"}}
+	rows := []Row{{Key: "0", Values: []any{1, "y"}}}
+	m := New(cols, rows,
+		WithExtraViews(ExtraView{Label: "Charts", Render: func(m *Model, w, h int) string { return "" }}),
+		WithSplitLayout(func(totalWidth, naturalWidth int, view View) SplitLayout {
+			return SplitLayout{Split: true, PrimaryWidth: 40, SecondaryWidth: totalWidth - 40}
+		}),
+	)
+	m.SetView(View(firstExtraView))
+	body := m.body(100)
+	lines := strings.Split(body, "\n")
+	// Every line's secondary card must start at the same column — right
+	// after the fixed PrimaryWidth — regardless of the (much narrower)
+	// natural width of a 2-column table. Indexed by RUNE (display column),
+	// not byte: the border glyphs (╭│╰) are multi-byte UTF-8, so a
+	// byte-offset comparison would report false mismatches even when
+	// every line is correctly aligned by display column.
+	first := -1
+	for _, line := range lines {
+		runes := []rune(ansi.Strip(line))
+		col := -1
+		for i, r := range runes {
+			if r == '╭' || r == '│' || r == '╰' {
+				col = i
+				break
+			}
+		}
+		if col < 0 {
+			continue
+		}
+		if first < 0 {
+			first = col
+		} else if col != first {
+			t.Fatalf("secondary card's left edge is not aligned across lines: %d vs %d\n%s", first, col, body)
+		}
+	}
+	if first != 41 { // layout.PrimaryWidth + the 1-cell gap column
+		t.Fatalf("secondary card starts at column %d, want 41 (layout.PrimaryWidth + gap): %q", first, ansi.Strip(lines[0]))
+	}
+}
+
+// TestViewSwitcherUsesShortLabelsAtNarrowWidths is the regression test for
+// m3: a product-provided ShortLabel (e.g. DataTug's "Charts" → "C",
+// CardView's own built-in "Current row" → "Row") is used in the view
+// switcher's shortened header tiers, so two views stay visually
+// distinguishable at the width where their names would otherwise both
+// truncate to the same generic N-character prefix.
+func TestViewSwitcherUsesShortLabelsAtNarrowWidths(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(
+		ExtraView{Label: "Charts", ShortLabel: "C", Render: func(m *Model, w, h int) string { return "" }},
+		CardView(""),
+	))
+	for _, width := range []int{30, 60} {
+		header := ansi.Strip(m.HeaderLine(width))
+		if !strings.Contains(header, "2 C") {
+			t.Fatalf("width %d: header missing short Charts label: %q", width, header)
+		}
+		if !strings.Contains(header, "3 Row") {
+			t.Fatalf("width %d: header missing short Current row label: %q", width, header)
+		}
+	}
+}
+
+// TestWithoutViewSwitcherHidesSwitcherText is the regression test for m4:
+// a minimal grid (DataTug's dock/bookmark/parameter-lookup grids) never
+// had a "1 Table" view switcher in main; WithoutViewSwitcher restores a
+// title-only header instead.
+func TestWithoutViewSwitcherHidesSwitcherText(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithTitle("Bookmarks"), WithoutViewSwitcher())
+	header := ansi.Strip(m.HeaderLine(60))
+	if strings.Contains(header, "1 Table") || strings.Contains(header, "│") {
+		t.Fatalf("header still shows the view switcher: %q", header)
+	}
+	if !strings.Contains(header, "Bookmarks") {
+		t.Fatalf("header missing title: %q", header)
 	}
 }
