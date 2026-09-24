@@ -1,0 +1,718 @@
+// Package openairesponses is an ai.LLMProvider over OpenAI's Responses API
+// (POST {base}/responses, stream:true), implemented directly over net/http --
+// no vendor SDK. It mirrors ai/openaicompat's Config shape and adapter
+// conventions but speaks the Responses API's item-based input/output model
+// and SSE event set (response.created, response.output_text.delta,
+// response.function_call_arguments.delta/done, response.output_item.added/
+// done, response.completed, response.failed, response.incomplete, error)
+// instead of Chat Completions' delta/choices shape.
+package openairesponses
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/strongo/aichat/ai"
+	"github.com/strongo/aichat/ai/internal/retry"
+	"github.com/strongo/aichat/ai/internal/sse"
+)
+
+// Config configures a Provider. BaseURL and APIKey are required; Model is the
+// default used when a ChatRequest leaves Model empty or ai.ModelAuto. Same
+// shape as ai/openaicompat.Config and ai/anthropic.Config so products can
+// swap adapters without reshaping their wiring.
+type Config struct {
+	BaseURL    string
+	APIKey     string
+	Model      string
+	Headers    map[string]string
+	HTTPClient *http.Client
+}
+
+// Provider implements ai.LLMProvider over the Responses API.
+type Provider struct {
+	cfg Config
+}
+
+// marshalJSON is json.Marshal, indirected so a test can force the
+// marshal-error path deterministically -- Config/ai.ChatRequest never carry
+// a Go value json.Marshal itself rejects (chan/func/complex), so that path
+// is otherwise unreachable through the public API.
+var marshalJSON = json.Marshal
+
+// New builds a Provider. It panics if BaseURL is empty.
+func New(cfg Config) *Provider {
+	if cfg.BaseURL == "" {
+		panic("openairesponses: Config.BaseURL is required")
+	}
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = http.DefaultClient
+	}
+	return &Provider{cfg: cfg}
+}
+
+// Name implements ai.LLMProvider.
+func (p *Provider) Name() string { return "openai-responses" }
+
+// --- request wire types --------------------------------------------------
+
+// inputItem is one element of the Responses API "input" array. Type is
+// omitted for a plain message item (role+content, the API's shorthand for
+// {"type":"message", ...}); "function_call" and "function_call_output" name
+// the other two shapes this adapter emits.
+type inputItem struct {
+	Type      string `json:"type,omitempty"`
+	Role      string `json:"role,omitempty"`
+	Content   string `json:"content,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+	Output    string `json:"output,omitempty"`
+}
+
+type toolDef struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Strict      bool            `json:"strict"`
+}
+
+type namedToolChoice struct {
+	Type string `json:"type"`
+	Name string `json:"name"`
+}
+
+type reasoningOpt struct {
+	Effort string `json:"effort"`
+}
+
+type jsonSchemaFormat struct {
+	Type   string          `json:"type"`
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict"`
+}
+
+type textOpt struct {
+	Format jsonSchemaFormat `json:"format"`
+}
+
+type responseRequestBody struct {
+	Model           string      `json:"model"`
+	Input           []inputItem `json:"input"`
+	Instructions    string      `json:"instructions,omitempty"`
+	Stream          bool        `json:"stream"`
+	MaxOutputTokens int         `json:"max_output_tokens,omitempty"`
+	Tools           []toolDef   `json:"tools,omitempty"`
+	// ToolChoice is either a bare string ("auto"|"none"|"required") or a
+	// namedToolChoice{"type":"function","name":...} (Responses API keeps
+	// tool_choice flat, unlike Chat Completions' nested function object).
+	ToolChoice any           `json:"tool_choice,omitempty"`
+	Reasoning  *reasoningOpt `json:"reasoning,omitempty"`
+	Text       *textOpt      `json:"text,omitempty"`
+}
+
+// --- response wire types --------------------------------------------------
+
+type outputItem struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"` // "message" | "function_call" | ...
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+type incompleteDetails struct {
+	Reason string `json:"reason"`
+}
+
+type responseAPIError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Type    string `json:"type"`
+}
+
+type tokenDetails struct {
+	CachedTokens    int64 `json:"cached_tokens"`
+	ReasoningTokens int64 `json:"reasoning_tokens"`
+}
+
+type responseUsage struct {
+	InputTokens         int64         `json:"input_tokens"`
+	OutputTokens        int64         `json:"output_tokens"`
+	InputTokensDetails  *tokenDetails `json:"input_tokens_details,omitempty"`
+	OutputTokensDetails *tokenDetails `json:"output_tokens_details,omitempty"`
+}
+
+type responseObj struct {
+	ID                string             `json:"id"`
+	Status            string             `json:"status"`
+	Output            []outputItem       `json:"output,omitempty"`
+	Usage             *responseUsage     `json:"usage,omitempty"`
+	IncompleteDetails *incompleteDetails `json:"incomplete_details,omitempty"`
+	Error             *responseAPIError  `json:"error,omitempty"`
+}
+
+// sseEvent is the union of every field any Responses API streaming event
+// payload may carry. Only the fields relevant to Type are populated by the
+// server; this adapter reads Type first and only looks at the fields that
+// event defines (see Stream).
+type sseEvent struct {
+	Type      string       `json:"type"`
+	Response  *responseObj `json:"response,omitempty"`
+	ItemID    string       `json:"item_id,omitempty"`
+	Item      *outputItem  `json:"item,omitempty"`
+	Delta     string       `json:"delta,omitempty"`
+	Arguments string       `json:"arguments,omitempty"`
+	Code      string       `json:"code,omitempty"`
+	Message   string       `json:"message,omitempty"`
+}
+
+type apiErrorBody struct {
+	Error responseAPIError `json:"error"`
+}
+
+// Responses API SSE event type names this adapter understands. Any other
+// event type (response.in_progress, response.output_text.done,
+// response.content_part.*, reasoning/MCP/web-search/... progress events) is
+// silently ignored, per the "consumers must ignore event types they do not
+// know" clause of the ai.LLMProvider contract.
+const (
+	evResponseCreated    = "response.created"
+	evOutputTextDelta    = "response.output_text.delta"
+	evOutputItemAdded    = "response.output_item.added"
+	evOutputItemDone     = "response.output_item.done"
+	evFuncArgsDelta      = "response.function_call_arguments.delta"
+	evFuncArgsDone       = "response.function_call_arguments.done"
+	evResponseCompleted  = "response.completed"
+	evResponseFailed     = "response.failed"
+	evResponseIncomplete = "response.incomplete"
+	evError              = "error"
+)
+
+// Stream implements ai.LLMProvider.
+//
+// Fatal-error contract (see ai.LLMProvider doc): every fatal condition
+// yields exactly one final (ai.Event{Type: ai.EventError, Error: e}, e) and
+// returns; EventStarted is only yielded once the HTTP request has actually
+// succeeded. The Responses API has no wire "[DONE]" sentinel like Chat
+// Completions -- its own terminal events are response.completed (success)
+// and response.incomplete (truncated, e.g. by max_output_tokens); either
+// maps to exactly one ai.EventCompleted, so callers never see the wire-level
+// distinction the "truncation = no response.completed" doc comment on
+// ai.LLMProvider warns about.
+func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, error] {
+	return func(yield func(ai.Event, error) bool) {
+		model := req.Model
+		if model == "" || model == ai.ModelAuto {
+			model = p.cfg.Model
+		}
+
+		body := responseRequestBody{
+			Model:           model,
+			Input:           buildInput(req),
+			Instructions:    buildInstructions(req),
+			Stream:          true,
+			MaxOutputTokens: req.MaxTokens,
+		}
+		wantStructured := len(req.ResponseSchema) > 0
+		if wantStructured {
+			strict := req.StrictSchema == nil || *req.StrictSchema
+			body.Text = &textOpt{Format: jsonSchemaFormat{
+				Type:   "json_schema",
+				Name:   "response",
+				Schema: req.ResponseSchema,
+				Strict: strict,
+			}}
+		}
+		if len(req.Tools) > 0 {
+			body.Tools = make([]toolDef, len(req.Tools))
+			for i, t := range req.Tools {
+				body.Tools[i] = toolDef{
+					Type:        "function",
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters:  t.Schema,
+					Strict:      false,
+				}
+			}
+			body.ToolChoice = toolChoiceWire(req.ToolChoice)
+		}
+		if req.Reasoning != "" {
+			body.Reasoning = &reasoningOpt{Effort: req.Reasoning}
+		}
+		payload, err := marshalJSON(body)
+		if err != nil {
+			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeInvalid, Message: err.Error()})
+			return
+		}
+
+		var resp *http.Response
+		doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
+			r, e := p.doRequest(ctx, payload)
+			resp = r
+			return e
+		})
+		if doErr != nil {
+			yieldFatal(yield, toAIError(ctx, doErr))
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if !yield(ai.Event{Type: ai.EventStarted, Provider: p.Name(), Model: model}, nil) {
+			return
+		}
+
+		var structuredBuf strings.Builder
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		sc.Split(sse.ScanLines)
+		asm := newCallAssembler()
+		var usage *ai.Usage
+		sawTerminal := false
+		stopReason := ai.StopReasonEnd
+		for sc.Scan() {
+			line := sc.Text()
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "" {
+				continue
+			}
+			var ev sseEvent
+			if err := json.Unmarshal([]byte(data), &ev); err != nil {
+				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: fmt.Sprintf("openairesponses: bad event: %v", err)})
+				return
+			}
+
+			switch ev.Type {
+			case evOutputTextDelta:
+				if ev.Delta == "" {
+					continue
+				}
+				if wantStructured {
+					structuredBuf.WriteString(ev.Delta)
+				}
+				if !yield(ai.Event{Type: ai.EventTextDelta, Text: ev.Delta}, nil) {
+					return
+				}
+
+			case evOutputItemAdded:
+				if ev.Item != nil && ev.Item.Type == "function_call" {
+					asm.add(ev.Item.ID, ev.Item.CallID, ev.Item.Name)
+				}
+
+			case evFuncArgsDelta:
+				if ev.ItemID != "" && ev.Delta != "" {
+					asm.appendArgs(ev.ItemID, ev.Delta)
+				}
+
+			case evFuncArgsDone:
+				if ev.ItemID != "" && ev.Arguments != "" {
+					asm.setArgs(ev.ItemID, ev.Arguments)
+				}
+
+			case evOutputItemDone:
+				if ev.Item != nil && ev.Item.Type == "function_call" {
+					asm.finalize(ev.Item.ID, ev.Item.CallID, ev.Item.Name, ev.Item.Arguments)
+				}
+
+			case evResponseCompleted:
+				sawTerminal = true
+				if ev.Response != nil {
+					usage = usageFromWire(ev.Response.Usage)
+				}
+				if asm.len() > 0 {
+					stopReason = ai.StopReasonToolCalls
+				}
+
+			case evResponseIncomplete:
+				sawTerminal = true
+				stopReason = ai.StopReasonLength
+				if ev.Response != nil {
+					usage = usageFromWire(ev.Response.Usage)
+					if ev.Response.IncompleteDetails != nil && ev.Response.IncompleteDetails.Reason != "max_output_tokens" {
+						// Some non-length reason (e.g. a content filter) --
+						// still a completed-but-unusable turn, not a
+						// StopReasonLength one.
+						stopReason = ai.StopReasonEnd
+					}
+				}
+				if wantStructured && stopReason == ai.StopReasonLength {
+					yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "openairesponses: response truncated at max_output_tokens before a complete structured JSON object was produced"})
+					return
+				}
+
+			case evResponseFailed:
+				msg := "openairesponses: response failed"
+				if ev.Response != nil && ev.Response.Error != nil {
+					msg = ev.Response.Error.Message
+				}
+				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: msg})
+				return
+
+			case evError:
+				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: ev.Message})
+				return
+
+			default:
+				// evResponseCreated and every other event type this adapter
+				// doesn't need are ignored.
+			}
+			if sawTerminal {
+				break
+			}
+		}
+		if err := sc.Err(); err != nil {
+			yieldFatal(yield, toAIError(ctx, err))
+			return
+		}
+		if !sawTerminal {
+			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "openairesponses: stream truncated (no response.completed/response.incomplete)"})
+			return
+		}
+
+		if usage != nil {
+			if !yield(ai.Event{Type: ai.EventUsage, Usage: usage}, nil) {
+				return
+			}
+		}
+
+		if wantStructured && structuredBuf.Len() > 0 {
+			raw := extractJSON(structuredBuf.String())
+			if !yield(ai.Event{Type: ai.EventStructured, Structured: json.RawMessage(raw)}, nil) {
+				return
+			}
+		}
+
+		for _, call := range asm.calls() {
+			c := call
+			if !yield(ai.Event{Type: ai.EventToolCall, ToolCall: &c}, nil) {
+				return
+			}
+		}
+
+		yield(ai.Event{Type: ai.EventCompleted, Usage: usage, StopReason: stopReason}, nil)
+	}
+}
+
+// callAssembler accumulates response.output_item.added/
+// response.function_call_arguments.delta+done/response.output_item.done
+// events into complete ai.ToolCall values, in the order the items were
+// added. output_item.done carries the provider's own fully-assembled
+// arguments string, which finalize prefers over the locally-accumulated
+// delta buffer -- it is the authoritative source; deltas exist so a UI can
+// show live progress, not to replace it.
+type callAssembler struct {
+	order   []string
+	byID    map[string]*ai.ToolCall
+	argsBuf map[string]*strings.Builder
+}
+
+func newCallAssembler() *callAssembler {
+	return &callAssembler{byID: map[string]*ai.ToolCall{}, argsBuf: map[string]*strings.Builder{}}
+}
+
+func (a *callAssembler) add(itemID, callID, name string) {
+	if _, ok := a.byID[itemID]; ok {
+		return
+	}
+	a.byID[itemID] = &ai.ToolCall{ID: callID, Name: name}
+	a.argsBuf[itemID] = &strings.Builder{}
+	a.order = append(a.order, itemID)
+}
+
+func (a *callAssembler) appendArgs(itemID, delta string) {
+	b, ok := a.argsBuf[itemID]
+	if !ok {
+		// A delta arrived before output_item.added (not expected from the
+		// documented event order, but tolerate it rather than dropping
+		// data): synthesize the entry.
+		a.add(itemID, "", "")
+		b = a.argsBuf[itemID]
+	}
+	b.WriteString(delta)
+}
+
+func (a *callAssembler) setArgs(itemID, args string) {
+	if _, ok := a.byID[itemID]; !ok {
+		a.add(itemID, "", "")
+	}
+	a.argsBuf[itemID].Reset()
+	a.argsBuf[itemID].WriteString(args)
+}
+
+// finalize records output_item.done's authoritative call_id/name/arguments
+// for itemID, filling in whatever add()/appendArgs() had not yet captured.
+func (a *callAssembler) finalize(itemID, callID, name, arguments string) {
+	call, ok := a.byID[itemID]
+	if !ok {
+		a.add(itemID, callID, name)
+		call = a.byID[itemID]
+	}
+	if callID != "" {
+		call.ID = callID
+	}
+	if name != "" {
+		call.Name = name
+	}
+	if arguments != "" {
+		a.argsBuf[itemID].Reset()
+		a.argsBuf[itemID].WriteString(arguments)
+	}
+}
+
+func (a *callAssembler) len() int { return len(a.order) }
+
+func (a *callAssembler) calls() []ai.ToolCall {
+	out := make([]ai.ToolCall, 0, len(a.order))
+	for i, id := range a.order {
+		call := *a.byID[id]
+		if call.ID == "" {
+			// A malformed/absent call_id must not reach callers as "" --
+			// Handler dispatch and ToolResult.CallID pairing both key off
+			// it. Synthesize a stable, unique one (mirrors
+			// ai/openaicompat's toolCallAssembler.calls()).
+			call.ID = fmt.Sprintf("call_%d", i)
+		}
+		args := a.argsBuf[id].String()
+		if args == "" {
+			args = "{}"
+		}
+		call.Arguments = json.RawMessage(args)
+		out = append(out, call)
+	}
+	return out
+}
+
+func usageFromWire(u *responseUsage) *ai.Usage {
+	if u == nil {
+		return nil
+	}
+	out := &ai.Usage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens}
+	if u.InputTokensDetails != nil {
+		out.CacheReadTokens = u.InputTokensDetails.CachedTokens
+	}
+	if u.OutputTokensDetails != nil {
+		out.ReasoningTokens = u.OutputTokensDetails.ReasoningTokens
+	}
+	return out
+}
+
+// toolChoiceWire maps ai.ChatRequest.ToolChoice to the Responses API
+// tool_choice shape: "" (adapter default) and "auto"/"none"/"required" pass
+// through as bare strings, and any other value names a specific tool --
+// {"type":"function","name":...}, flat (unlike Chat Completions' nested
+// function object; see namedToolChoice).
+func toolChoiceWire(choice string) any {
+	switch choice {
+	case "", ai.ToolChoiceAuto:
+		return "auto"
+	case ai.ToolChoiceNone:
+		return "none"
+	case ai.ToolChoiceRequired:
+		return "required"
+	default:
+		return namedToolChoice{Type: "function", Name: choice}
+	}
+}
+
+// yieldFatal yields the single fatal-pair event the LLMProvider contract
+// requires and nothing else. The caller must return immediately afterward.
+func yieldFatal(yield func(ai.Event, error) bool, e *ai.Error) {
+	yield(ai.Event{Type: ai.EventError, Error: e}, e)
+}
+
+// toAIError normalises err to *ai.Error, mapping context cancellation to
+// ErrCodeCanceled (never retryable) ahead of any other classification.
+func toAIError(ctx context.Context, err error) *ai.Error {
+	var aiErr *ai.Error
+	if errors.As(err, &aiErr) {
+		if ctx.Err() != nil {
+			return &ai.Error{Code: ai.ErrCodeCanceled, Message: ctx.Err().Error()}
+		}
+		return aiErr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
+	}
+	return &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
+}
+
+func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Response, error) {
+	url := strings.TrimSuffix(p.cfg.BaseURL, "/") + "/responses"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	if p.cfg.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
+	}
+	for k, v := range p.cfg.Headers {
+		httpReq.Header.Set(k, v)
+	}
+	resp, err := p.cfg.HTTPClient.Do(httpReq)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
+		}
+		return nil, &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp, nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, _ := io.ReadAll(resp.Body)
+	return nil, httpStatusError(resp.StatusCode, b)
+}
+
+// quotaIndicators are the OpenAI error type/code values that mean the
+// account's quota/credit is exhausted rather than a transient rate limit --
+// retrying doesn't help until the account is topped up.
+var quotaIndicators = map[string]bool{
+	"insufficient_quota": true,
+}
+
+func httpStatusError(status int, body []byte) *ai.Error {
+	var apiErr apiErrorBody
+	_ = json.Unmarshal(body, &apiErr)
+	msg := apiErr.Error.Message
+	if msg == "" {
+		msg = strings.TrimSpace(string(body))
+	}
+	if msg == "" {
+		msg = "HTTP " + strconv.Itoa(status)
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return &ai.Error{Code: ai.ErrCodeAuth, Message: msg}
+	case status == http.StatusTooManyRequests:
+		if quotaIndicators[apiErr.Error.Type] || quotaIndicators[apiErr.Error.Code] {
+			return &ai.Error{Code: ai.ErrCodeQuota, Message: msg}
+		}
+		return &ai.Error{Code: ai.ErrCodeRateLimited, Message: msg, Retryable: true}
+	case status >= 500:
+		return &ai.Error{Code: ai.ErrCodeUpstream, Message: msg, Retryable: true}
+	default:
+		return &ai.Error{Code: ai.ErrCodeInvalid, Message: msg}
+	}
+}
+
+// buildInstructions renders System plus the STATIC context blocks as the
+// Responses API "instructions" field -- the same stable, cacheable prefix
+// ai/openaicompat.buildMessages renders as a leading system message.
+func buildInstructions(req ai.ChatRequest) string {
+	var sys strings.Builder
+	sys.WriteString(req.System)
+	for _, b := range req.Context {
+		if b.Kind != ai.ContextStatic {
+			continue
+		}
+		if sys.Len() > 0 {
+			sys.WriteString("\n\n")
+		}
+		if b.Name != "" {
+			sys.WriteString("# " + b.Name + "\n")
+		}
+		sys.WriteString(b.Text)
+	}
+	return sys.String()
+}
+
+// buildInput renders req.Messages as Responses API input items: user/
+// assistant message items, function_call items (one per ToolCall, carrying
+// its call_id) for an assistant message that invoked tools, and
+// function_call_output items for a RoleTool message's ToolResults. Dynamic
+// context is spliced onto the last "user" message item's content, same rule
+// as ai/openaicompat.buildMessages (see its M5 doc): never the literal last
+// item, which in a multi-step tool-calling turn can be a function_call/
+// function_call_output item by the time a later step re-renders history.
+func buildInput(req ai.ChatRequest) []inputItem {
+	items := make([]inputItem, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		if m.Role == ai.RoleTool {
+			for _, r := range m.ToolResults {
+				output := r.Content
+				if r.IsError && !strings.HasPrefix(output, "Error:") {
+					output = "Error: " + output
+				}
+				items = append(items, inputItem{Type: "function_call_output", CallID: r.CallID, Output: output})
+			}
+			continue
+		}
+		if m.Text != "" || len(m.ToolCalls) == 0 {
+			items = append(items, inputItem{Role: string(m.Role), Content: m.Text})
+		}
+		for _, tc := range m.ToolCalls {
+			args := tc.Arguments
+			if len(args) == 0 {
+				args = json.RawMessage("{}")
+			}
+			items = append(items, inputItem{
+				Type:      "function_call",
+				CallID:    tc.ID,
+				Name:      tc.Name,
+				Arguments: string(args),
+			})
+		}
+	}
+
+	if dyn := renderDynamic(req.Context); dyn != "" {
+		for i := len(items) - 1; i >= 0; i-- {
+			if items[i].Type == "" && items[i].Role == "user" {
+				items[i].Content = dyn + items[i].Content
+				break
+			}
+		}
+	}
+	return items
+}
+
+// renderDynamic renders the dynamic context blocks as a clearly delimited
+// block, or "" when there are none. Identical rendering to
+// ai/openaicompat.renderDynamic.
+func renderDynamic(blocks []ai.ContextBlock) string {
+	var dyn strings.Builder
+	for _, b := range blocks {
+		if b.Kind != ai.ContextDynamic {
+			continue
+		}
+		if dyn.Len() > 0 {
+			dyn.WriteString("\n\n")
+		}
+		if b.Name != "" {
+			dyn.WriteString("# " + b.Name + "\n")
+		}
+		dyn.WriteString(b.Text)
+	}
+	if dyn.Len() == 0 {
+		return ""
+	}
+	return "[context]\n" + dyn.String() + "\n[/context]\n\n"
+}
+
+// extractJSON tolerates a ```json fenced response, returning the JSON body.
+// Identical to ai/openaicompat.extractJSON.
+func extractJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```json")
+		s = strings.TrimPrefix(s, "```")
+		s = strings.TrimSuffix(s, "```")
+		s = strings.TrimSpace(s)
+	}
+	return s
+}

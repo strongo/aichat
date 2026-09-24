@@ -274,9 +274,14 @@ type Usage struct {
 // per-field doc on Usage) against the total it is already included in.
 // provider should be the ai.LLMProvider.Name() that produced this Usage:
 //
-//   - "openai-compatible": CacheReadTokens/ReasoningTokens are
-//     informational subsets already counted inside InputTokens/
-//     OutputTokens — Total = InputTokens + OutputTokens.
+//   - "openai-compatible" and "openai-responses": CacheReadTokens/
+//     ReasoningTokens are informational subsets already counted inside
+//     InputTokens/OutputTokens — Total = InputTokens + OutputTokens.
+//     ai/openairesponses populates them from the Responses API's
+//     usage.input_tokens_details.cached_tokens and
+//     usage.output_tokens_details.reasoning_tokens, the same subset
+//     relationship as ai/openaicompat's Chat Completions
+//     prompt_tokens_details/completion_tokens_details fields.
 //   - "anthropic" (and any other/unrecognised provider name — see below):
 //     CacheReadTokens/CacheWriteTokens are billed separately from
 //     InputTokens/OutputTokens — Total = InputTokens + OutputTokens +
@@ -292,7 +297,7 @@ type Usage struct {
 // this function doesn't know the convention of.
 func (u Usage) BillableTokens(provider string) int64 {
 	switch provider {
-	case "openai-compatible":
+	case "openai-compatible", "openai-responses":
 		return u.InputTokens + u.OutputTokens
 	default:
 		return u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens
