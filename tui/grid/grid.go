@@ -588,6 +588,19 @@ func (m *Model) ensureSelectedColumnVisible() {
 	}
 }
 
+// VisibleIndices returns the display-index range (inclusive) of the table's
+// current page, or (0, -1) with no rows.
+func (m *Model) VisibleIndices() (int, int) { return m.table.VisibleIndices() }
+
+// ColumnOffset is the index of the first horizontally-scrolled-into-view
+// column in the table.
+func (m *Model) ColumnOffset() int { return m.table.GetHorizontalScrollColumnOffset() }
+
+// TableView renders just the inner table (no card border/scrollbar/footer),
+// at the Model's last-set width, for a caller that wants to embed it in its
+// own chrome rather than grid.Model's own View.
+func (m *Model) TableView() string { return m.table.View() }
+
 // CurrentIndex returns the display index of the highlighted row, or -1 when
 // there are no rows. It is filter-aware: bubble-table's cursor indexes
 // GetVisibleRows() (the post-filter subset), so the row's hidden sourceKey
