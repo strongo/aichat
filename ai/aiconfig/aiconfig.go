@@ -77,9 +77,17 @@ type Config struct {
 
 // Default BYOK endpoints, used when BYOK.Endpoint is empty. Not cloud
 // boundary defaults -- see Cloud's doc and Deps.CloudBaseURL for that.
+//
+// The two adapters compose their request path differently, so their
+// defaults are NOT parallel strings: ai/openaicompat's path is just
+// "/chat/completions" appended to BaseURL, so BaseURL itself must already
+// include "/v1/" (OpenAI's actual API root). ai/anthropic's path is the
+// fixed "/v1/messages" appended to BaseURL, so BaseURL here must be the
+// BARE host with no "/v1" of its own -- appending it here too would
+// double it into ".../v1/v1/messages".
 const (
 	defaultOpenAIEndpoint    = "https://api.openai.com/v1/"
-	defaultAnthropicEndpoint = "https://api.anthropic.com/v1/"
+	defaultAnthropicEndpoint = "https://api.anthropic.com"
 )
 
 // Environment variable SUFFIXES ApplyEnv reads, each joined to the prefix
@@ -325,6 +333,13 @@ func buildBYOK(cfg BYOK, deps Deps) (ai.LLMProvider, error) {
 	}
 	switch protocol {
 	case "openai-compatible":
+		// ai/openaicompat has no built-in default model (unlike
+		// ai/anthropic, which falls back to a Haiku default): an empty
+		// Model here would only fail later, at request time, against the
+		// real API. Catching it now is a Build-time error instead.
+		if cfg.Model == "" {
+			return nil, fmt.Errorf("aiconfig: byok.model is required when byok.protocol is openai-compatible (no built-in default)")
+		}
 		return openaicompat.New(openaicompat.Config{
 			BaseURL:    endpoint,
 			APIKey:     apiKey,

@@ -16,7 +16,7 @@ package llmdecider
 // Kept as a static, tested constant (rather than reflected from the struct)
 // so a schema change is a visible, reviewed diff. Keep it in sync with
 // ai/decision.Decision and wireDecision; TestDecisionSchema_MatchesFields
-// and TestDecisionSchema_IsStrictValid in schema_test.go check both.
+// and TestDecisionSchema_IsStrictValid in llmdecider_test.go check both.
 const decisionSchema = `{
   "type": "object",
   "additionalProperties": false,

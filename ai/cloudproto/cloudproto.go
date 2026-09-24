@@ -30,7 +30,6 @@ package cloudproto
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,6 +38,7 @@ import (
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/decision"
+	"github.com/strongo/aichat/ai/internal/sse"
 )
 
 const (
@@ -94,7 +94,7 @@ func ReadEvents(r io.Reader) iter.Seq2[ai.Event, error] {
 	return func(yield func(ai.Event, error) bool) {
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		sc.Split(scanSSELines)
+		sc.Split(sse.ScanLines)
 		var name string
 		var data strings.Builder
 		sawTerminal := false
@@ -152,7 +152,8 @@ func ReadEvents(r io.Reader) iter.Seq2[ai.Event, error] {
 			}
 		}
 		if err := sc.Err(); err != nil {
-			yield(ai.Event{}, err)
+			aiErr := &ai.Error{Code: ai.ErrCodeUpstream, Message: fmt.Sprintf("cloudproto: transport error: %v", err)}
+			yield(ai.Event{Type: ai.EventError, Error: aiErr}, aiErr)
 			return
 		}
 		if flush() {
@@ -171,23 +172,4 @@ func known(t ai.EventType) bool {
 		return true
 	}
 	return false
-}
-
-// scanSSELines is bufio.ScanLines but also splits on a bare '\r' (some SSE
-// producers/proxies use old Mac-style line endings), not just "\n" and
-// "\r\n".
-func scanSSELines(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
-	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
-		if data[i] == '\r' && i+1 < len(data) && data[i+1] == '\n' {
-			return i + 2, data[:i], nil
-		}
-		return i + 1, data[:i], nil
-	}
-	if atEOF {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
 }

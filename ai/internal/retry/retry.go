@@ -9,6 +9,9 @@ import (
 	"context"
 	"errors"
 	"math/rand"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -83,6 +86,37 @@ func Do(ctx context.Context, cfg Config, fn func(ctx context.Context) error) err
 		}
 	}
 	return lastErr
+}
+
+// WaitOnRetryAfter blocks for the duration a 429 response's Retry-After
+// header asks for (seconds, or an HTTP-date), up to a sane cap, before the
+// caller's own retry-loop backoff runs. It never blocks past ctx
+// cancellation and silently does nothing for an empty or unparseable
+// header. Shared by every HTTP adapter (ai/openaicompat, ai/anthropic) that
+// wants to honour a server's own requested wait ahead of Do's backoff+jitter.
+func WaitOnRetryAfter(ctx context.Context, header string) {
+	if header == "" {
+		return
+	}
+	var d time.Duration
+	if secs, err := strconv.Atoi(strings.TrimSpace(header)); err == nil {
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(header); err == nil {
+		d = time.Until(t)
+	} else {
+		return
+	}
+	if d <= 0 {
+		return
+	}
+	const maxWait = 30 * time.Second
+	if d > maxWait {
+		d = maxWait
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
 }
 
 func jittered(d time.Duration, frac float64) time.Duration {

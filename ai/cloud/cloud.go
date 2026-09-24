@@ -97,9 +97,12 @@ func (d decider) Decide(ctx context.Context, req decision.Request) (decision.Dec
 // Fatal-error contract (see ai.LLMProvider doc): every fatal condition
 // yields exactly one final (ai.Event{Type: ai.EventError, Error: e}, e) and
 // returns; EventStarted is only yielded once the HTTP request has actually
-// succeeded. cloudproto.ReadEvents already conforms (an EventError frame or
-// an unterminated stream is fatal there too), so Stream relays its events
-// unchanged and only has to normalise its OWN pre-body errors the same way.
+// succeeded. cloudproto.ReadEvents already conforms (an EventError frame, a
+// transport error, or an unterminated stream are all fatal there too), so
+// Stream relays its events unchanged EXCEPT that a mid-stream failure caused
+// by ctx being done (the body read was interrupted by cancellation, not a
+// genuine transport/upstream fault) is remapped to ErrCodeCanceled here --
+// cloudproto has no ctx of its own to make that distinction itself.
 func (c *Client) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, error] {
 	return func(yield func(ai.Event, error) bool) {
 		if req.Product == "" {
@@ -124,6 +127,10 @@ func (c *Client) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Ev
 		defer func() { _ = resp.Body.Close() }()
 
 		for ev, err := range cloudproto.ReadEvents(resp.Body) {
+			if err != nil && ctx.Err() != nil {
+				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeCanceled, Message: ctx.Err().Error()})
+				return
+			}
 			if !yield(ev, err) {
 				return
 			}
@@ -279,7 +286,10 @@ func (c *Client) newRequestMethod(ctx context.Context, method, path string, payl
 	httpReq.Header.Set(cloudproto.HeaderProduct, c.cfg.Product)
 	token, err := c.cfg.Token(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("cloud: token: %w", err)
+		// A token-source failure is an auth problem, not a transport one --
+		// never retryable (retrying without fixing whatever broke the token
+		// source would just fail again the same way).
+		return nil, &ai.Error{Code: ai.ErrCodeAuth, Message: fmt.Sprintf("cloud: token: %v", err)}
 	}
 	if token != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+token)
@@ -294,9 +304,13 @@ func decodeHTTPError(resp *http.Response) error {
 		e := er.Error
 		// The HTTP status is authoritative for retryability even when the
 		// JSON body's own "retryable" was left false/omitted: a 429/5xx is
-		// always worth retrying before the first byte, regardless of
-		// whether the server remembered to say so in the body.
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		// generally worth retrying before the first byte, regardless of
+		// whether the server remembered to say so in the body -- EXCEPT
+		// ErrCodeQuota, which a 429 sometimes carries for exhausted
+		// allowance rather than a transient rate limit: retrying an
+		// exhausted quota just fails again the same way, so it is never
+		// forced retryable here.
+		if e.Code != ai.ErrCodeQuota && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
 			e.Retryable = true
 		}
 		return &e
@@ -312,7 +326,7 @@ func decodeHTTPError(resp *http.Response) error {
 		code = ai.ErrCodeAuth
 	case http.StatusTooManyRequests:
 		code, retryable = ai.ErrCodeRateLimited, true
-	case http.StatusBadRequest:
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
 		code = ai.ErrCodeInvalid
 	}
 	return &ai.Error{Code: code, Message: msg, Retryable: retryable}

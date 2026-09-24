@@ -15,10 +15,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/internal/retry"
+	"github.com/strongo/aichat/ai/internal/sse"
 )
 
 // Config configures a Provider. BaseURL and APIKey are required; Model is the
@@ -174,7 +174,7 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		var structuredBuf strings.Builder
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		sc.Split(scanSSELines)
+		sc.Split(sse.ScanLines)
 		var usage *ai.Usage
 		sawDone := false
 		for sc.Scan() {
@@ -296,38 +296,9 @@ func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Respons
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusTooManyRequests {
-		waitOnRetryAfter(ctx, resp.Header.Get("Retry-After"))
+		retry.WaitOnRetryAfter(ctx, resp.Header.Get("Retry-After"))
 	}
 	return nil, httpStatusError(resp.StatusCode, b)
-}
-
-// waitOnRetryAfter blocks for the duration a 429 response's Retry-After
-// header asks for (seconds, or an HTTP-date), up to a sane cap, before the
-// retry helper's own backoff runs. It never blocks past ctx cancellation and
-// silently does nothing for a header it can't parse.
-func waitOnRetryAfter(ctx context.Context, header string) {
-	if header == "" {
-		return
-	}
-	var d time.Duration
-	if secs, err := strconv.Atoi(strings.TrimSpace(header)); err == nil {
-		d = time.Duration(secs) * time.Second
-	} else if t, err := http.ParseTime(header); err == nil {
-		d = time.Until(t)
-	} else {
-		return
-	}
-	if d <= 0 {
-		return
-	}
-	const maxWait = 30 * time.Second
-	if d > maxWait {
-		d = maxWait
-	}
-	select {
-	case <-ctx.Done():
-	case <-time.After(d):
-	}
 }
 
 func httpStatusError(status int, body []byte) error {
@@ -421,22 +392,4 @@ func extractJSON(s string) string {
 		s = strings.TrimSpace(s)
 	}
 	return s
-}
-
-// scanSSELines is bufio.ScanLines but also splits on a bare '\r' (some SSE
-// producers use old Mac-style line endings), not just "\n" and "\r\n".
-func scanSSELines(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
-	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
-		if data[i] == '\r' && i+1 < len(data) && data[i+1] == '\n' {
-			return i + 2, data[:i], nil
-		}
-		return i + 1, data[:i], nil
-	}
-	if atEOF {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
 }

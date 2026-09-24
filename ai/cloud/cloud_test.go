@@ -199,6 +199,93 @@ func TestNewRequest_TokenError(t *testing.T) {
 	if !errors.As(err, &aiErr) || !strings.Contains(aiErr.Message, wantErr.Error()) {
 		t.Fatalf("err = %v, want an *ai.Error mentioning %v", err, wantErr)
 	}
+	// n2: a token-source failure is an auth problem, never retryable --
+	// retrying without fixing whatever broke the token source just fails
+	// the same way again.
+	if aiErr.Code != ai.ErrCodeAuth {
+		t.Errorf("Code = %q, want %q", aiErr.Code, ai.ErrCodeAuth)
+	}
+	if aiErr.Retryable {
+		t.Error("a token-source error must not be retryable")
+	}
+}
+
+func TestStream_MidStreamCancelIsCanceled(t *testing.T) {
+	started := make(chan struct{})
+	disconnected := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", cloudproto.ContentTypeSSE)
+		w.WriteHeader(http.StatusOK)
+		_ = cloudproto.WriteEvent(w, ai.Event{Type: ai.EventTextDelta, Text: "partial"})
+		w.(http.Flusher).Flush()
+		close(started)
+		<-r.Context().Done() // server observes the client disconnect
+		close(disconnected)
+	}))
+	defer srv.Close()
+	c := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+	_, _, _, err := ai.Collect(c.Stream(ctx, ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeCanceled {
+		t.Fatalf("err = %v, want ErrCodeCanceled", err)
+	}
+	if aiErr.Retryable {
+		t.Error("a cancellation must never be retryable")
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never observed the client disconnect")
+	}
+}
+
+func TestDecodeHTTPError_429QuotaNotRetryable(t *testing.T) {
+	// n3: a 429 whose body names ErrCodeQuota (allowance exhausted) must
+	// NOT be forced retryable just because the status is 429 -- retrying an
+	// exhausted quota fails the same way again.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"quota","message":"allowance exhausted"}}`))
+	}))
+	defer srv.Close()
+	c := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")})
+	_, _, _, err := ai.Collect(c.Stream(context.Background(), ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeQuota {
+		t.Fatalf("err = %v, want ErrCodeQuota", err)
+	}
+	if aiErr.Retryable {
+		t.Error("a 429 quota error must not be forced retryable")
+	}
+}
+
+func TestDecodeHTTPError_StatusMapping(t *testing.T) {
+	// n11: 404/409/422 map to ErrCodeInvalid (a client-request problem, not
+	// something retrying fixes).
+	cases := []int{http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity}
+	for _, status := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`boom`))
+		}))
+		_, _, _, err := ai.Collect(New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")}).Stream(context.Background(), ai.ChatRequest{}))
+		srv.Close()
+		var aiErr *ai.Error
+		if !errors.As(err, &aiErr) {
+			t.Fatalf("status %d: err = %v, want *ai.Error", status, err)
+		}
+		if aiErr.Code != ai.ErrCodeInvalid {
+			t.Errorf("status %d: Code = %q, want %q", status, aiErr.Code, ai.ErrCodeInvalid)
+		}
+		if aiErr.Retryable {
+			t.Errorf("status %d: must not be retryable", status)
+		}
+	}
 }
 
 func TestStream_FatalPairShape(t *testing.T) {

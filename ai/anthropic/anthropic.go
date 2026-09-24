@@ -17,6 +17,7 @@ import (
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/internal/retry"
+	"github.com/strongo/aichat/ai/internal/sse"
 )
 
 const (
@@ -162,7 +163,7 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		var usage *ai.Usage
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		sc.Split(scanSSELines)
+		sc.Split(sse.ScanLines)
 		var eventName string
 		sawStop := false
 		for sc.Scan() {
@@ -342,6 +343,9 @@ func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Respons
 	}
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		retry.WaitOnRetryAfter(ctx, resp.Header.Get("Retry-After"))
+	}
 	return nil, httpStatusError(resp.StatusCode, b)
 }
 
@@ -471,21 +475,4 @@ func extractJSON(s string) string {
 		s = strings.TrimSpace(s)
 	}
 	return s
-}
-
-// scanSSELines is bufio.ScanLines but also splits on a bare '\r'.
-func scanSSELines(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
-	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
-		if data[i] == '\r' && i+1 < len(data) && data[i+1] == '\n' {
-			return i + 2, data[:i], nil
-		}
-		return i + 1, data[:i], nil
-	}
-	if atEOF {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
 }

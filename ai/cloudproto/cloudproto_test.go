@@ -3,6 +3,7 @@ package cloudproto
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -228,6 +229,48 @@ func TestReadEvents_BareCRLineEndings(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].Text != "hi" || got[1].Type != ai.EventCompleted {
 		t.Fatalf("got = %+v, want bare-CR line endings parsed like LF", got)
+	}
+}
+
+// errAfterReader returns n bytes of data, then a fixed error on every
+// subsequent Read -- simulating a transport that dies mid-stream (a broken
+// connection, a reset, etc.).
+type errAfterReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	return 0, r.err
+}
+
+func TestReadEvents_TransportErrorIsFatalPair(t *testing.T) {
+	raw := "event: text.delta\ndata: {\"type\":\"text.delta\",\"text\":\"partial\"}\n\n"
+	r := &errAfterReader{data: []byte(raw), err: errors.New("connection reset by peer")}
+	var got []ai.Event
+	var lastErr error
+	for ev, err := range ReadEvents(r) {
+		got = append(got, ev)
+		lastErr = err
+		if err != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		t.Fatal("expected a fatal error for the transport failure")
+	}
+	last := got[len(got)-1]
+	if last.Type != ai.EventError || last.Error == nil {
+		t.Fatalf("last event = %+v, want the fatal pair Event{Type: EventError, Error: e}", last)
+	}
+	var aiErr *ai.Error
+	if !errors.As(lastErr, &aiErr) || aiErr.Code != ai.ErrCodeUpstream {
+		t.Fatalf("lastErr = %v, want an *ai.Error with Code upstream", lastErr)
 	}
 }
 

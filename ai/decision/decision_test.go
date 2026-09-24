@@ -291,7 +291,7 @@ func TestValidate_UnknownInteraction(t *testing.T) {
 }
 
 func TestValidate_ModuleOptionalForConfirmationEtc(t *testing.T) {
-	for _, ia := range []Interaction{InteractionConfirmation, InteractionRejection, InteractionCancellation, InteractionUndo} {
+	for _, ia := range []Interaction{InteractionConfirmation, InteractionRejection, InteractionCancellation, InteractionUndo, InteractionChat} {
 		d := Decision{Interaction: ia}
 		if err := Validate(d, taxonomy()); err != nil {
 			t.Errorf("interaction %q: unexpected error with empty module: %v", ia, err)

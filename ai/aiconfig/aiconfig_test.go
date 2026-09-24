@@ -2,11 +2,14 @@ package aiconfig
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/anthropic"
 	"github.com/strongo/aichat/ai/decision"
 	"github.com/strongo/aichat/ai/openaicompat"
@@ -223,13 +226,74 @@ func TestBuild_BYOKDefaultEndpoints(t *testing.T) {
 	}
 
 	cfg2 := defaults()
-	cfg2.LLM.Provider = "byok" // BYOK.Protocol left empty too -> openai-compatible default
+	cfg2.LLM.Provider = "byok"   // BYOK.Protocol left empty too -> openai-compatible default
+	cfg2.BYOK = BYOK{Model: "m"} // openai-compatible has no default model (n10): must be set
 	providers2, err := Build(cfg2, Deps{})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 	if _, ok := providers2.LLM.(*openaicompat.Provider); !ok {
 		t.Fatalf("LLM = %T, want *openaicompat.Provider using the default endpoint", providers2.LLM)
+	}
+}
+
+// roundTripFunc lets a test capture the exact request URL a provider built,
+// without touching the network or overriding the endpoint under test --
+// unlike pointing BaseURL at an httptest.Server (which never reproduces a
+// BaseURL shaped like the real default, since httptest URLs have no "/v1"
+// segment of their own to accidentally double).
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestBuild_BYOKDefaultEndpoints_ComposeCorrectPaths(t *testing.T) {
+	// B2: ai/anthropic appends the fixed "/v1/messages" to BaseURL itself,
+	// so the default BaseURL must be the BARE host -- appending "/v1/" in
+	// the default too would double it into ".../v1/v1/messages".
+	var gotURL string
+	cfg := defaults()
+	cfg.LLM.Provider = "byok"
+	cfg.BYOK = BYOK{Protocol: "anthropic"} // no Endpoint -> default
+	providers, err := Build(cfg, Deps{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotURL = r.URL.String()
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")),
+			}, nil
+		})},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	_, _, _, _ = ai.Collect(providers.LLM.Stream(context.Background(), ai.ChatRequest{}))
+	if gotURL != "https://api.anthropic.com/v1/messages" {
+		t.Errorf("anthropic request URL = %q, want %q (default endpoint must not double /v1/)", gotURL, "https://api.anthropic.com/v1/messages")
+	}
+
+	// ai/openaicompat appends only "/chat/completions", so its default
+	// BaseURL must already carry "/v1/" (OpenAI's real API root).
+	var gotURL2 string
+	cfg2 := defaults()
+	cfg2.LLM.Provider = "byok" // Protocol left empty -> openai-compatible default
+	cfg2.BYOK = BYOK{Model: "m"}
+	providers2, err := Build(cfg2, Deps{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotURL2 = r.URL.String()
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+			}, nil
+		})},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	_, _, _, _ = ai.Collect(providers2.LLM.Stream(context.Background(), ai.ChatRequest{}))
+	if gotURL2 != "https://api.openai.com/v1/chat/completions" {
+		t.Errorf("openaicompat request URL = %q, want %q", gotURL2, "https://api.openai.com/v1/chat/completions")
 	}
 }
 
@@ -246,10 +310,35 @@ func TestBuild_EmptyAPIKeyEnvValueErrors(t *testing.T) {
 func TestBuild_NoAPIKeyEnvConfiguredIsFine(t *testing.T) {
 	cfg := defaults()
 	cfg.LLM.Provider = "byok"
-	cfg.BYOK = BYOK{Endpoint: "https://x"} // no APIKeyEnv at all
+	cfg.BYOK = BYOK{Endpoint: "https://x", Model: "m"} // no APIKeyEnv at all
 	_, err := Build(cfg, Deps{})
 	if err != nil {
 		t.Fatalf("Build: %v, want success when no key is configured at all", err)
+	}
+}
+
+func TestBuild_OpenAICompatibleEmptyModelErrors(t *testing.T) {
+	// n10: ai/openaicompat has no built-in default model (unlike
+	// ai/anthropic), so an empty Model must be a Build-time error rather
+	// than a failure deferred to the first real request.
+	cfg := defaults()
+	cfg.LLM.Provider = "byok"
+	cfg.BYOK = BYOK{Protocol: "openai-compatible", Endpoint: "https://x"} // no Model
+	_, err := Build(cfg, Deps{})
+	if err == nil {
+		t.Fatal("expected an error for an empty byok.model with byok.protocol=openai-compatible")
+	}
+}
+
+func TestBuild_AnthropicEmptyModelIsFine(t *testing.T) {
+	// Anthropic has a built-in default model, so an empty Model is not an
+	// error there.
+	cfg := defaults()
+	cfg.LLM.Provider = "byok"
+	cfg.BYOK = BYOK{Protocol: "anthropic", Endpoint: "https://x"} // no Model
+	_, err := Build(cfg, Deps{})
+	if err != nil {
+		t.Fatalf("Build: %v, want success: anthropic has a default model", err)
 	}
 }
 
@@ -345,7 +434,7 @@ func TestBuild_DecisionAutoWithoutTokenSkipsCloud(t *testing.T) {
 func TestBuild_DecisionAutoWithoutTokenButBYOKLLM(t *testing.T) {
 	cfg := defaults()
 	cfg.LLM.Provider = "byok"
-	cfg.BYOK = BYOK{Endpoint: "https://x"}
+	cfg.BYOK = BYOK{Endpoint: "https://x", Model: "m"}
 	providers, err := Build(cfg, Deps{})
 	if err != nil {
 		t.Fatalf("Build: %v", err)

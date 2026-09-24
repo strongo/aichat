@@ -111,14 +111,16 @@ type Provider interface {
 
 // moduleOptionalInteractions is the set of Interaction values that make
 // sense with no Module/Intent at all -- "Yes", "No", "Cancel", "Undo that"
-// answer the PREVIOUS turn's pending action rather than naming a module, so
-// a deterministic rules.Provider handling them has nothing module-shaped to
-// report. See REQ: rules-friendly-validation.
+// answer the PREVIOUS turn's pending action rather than naming a module, and
+// plain chat ("How's it going?", "thanks!") isn't routed to any product
+// module at all -- so none of them has anything module-shaped to report.
+// See REQ: rules-friendly-validation.
 var moduleOptionalInteractions = map[Interaction]bool{
 	InteractionConfirmation: true,
 	InteractionRejection:    true,
 	InteractionCancellation: true,
 	InteractionUndo:         true,
+	InteractionChat:         true,
 }
 
 // knownInteractions is the full Interaction enum.

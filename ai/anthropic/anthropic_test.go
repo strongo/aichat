@@ -407,6 +407,37 @@ func TestStream_CtxCancelMidBodyIsCanceled(t *testing.T) {
 	}
 }
 
+func TestStream_RetryAfterHonouredOn429(t *testing.T) {
+	attempts := 0
+	var firstAttempt, secondAttempt time.Time
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			firstAttempt = time.Now()
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"slow down"}}`))
+			return
+		}
+		secondAttempt = time.Now()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if secondAttempt.Sub(firstAttempt) < 900*time.Millisecond {
+		t.Errorf("retry happened after %v, want >= ~1s (Retry-After: 1)", secondAttempt.Sub(firstAttempt))
+	}
+}
+
 func TestNew_PanicsWithoutBaseURL(t *testing.T) {
 	defer func() {
 		if recover() == nil {
