@@ -28,3 +28,20 @@ jobs:
       disable-version-bumping: false
       code_coverage: true
       min_test_coverage_percent: 100
+
+  full_statement_coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Fail on any statement with zero coverage
+        # strongo_workflow's min_test_coverage_percent gate compares the
+        # 1-decimal "total:" percentage go tool cover -func prints, which
+        # rounds and so isn't a literal 100% gate. This job checks the raw
+        # coverage profile directly: cover.out's per-block lines end in a
+        # count, and any count of 0 means that statement never ran.
+        run: |
+          go test -coverprofile=cover.out ./...
+          awk 'NR>1 && $NF==0 {print; bad=1} END{exit bad}' cover.out
