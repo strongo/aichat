@@ -368,6 +368,189 @@ func TestStopForIDIgnoresNonFocusableEntry(t *testing.T) {
 	}
 }
 
+func TestNewAppliesConstructionOptions(t *testing.T) {
+	var gotWidth int
+	m := New(WithMarkdownRenderer(func(text string, width int) string {
+		gotWidth = width
+		return "R:" + text
+	}))
+	m.SetSize(30, 5)
+	m.Append(Entry{Role: RoleAssistant, Text: "hi", Markdown: true})
+
+	if !strings.Contains(m.View(), "R:hi") {
+		t.Fatalf("View() = %q, want the WithMarkdownRenderer option applied via New", m.View())
+	}
+	if gotWidth <= 0 {
+		t.Errorf("renderer width = %d, want > 0", gotWidth)
+	}
+}
+
+func TestEntryIndexForStopOutOfRangeReturnsMinusOne(t *testing.T) {
+	m := New()
+	m.Append(Entry{Block: &fakeBlock{label: "a"}})
+	if got := m.entryIndexForStop(5); got != -1 {
+		t.Fatalf("entryIndexForStop(5) = %d, want -1 (only one stop exists)", got)
+	}
+}
+
+// plainBlock is a Block that does NOT implement EntityBlock.
+type plainBlock struct{}
+
+func (plainBlock) View(width int, focused bool) string { return "plain" }
+func (plainBlock) Update(msg tea.Msg) (Block, tea.Cmd) { return plainBlock{}, nil }
+func (plainBlock) Focusable() bool                     { return true }
+
+func TestCurrentReturnsNilWhenFocusedBlockIsNotEntityBlock(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{Block: plainBlock{}})
+	m.Focus(0)
+	if got := m.Current(); got != nil {
+		t.Fatalf("Current() = %v, want nil for a block that does not implement EntityBlock", got)
+	}
+}
+
+// cmdBlock is a Block whose Update returns a non-nil tea.Cmd, so broadcast
+// has something to batch.
+type cmdBlock struct{ fakeBlock }
+
+func (b *cmdBlock) Update(msg tea.Msg) (Block, tea.Cmd) {
+	b.updates++
+	return b, func() tea.Msg { return "cmd-ran" }
+}
+
+func TestBroadcastSkipsNilBlockEntriesAndBatchesNonNilCmds(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{Role: RoleUser, Text: "no block here"}) // nil Block: must be skipped
+	cb := &cmdBlock{fakeBlock: fakeBlock{label: "c"}}
+	m.Append(Entry{Block: cb})
+
+	cmd := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	if cb.updates != 1 {
+		t.Fatalf("cmdBlock.updates = %d, want 1", cb.updates)
+	}
+	if cmd == nil {
+		t.Fatal("Update should return a non-nil batched cmd when a block returns one")
+	}
+}
+
+func TestUserCardViewFocusedAppliesBoldStyle(t *testing.T) {
+	unfocused := userCardView("hello", 20, false)
+	focused := userCardView("hello", 20, true)
+	if unfocused == focused {
+		t.Fatalf("expected focused rendering to differ from unfocused: %q", unfocused)
+	}
+	if !strings.Contains(unfocused, "hello") || !strings.Contains(focused, "hello") {
+		t.Fatalf("expected both renderings to contain the text: %q / %q", unfocused, focused)
+	}
+}
+
+func TestRenderedLineCountEmptyBlockIsOneLine(t *testing.T) {
+	if got := renderedLineCount("", 20); got != 1 {
+		t.Fatalf("renderedLineCount(\"\", 20) = %d, want 1", got)
+	}
+}
+
+func TestRenderedLineCountZeroWidthCountsRawLines(t *testing.T) {
+	if got := renderedLineCount("one\ntwo", 0); got != 2 {
+		t.Fatalf("renderedLineCount with width<=0 = %d, want 2 (one line per raw line)", got)
+	}
+}
+
+func TestEnsureBlockVisibleContextHeightFallsBackWhenBlockFillsViewport(t *testing.T) {
+	m := New()
+	m.SetSize(20, 3)
+	blocks := []string{
+		"short",
+		strings.Repeat("x\n", 4), // renders taller than the 3-line viewport
+	}
+	// Directly drive the scrolling helper: blockIndex 1's height (>= the
+	// viewport height) drives contextHeight to 0 via the primary formula,
+	// which must fall back to the min(previousSpan, max(2, height/3)) branch
+	// instead of leaving no context at all.
+	m.ensureBlockVisible(blocks, 1)
+	if got := m.viewport.YOffset(); got != 0 {
+		t.Fatalf("YOffset = %d, want 0 (target clamped to 0 by the fallback context height)", got)
+	}
+}
+
+func TestAppendDeltaNoRenderAccumulatesTextWithoutRebuilding(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.AppendDelta("turn-1", "Hel") // creates + renders the entry
+	before := m.View()
+	if !strings.Contains(before, "Hel") {
+		t.Fatalf("initial view missing text: %q", before)
+	}
+
+	m.AppendDeltaNoRender("turn-1", "lo")
+
+	if got := m.Entries()[0].Text; got != "Hello" {
+		t.Fatalf("text = %q, want Hello (AppendDeltaNoRender should still accumulate text)", got)
+	}
+	if !m.Entries()[0].renderValid {
+		t.Fatal("AppendDeltaNoRender must NOT invalidate the cached render")
+	}
+	// The viewport's rendered content must be untouched: the new text is not
+	// yet visible because no Rebuild happened.
+	if after := m.View(); after != before || strings.Contains(after, "Hello") {
+		t.Fatalf("AppendDeltaNoRender triggered a render: before=%q after=%q", before, after)
+	}
+}
+
+func TestAppendDeltaNoRenderCreatesEntryOnFirstUse(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.AppendDeltaNoRender("turn-1", "Hi")
+
+	if len(m.Entries()) != 1 {
+		t.Fatalf("entries = %d, want 1", len(m.Entries()))
+	}
+	e := m.Entries()[0]
+	if e.Role != RoleAssistant || e.Text != "Hi" {
+		t.Fatalf("entry = %+v, want assistant/Hi", e)
+	}
+	// The viewport must not show the accumulated text until a Rebuild
+	// (e.g. via InvalidateAndRebuild) happens.
+	if strings.Contains(m.View(), "Hi") {
+		t.Fatalf("AppendDeltaNoRender rendered without a Rebuild: %q", m.View())
+	}
+}
+
+func TestInvalidateAndRebuildRendersAccumulatedDeltas(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.AppendDeltaNoRender("turn-1", "Hel")
+	m.AppendDeltaNoRender("turn-1", "lo")
+	if strings.Contains(m.View(), "Hello") {
+		t.Fatal("text should not be visible before InvalidateAndRebuild")
+	}
+
+	m.InvalidateAndRebuild("turn-1")
+
+	if !strings.Contains(m.View(), "Hello") {
+		t.Fatalf("InvalidateAndRebuild did not render accumulated text: %q", m.View())
+	}
+	if !m.Entries()[0].renderValid {
+		t.Fatal("InvalidateAndRebuild should leave the entry's cache valid after rendering")
+	}
+}
+
+func TestInvalidateAndRebuildUnknownIDIsNoop(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{Role: RoleUser, Text: "hello"})
+	before := m.View()
+
+	m.InvalidateAndRebuild("nope")
+
+	if got := m.View(); got != before {
+		t.Fatalf("InvalidateAndRebuild for an unknown id changed the view: before=%q after=%q", before, got)
+	}
+}
+
 func TestSetMarkdownRendererAppliesAfterConstruction(t *testing.T) {
 	m := New()
 	m.SetSize(40, 10)
