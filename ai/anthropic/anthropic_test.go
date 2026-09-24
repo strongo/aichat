@@ -540,3 +540,132 @@ func TestNew_PanicsWithoutBaseURL(t *testing.T) {
 	}()
 	New(Config{})
 }
+
+func TestStream_ToolCallsAssembledFromInputJSONDeltasTwoParallel(t *testing.T) {
+	var gotBody messagesRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "message_start", `{"type":"message_start","message":{"model":"claude-haiku-4-5-20251001","usage":{"input_tokens":10}}}`)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_a","name":"run_dtql"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"sql\":"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"select 1\"}"}}`)
+		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_b","name":"find_bookmarks"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"x\"}"}}`)
+		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":1}`)
+		sseWrite(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":8}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-haiku-4-5-20251001"})
+	req := ai.ChatRequest{
+		Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+		Tools: []ai.Tool{
+			{Name: "run_dtql", Schema: json.RawMessage(`{"type":"object"}`)},
+			{Name: "find_bookmarks", Schema: json.RawMessage(`{"type":"object"}`)},
+		},
+		ToolChoice: ai.ToolChoiceAuto,
+	}
+
+	var calls []ai.ToolCall
+	var stopReason string
+	for ev, err := range p.Stream(context.Background(), req) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		switch ev.Type {
+		case ai.EventToolCall:
+			calls = append(calls, *ev.ToolCall)
+		case ai.EventCompleted:
+			stopReason = ev.StopReason
+		}
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("got %d tool calls, want 2: %+v", len(calls), calls)
+	}
+	if calls[0].ID != "call_a" || calls[0].Name != "run_dtql" || string(calls[0].Arguments) != `{"sql":"select 1"}` {
+		t.Errorf("call[0] = %+v", calls[0])
+	}
+	if calls[1].ID != "call_b" || calls[1].Name != "find_bookmarks" || string(calls[1].Arguments) != `{"q":"x"}` {
+		t.Errorf("call[1] = %+v", calls[1])
+	}
+	if stopReason != ai.StopReasonToolCalls {
+		t.Errorf("StopReason = %q, want %q", stopReason, ai.StopReasonToolCalls)
+	}
+	if gotBody.ToolChoice == nil || gotBody.ToolChoice.Type != "auto" {
+		t.Errorf("tool_choice = %+v, want auto", gotBody.ToolChoice)
+	}
+	if len(gotBody.Tools) != 2 || gotBody.Tools[0].Name != "run_dtql" {
+		t.Errorf("tools = %+v", gotBody.Tools)
+	}
+}
+
+func TestStream_ToolResultMessagesMergedAndReasoningSetsThinkingBudget(t *testing.T) {
+	var gotBody messagesRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"done"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-haiku-4-5-20251001"})
+	req := ai.ChatRequest{
+		Reasoning: ai.ReasoningMedium,
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{
+				{ID: "call_a", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 1"}`)},
+				{ID: "call_b", Name: "find_bookmarks", Arguments: json.RawMessage(`{}`)},
+			}},
+			// Two consecutive RoleTool source messages must merge into ONE
+			// wire "user" message.
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_a", Content: "1 row"}}},
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_b", Content: "not found", IsError: true}}},
+		},
+	}
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	if len(gotBody.Messages) != 3 {
+		t.Fatalf("got %d wire messages, want 3 (user, assistant tool_use, merged user tool_result): %+v", len(gotBody.Messages), gotBody.Messages)
+	}
+	asst := gotBody.Messages[1]
+	if asst.Role != "assistant" || len(asst.Content) != 2 {
+		t.Fatalf("assistant message = %+v", asst)
+	}
+	if asst.Content[0].Type != "tool_use" || asst.Content[0].ID != "call_a" {
+		t.Errorf("assistant block[0] = %+v", asst.Content[0])
+	}
+	merged := gotBody.Messages[2]
+	if merged.Role != "user" || len(merged.Content) != 2 {
+		t.Fatalf("merged tool_result message = %+v", merged)
+	}
+	if merged.Content[0].ToolUseID != "call_a" || merged.Content[0].Content != "1 row" || merged.Content[0].IsError {
+		t.Errorf("tool_result[0] = %+v", merged.Content[0])
+	}
+	if merged.Content[1].ToolUseID != "call_b" || !merged.Content[1].IsError {
+		t.Errorf("tool_result[1] = %+v", merged.Content[1])
+	}
+
+	if gotBody.Thinking == nil || gotBody.Thinking.Type != "enabled" || gotBody.Thinking.BudgetTokens != 4096 {
+		t.Errorf("thinking = %+v, want enabled/4096", gotBody.Thinking)
+	}
+	if gotBody.MaxTokens <= gotBody.Thinking.BudgetTokens {
+		t.Errorf("MaxTokens = %d, want > budget_tokens %d", gotBody.MaxTokens, gotBody.Thinking.BudgetTokens)
+	}
+}

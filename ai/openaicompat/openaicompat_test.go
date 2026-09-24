@@ -562,3 +562,142 @@ func TestStream_NoRetryAfterWaitOnLastAttempt(t *testing.T) {
 		t.Errorf("elapsed = %v, want >= ~4s (Retry-After honoured on the two non-final attempts)", elapsed)
 	}
 }
+
+// mustChunk builds one streamed chat-completion chunk carrying a single
+// argument-fragment delta.tool_calls entry at index, JSON-marshalled so
+// argument text needing escaping (quotes, braces) is never hand-escaped in a
+// test fixture.
+func mustChunk(t *testing.T, index int, argsFragment string) string {
+	t.Helper()
+	type fn struct {
+		Arguments string `json:"arguments"`
+	}
+	type tc struct {
+		Index    int `json:"index"`
+		Function fn  `json:"function"`
+	}
+	type delta struct {
+		ToolCalls []tc `json:"tool_calls"`
+	}
+	type choice struct {
+		Delta delta `json:"delta"`
+	}
+	type chunk struct {
+		Model   string   `json:"model"`
+		Choices []choice `json:"choices"`
+	}
+	b, err := json.Marshal(chunk{Model: "gpt-5", Choices: []choice{{Delta: delta{ToolCalls: []tc{{Index: index, Function: fn{Arguments: argsFragment}}}}}}})
+	if err != nil {
+		t.Fatalf("mustChunk: %v", err)
+	}
+	return string(b)
+}
+
+func TestStream_ToolCallsAssembledFromMultiChunkParallelDeltas(t *testing.T) {
+	var gotBody chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// Two parallel calls (index 0 and 1); id/name arrive on the first
+		// chunk for each index, arguments arrive concatenated across chunks.
+		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"run_dtql","arguments":""}}]}}]}`)
+		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"find_bookmarks","arguments":""}}]}}]}`)
+		sseWrite(w, mustChunk(t, 0, `{"sql":`))
+		sseWrite(w, mustChunk(t, 0, `"select 1"}`))
+		sseWrite(w, mustChunk(t, 1, `{"q":"x"}`))
+		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, Model: "gpt-5"})
+	req := ai.ChatRequest{
+		Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+		Tools: []ai.Tool{
+			{Name: "run_dtql", Description: "run a query", Schema: json.RawMessage(`{"type":"object"}`)},
+			{Name: "find_bookmarks", Schema: json.RawMessage(`{"type":"object"}`)},
+		},
+		ToolChoice: ai.ToolChoiceAuto,
+	}
+
+	var calls []ai.ToolCall
+	var stopReason string
+	for ev, err := range p.Stream(context.Background(), req) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		switch ev.Type {
+		case ai.EventToolCall:
+			calls = append(calls, *ev.ToolCall)
+		case ai.EventCompleted:
+			stopReason = ev.StopReason
+		}
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("got %d tool calls, want 2: %+v", len(calls), calls)
+	}
+	if calls[0].ID != "call_a" || calls[0].Name != "run_dtql" || string(calls[0].Arguments) != `{"sql":"select 1"}` {
+		t.Errorf("call[0] = %+v", calls[0])
+	}
+	if calls[1].ID != "call_b" || calls[1].Name != "find_bookmarks" || string(calls[1].Arguments) != `{"q":"x"}` {
+		t.Errorf("call[1] = %+v", calls[1])
+	}
+	if stopReason != ai.StopReasonToolCalls {
+		t.Errorf("StopReason = %q, want %q", stopReason, ai.StopReasonToolCalls)
+	}
+	if gotBody.ToolChoice != "auto" {
+		t.Errorf("tool_choice = %v, want auto", gotBody.ToolChoice)
+	}
+	if len(gotBody.Tools) != 2 || gotBody.Tools[0].Function.Name != "run_dtql" {
+		t.Errorf("tools = %+v", gotBody.Tools)
+	}
+}
+
+func TestStream_ToolMessagesRoundTripInRequestBody(t *testing.T) {
+	var gotBody chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, Model: "gpt-5"})
+	req := ai.ChatRequest{
+		Reasoning: ai.ReasoningHigh,
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_a", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 1"}`)}}},
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_a", Content: "1 row"}}},
+		},
+	}
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	if len(gotBody.Messages) != 3 {
+		t.Fatalf("got %d messages, want 3: %+v", len(gotBody.Messages), gotBody.Messages)
+	}
+	asst := gotBody.Messages[1]
+	if asst.Role != "assistant" || len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "call_a" || asst.ToolCalls[0].Function.Name != "run_dtql" {
+		t.Errorf("assistant message = %+v", asst)
+	}
+	toolMsg := gotBody.Messages[2]
+	if toolMsg.Role != "tool" || toolMsg.ToolCallID != "call_a" || toolMsg.Content != "1 row" {
+		t.Errorf("tool message = %+v", toolMsg)
+	}
+	if gotBody.ReasoningEffort != "high" {
+		t.Errorf("reasoning_effort = %q, want high", gotBody.ReasoningEffort)
+	}
+}
