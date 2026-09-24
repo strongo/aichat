@@ -94,6 +94,11 @@ func Do(ctx context.Context, cfg Config, fn func(ctx context.Context) error) err
 	return lastErr
 }
 
+// waitOnRetryAfterSleep is time.After, overridable in tests so
+// WaitOnRetryAfter's select loop can be exercised without a real
+// multi-second sleep. The public API signature is unchanged.
+var waitOnRetryAfterSleep = time.After
+
 // WaitOnRetryAfter blocks for the duration a 429 response's Retry-After
 // header asks for (seconds, or an HTTP-date), up to a sane cap, before the
 // caller's own retry-loop backoff runs. It never blocks past ctx
@@ -121,7 +126,7 @@ func WaitOnRetryAfter(ctx context.Context, header string) {
 	}
 	select {
 	case <-ctx.Done():
-	case <-time.After(d):
+	case <-waitOnRetryAfterSleep(d):
 	}
 }
 
