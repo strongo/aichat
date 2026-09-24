@@ -71,15 +71,20 @@ tables/files staged as context for the next turn (ported from
 datatug-cli#291's attachment chips, matched step for step against DataTug's
 own `TestComposerAttachmentChipsCanBeFocusedClearedAndRestored`). `Chip{ID,
 Label string; Ref *session.EntityRef}` is product-neutral: `Ref` carries the
-product's own entity identity when the chip has one. `RemoveChip(id string)`
-and `ClearChips()` are product-facing equivalents of a focused-chip removal
+product's own entity identity when the chip has one. `RemoveChip(id string)
+(tea.Cmd, bool)` (the bool reports whether that ID was found) and
+`ClearChips()` are product-facing equivalents of a focused-chip removal
 and Esc's chip-clear step below, for a product's own UI controls. The
 transcript viewport's height shrinks by exactly the number of rendered chip
 rows, and grows back as chips are removed, so the layout never overflows —
 `historyHeight()` also accounts for the top bar's actual rendered height (a
-product's `WithTopBar` may render more than one line) and the open
-slash-command menu's height, so `View()`'s total rendered height always
-equals the terminal height exactly.
+product's `WithTopBar` may render more than one line), the open
+slash-command menu's height, and the busy spinner's own trailing line, so
+`View()`'s total rendered height always equals the terminal height exactly
+— and `View()` re-applies this sizing on every call (not only after
+`WindowSizeMsg`/`F6`/a chip change), since typing `/`, `SetBusy(true)`, and
+`SetStatus` can all change how much chrome is drawn without any of those
+events firing.
 
 Chatshell keeps a single composer-draft snapshot covering BOTH the
 composer's text and its chip list together (mirroring DataTug's own

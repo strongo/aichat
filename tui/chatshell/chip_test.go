@@ -287,7 +287,9 @@ func TestRemoveChipByID(t *testing.T) {
 	h := &chipHandler{}
 	m := newTestShell(h)
 	m.SetChips(threeChips())
-	m.RemoveChip("b")
+	if _, ok := m.RemoveChip("b"); !ok {
+		t.Fatal("RemoveChip(\"b\") should report found=true")
+	}
 	got := m.Chips()
 	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "c" {
 		t.Fatalf("Chips() = %+v", got)
@@ -296,8 +298,8 @@ func TestRemoveChipByID(t *testing.T) {
 		t.Fatal("RemoveChip should snapshot like any other removal")
 	}
 	// An unknown ID is a documented no-op.
-	if cmd := m.RemoveChip("nope"); cmd != nil {
-		t.Fatal("RemoveChip(unknown) should return nil")
+	if cmd, ok := m.RemoveChip("nope"); cmd != nil || ok {
+		t.Fatal("RemoveChip(unknown) should return (nil, false)")
 	}
 	if len(m.Chips()) != 2 {
 		t.Fatalf("Chips() = %+v, want unchanged for an unknown ID", m.Chips())
@@ -672,6 +674,52 @@ func TestHistoryHeightShrinksAsChipRowsAppearAndGrowsBackAsTheyClear(t *testing.
 	}
 }
 
+// TestComposerShrinksAsWrappedAttachmentsAreRemoved (m2, r2 review) is an
+// exact port of DataTug's own test of the same name
+// (origin/main:pkg/chat/workspace_test.go): width 62, three long chip
+// labels wrapping across two rows, the third (second-row) chip removed
+// grows historyHeight by exactly 1, and clearing every remaining chip grows
+// it by exactly 2 (from the original 2-row baseline).
+func TestComposerShrinksAsWrappedAttachmentsAreRemoved(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	m.Update(tea.WindowSizeMsg{Width: 62, Height: 30})
+	chips := []Chip{
+		{ID: "1", Label: "First customer table"},
+		{ID: "2", Label: "Second customer table"},
+		{ID: "3", Label: "Third customer table"},
+	}
+	m.SetChips(chips)
+	width := m.chatWidth()
+	if got := len(m.chipRows(width)); got != 2 {
+		t.Fatalf("chip rows = %d, want 2", got)
+	}
+	initialHeight := m.historyHeight()
+	if !strings.Contains(m.chipsView(width), "Third customer table") {
+		t.Fatal("wrapped chip is not visible")
+	}
+	lastChip := m.chipRows(width)[1][0]
+	if lastChip.index != 2 {
+		t.Fatalf("second-row chip index = %d, want 2 (Third customer table)", lastChip.index)
+	}
+
+	m.SetChips(chips[:2])
+	if got := len(m.chipRows(width)); got != 1 {
+		t.Fatalf("chip rows after removing the third chip = %d, want 1", got)
+	}
+	if got := m.historyHeight(); got != initialHeight+1 {
+		t.Fatalf("history height after removing the second-row chip = %d, want %d", got, initialHeight+1)
+	}
+
+	m.SetChips(nil)
+	if got := len(m.chipRows(width)); got != 0 {
+		t.Fatalf("chip rows after clearing chips = %d, want 0", got)
+	}
+	if got := m.historyHeight(); got != initialHeight+2 {
+		t.Fatalf("history height after clearing chips = %d, want %d", got, initialHeight+2)
+	}
+}
+
 func TestViewRendersChipRowAboveComposer(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
@@ -741,6 +789,89 @@ func TestViewHeightMatchesTerminalHeightWithChipsAndMenu(t *testing.T) {
 	}
 }
 
+// --- B1 (r2 review): historyHeight must stay in sync with chrome that
+// changes WITHOUT going through resize()'s old call sites (WindowSizeMsg,
+// F6, Ctrl+Left/Right, a chip-list change) -- opening the slash-command
+// menu by typing, SetBusy(true)/StartStream, and SetStatus all change how
+// much chrome View() draws around the transcript, and previously left the
+// transcript's ACTUAL viewport size stale until the next one of those
+// events. View() now re-applies resize() on every call, and historyHeight
+// reserves the busy spinner's own trailing line. -----------------------------
+
+func TestViewHeightMatchesAfterOpeningMenuByKeystroke(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithCommands([]Command{{Name: "/a", Help: "a"}}))
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	renderedLineCount(m.View().Content) // render once at the pre-menu size
+	for _, r := range "/a" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	if m.commandMenuView() == "" {
+		t.Fatal("expected the command menu to be open")
+	}
+	if got := renderedLineCount(m.View().Content); got != m.height {
+		t.Fatalf("rendered %d lines, want exactly m.height = %d once the menu opens by keystroke", got, m.height)
+	}
+}
+
+func TestViewHeightMatchesAfterSetBusy(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	renderedLineCount(m.View().Content) // render once while idle
+	m.SetBusy(true)
+	if got := renderedLineCount(m.View().Content); got != m.height {
+		t.Fatalf("rendered %d lines, want exactly m.height = %d while busy (spinner line reserved)", got, m.height)
+	}
+}
+
+func TestViewHeightMatchesAfterSetStatusPostRender(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	renderedLineCount(m.View().Content) // render once with no status
+	m.SetStatus("model: gpt\nusage: 12")
+	if got := renderedLineCount(m.View().Content); got != m.height {
+		t.Fatalf("rendered %d lines, want exactly m.height = %d after a post-render SetStatus", got, m.height)
+	}
+}
+
+func TestMouseClickFindsCloseGlyphWithMenuOpenAndNeverHitsAMenuRow(t *testing.T) {
+	h := &chipHandler{}
+	m := New(h, WithMouse(MouseCellMotion), WithCommands([]Command{{Name: "/a", Help: "a"}}))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m.SetMouseEnabled(true)
+	m.SetChips(threeChips())
+	renderedLineCount(m.View().Content) // render once before the menu opens
+
+	for _, r := range "/a" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	if m.commandMenuView() == "" {
+		t.Fatal("expected the command menu to be open")
+	}
+
+	// The rendered × is still findable and clickable with the menu open --
+	// resize() having run for this render keeps chipsTopY (computed at
+	// click time) in sync with what's actually drawn.
+	x, y := findCloseGlyph(t, m)
+	before := len(m.Chips())
+	m.Update(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
+	if len(m.Chips()) != before-1 {
+		t.Fatalf("Chips() = %+v, want one chip removed by the click on ×", m.Chips())
+	}
+
+	// A click on one of the MENU's own rows (well above the chip row) must
+	// never be misread as landing on a chip's × -- it falls through
+	// untouched, same as any other non-chip click.
+	menuRow := m.topBarHeight() + m.historyHeight() // the menu's first line
+	beforeMenuClick := len(m.Chips())
+	m.Update(tea.MouseClickMsg{X: 2, Y: menuRow, Button: tea.MouseLeft})
+	if len(m.Chips()) != beforeMenuClick {
+		t.Fatalf("Chips() = %+v, a click on a menu row must never remove a chip", m.Chips())
+	}
+}
+
 // --- mouse click removal ----------------------------------------------------
 
 func chipMouseSetup(t *testing.T) (*chipHandler, *Model) {
@@ -790,20 +921,8 @@ func TestMouseClickOnCloseGlyphRemovesChip(t *testing.T) {
 // interpreted, not just an internal-helper self-consistency bug.
 func TestMouseClickFindsCloseGlyphInRenderedView(t *testing.T) {
 	h, m := chipMouseSetup(t)
-	view := m.View().Content
-	lines := strings.Split(view, "\n")
-	row, col := -1, -1
-	for y, line := range lines {
-		stripped := ansi.Strip(line)
-		if x := strings.Index(stripped, chipCloseGlyph); x >= 0 {
-			row, col = y, x
-			break
-		}
-	}
-	if row < 0 {
-		t.Fatalf("rendered view has no %q glyph:\n%s", chipCloseGlyph, view)
-	}
-	m.Update(tea.MouseClickMsg{X: col, Y: row, Button: tea.MouseLeft})
+	x, y := findCloseGlyph(t, m)
+	m.Update(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
 	if len(m.Chips()) != 2 {
 		t.Fatalf("Chips() = %+v, want the first rendered chip removed", m.Chips())
 	}
@@ -955,9 +1074,28 @@ func TestSyncFocusClearsChipFocusOnZoneChange(t *testing.T) {
 // (origin/main:pkg/chat/workspace_test.go) against chatshell's
 // product-neutral composer, step for step. ---------------------------------
 
+// findCloseGlyph renders m's current View() and returns the (X, Y)
+// coordinates of the FIRST "×" glyph it finds, ansi-stripped so the
+// coordinates are display columns/rows exactly as a mouse click would
+// report them (m3, r1/r2 review: every × lookup in this replay locates the
+// glyph by scanning the ACTUAL rendered output, never via the internal
+// chipsTopY/chipRows helpers under test elsewhere).
+func findCloseGlyph(t *testing.T, m *Model) (x, y int) {
+	t.Helper()
+	view := m.View().Content
+	for row, line := range strings.Split(view, "\n") {
+		if col := strings.Index(ansi.Strip(line), chipCloseGlyph); col >= 0 {
+			return col, row
+		}
+	}
+	t.Fatalf("rendered view has no %q glyph:\n%s", chipCloseGlyph, view)
+	return 0, 0
+}
+
 func TestReplayDataTugComposerAttachmentChipsCanBeFocusedClearedAndRestored(t *testing.T) {
 	h := &chipHandler{}
 	m := newTestShell(h) // width 120, height 40
+	m.SetMouseEnabled(true)
 	customer := Chip{ID: "customer", Label: "Customer"}
 	m.SetChips([]Chip{customer})
 	m.input.SetValue("Top 5 rows")
@@ -999,10 +1137,28 @@ func TestReplayDataTugComposerAttachmentChipsCanBeFocusedClearedAndRestored(t *t
 
 	// Clicking the visible × (found in the rendered view, as m3 requires)
 	// removes the chip.
-	m.SetMouseEnabled(true)
-	cell := chipCellFor(t, m, 0)
-	m.Update(tea.MouseClickMsg{X: cell.x, Y: m.chipsTopY(), Button: tea.MouseLeft})
+	x, y := findCloseGlyph(t, m)
+	m.Update(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
 	if len(m.Chips()) != 0 {
 		t.Fatal("clicking the visible × did not remove the chip")
+	}
+
+	// r2 review, m1: the replay continues past the mouse removal --
+	// Shift+Esc restores the chip the click removed, Ctrl+D removes it
+	// again (DataTug's own built-in shortcut, independent of chip focus),
+	// and a further Shift+Esc restores it once more.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape, Mod: tea.ModShift})
+	if len(m.Chips()) != 1 || m.Chips()[0].ID != "customer" {
+		t.Fatalf("Shift+Esc did not restore the chip removed by the mouse click: %+v", m.Chips())
+	}
+
+	m.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	if len(m.Chips()) != 0 {
+		t.Fatalf("Ctrl+D did not remove the last chip: %+v", m.Chips())
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape, Mod: tea.ModShift})
+	if len(m.Chips()) != 1 || m.Chips()[0].ID != "customer" {
+		t.Fatalf("Shift+Esc did not restore the chip removed by Ctrl+D: %+v", m.Chips())
 	}
 }

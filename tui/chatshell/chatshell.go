@@ -1260,14 +1260,27 @@ func (m *Model) sidebarWidth() int {
 // (topBarHeight, which a product's own WithTopBar may render as more than
 // one line), the open slash-command menu (menuHeight, 0 when it isn't
 // showing), the chip row(s) (chipsHeight), the composer's own fixed single
-// line, and the status line(s) (statusSegmentHeight) -- so that
-// View()'s total rendered height always equals m.height exactly (a
-// pre-existing gap this REQ fixes: historyHeight previously assumed a
-// constant "4" rows of chrome, silently wrong once a product's top bar
-// wrapped to more than one line or the slash-command menu was open, either
-// under- or over-filling the screen).
+// line, the status line(s) (statusSegmentHeight), and -- while Busy() --
+// the spinner's own trailing "\n" + text line View() appends after the
+// transcript (r2 review, B1: that line was previously NOT reserved, so
+// View() rendered one line taller than m.height for the entire duration of
+// a stream) -- so that View()'s total rendered height always equals
+// m.height exactly (a pre-existing gap this REQ fixes: historyHeight
+// previously assumed a constant "4" rows of chrome, silently wrong once a
+// product's top bar wrapped to more than one line, the slash-command menu
+// was open, or busy, either under- or over-filling the screen).
+//
+// historyHeight is PURE (always computed fresh from current state) -- it is
+// View() re-applying it to m.transcript's actual viewport size, on EVERY
+// render (not just after WindowSizeMsg/F6/a chip change), that keeps the
+// transcript's rendered size from ever going stale relative to it; see
+// View's own doc.
 func (m *Model) historyHeight() int {
-	return max(1, m.height-m.topBarHeight()-m.menuHeight()-1-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth()))
+	busySpinnerLine := 0
+	if m.busy {
+		busySpinnerLine = 1
+	}
+	return max(1, m.height-m.topBarHeight()-m.menuHeight()-1-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine)
 }
 
 // topBarHeight is the rendered top bar's line count -- 1 for the default
@@ -1595,7 +1608,25 @@ func (m *Model) topBarView() string {
 	return lipgloss.NewStyle().Bold(true).Render(m.title)
 }
 
+// View renders the chat screen. It re-applies resize() FIRST, on every
+// call (r2 review, B1) -- not only in response to WindowSizeMsg/F6/Ctrl+
+// Left/Right/a chip-list change, the only events that previously called
+// it -- because historyHeight() (and therefore how tall the transcript
+// SHOULD be) also depends on state that changes without going through any
+// of those: typing "/" opens the slash-command menu, SetStatus changes the
+// status segment's height, and SetBusy(true)/StartStream reserves the
+// spinner line. Without this, m.transcript's ACTUAL viewport size (set via
+// SetSize, and otherwise sticky) drifts from the CURRENT historyHeight()
+// value between renders -- both the total rendered line count (over- or
+// under-filling the screen) and chipsTopY's click math (computed fresh
+// from the CURRENT historyHeight() at click time, but answering for
+// whatever was ACTUALLY drawn by the last, possibly stale, render) go
+// wrong. Calling resize() here is cheap (it only sets sizes) and
+// idempotent, so doing it unconditionally on every render is simpler and
+// more robust than hunting down every call site that can change chrome
+// height.
 func (m *Model) View() tea.View {
+	m.resize()
 	top := m.topBarView()
 	history := m.transcript.View()
 	if m.busy {

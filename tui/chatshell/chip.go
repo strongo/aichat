@@ -74,15 +74,17 @@ func (m *Model) Chips() []Chip {
 // equivalent of Backspace/Delete on a focused chip or a mouse click on its
 // ×, e.g. a "remove attachment" control the product renders elsewhere in
 // its own UI. It snapshots the pre-removal draft first, same as any other
-// removal (so Shift+Esc/Ctrl+Y can undo it), and reports whether a chip
-// with that ID was found and removed.
-func (m *Model) RemoveChip(id string) tea.Cmd {
+// removal (so Shift+Esc/Ctrl+Y can undo it), and reports (r2 review, m3)
+// via the second return value whether a chip with that ID was found and
+// removed; found is false (cmd is nil) for an unknown ID, a documented
+// no-op.
+func (m *Model) RemoveChip(id string) (cmd tea.Cmd, found bool) {
 	for i, c := range m.chips {
 		if c.ID == id {
-			return m.removeChipAt(i)
+			return m.removeChipAt(i), true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // ClearChips detaches every chip -- a product-facing equivalent of Esc's
