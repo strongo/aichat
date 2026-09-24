@@ -377,7 +377,7 @@ func (m *Model) rebuildTable() {
 	}
 	m.table = newTable
 	for i := 0; i < previousOffset; i++ {
-		m.table.ScrollRight()
+		m.table = m.table.ScrollRight()
 	}
 	m.ensureSelectedColumnVisible()
 }
@@ -579,7 +579,7 @@ func (m *Model) ensureSelectedColumnVisible() {
 	}
 	for m.table.GetHorizontalScrollColumnOffset() > m.selectedColumn {
 		before := m.table.GetHorizontalScrollColumnOffset()
-		m.table.ScrollLeft()
+		m.table = m.table.ScrollLeft()
 		if m.table.GetHorizontalScrollColumnOffset() == before {
 			break
 		}
@@ -587,7 +587,7 @@ func (m *Model) ensureSelectedColumnVisible() {
 	_, last := m.visibleColumnWindow()
 	for m.selectedColumn > last && m.table.GetHorizontalScrollColumnOffset() < m.selectedColumn {
 		before := m.table.GetHorizontalScrollColumnOffset()
-		m.table.ScrollRight()
+		m.table = m.table.ScrollRight()
 		if m.table.GetHorizontalScrollColumnOffset() == before {
 			break
 		}
