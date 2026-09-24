@@ -2204,7 +2204,12 @@ func TestReplaceBlockNoFocusToLoseIsANoop(t *testing.T) {
 // ReplaceBlock shifted stop numbers, even though the focused entry's own
 // Block never changed. Fixed in chatshell.go's ReplaceBlock by tracking the
 // focused entry by its raw position in m.transcript.Entries() instead of by
-// ID (see stopForRawIndex).
+// ID (see stopForRawIndex), and by pushing the recomputed stop straight into
+// transcript via syncFocus() before returning — transcript's own focus
+// cursor only re-resolves itself by ID, which is a no-op for a no-ID entry,
+// so without that explicit resync the highlight would stay wherever
+// transcript.ReplaceBlock last left it (lost, or on the wrong Block) instead
+// of reflecting focusRing's corrected stop immediately.
 func TestReplaceBlockKeepsFocusOnNoIDEntryWhenEarlierEntryReplaced(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
@@ -2229,13 +2234,41 @@ func TestReplaceBlockKeepsFocusOnNoIDEntryWhenEarlierEntryReplaced(t *testing.T)
 	if stop := m.focusRing.Stop(); stop != 0 {
 		t.Fatalf("focusRing.Stop() = %d, want 0 (blk2 is now the only focusable entry)", stop)
 	}
-	// syncFocus (e.g. the next resize or zone change) must propagate
-	// focusRing's corrected stop into the transcript and land back on blk2,
-	// not lose it or land on a different entry.
+	// transcript's own focus must already reflect the corrected stop right
+	// after ReplaceBlock, with no further syncFocus() call needed.
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.Block != transcript.Block(blk2) {
+		t.Fatalf("FocusedEntry() immediately after ReplaceBlock = %+v, want still focused on blk2", fe)
+	}
+}
+
+// TestReplaceBlockKeepsFocusOnNoIDEntryWithThreeEntries extends the above
+// regression to a 3-entry transcript where the focused no-ID entry sits in
+// the MIDDLE, and an EARLIER entry's swap shifts its stop down by one while
+// a LATER entry stays untouched — exercising stopForRawIndex/syncFocus with
+// entries on both sides of the focused one.
+func TestReplaceBlockKeepsFocusOnNoIDEntryWithThreeEntries(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	blk2 := &fakeBlock{}
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &variableFocusBlock{focusable: true}}) // stop 0
+	m.transcript.Append(transcript.Entry{Block: blk2})                                          // no ID, stop 1
+	m.transcript.Append(transcript.Entry{ID: "c", Block: &fakeBlock{}})                         // stop 2
+
+	m.focusRing.FocusStop(1)
 	m.syncFocus()
-	fe := m.transcript.FocusedEntry()
-	if fe == nil || fe.Block != transcript.Block(blk2) {
-		t.Fatalf("FocusedEntry() after resync = %+v, want still focused on blk2", fe)
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.Block != transcript.Block(blk2) {
+		t.Fatalf("setup: focused entry block = %+v, want blk2", fe)
+	}
+
+	// Replacing the EARLIER entry "a" shifts blk2's stop from 1 down to 0;
+	// "c" (untouched, after blk2) stays focusable too.
+	m.ReplaceBlock("a", &variableFocusBlock{focusable: false})
+
+	if stop := m.focusRing.Stop(); stop != 0 {
+		t.Fatalf("focusRing.Stop() = %d, want 0 (blk2 is now the first focusable entry)", stop)
+	}
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.Block != transcript.Block(blk2) {
+		t.Fatalf("FocusedEntry() immediately after ReplaceBlock = %+v, want still focused on blk2 (not \"c\")", fe)
 	}
 }
 

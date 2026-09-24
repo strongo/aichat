@@ -696,6 +696,13 @@ func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
 		// (see the no-ID staleness note above).
 		if stop := stopForRawIndex(m.transcript.Entries(), focusedRawIdx); stop >= 0 {
 			m.focusRing.FocusStop(stop)
+			// transcript's own focus index only re-resolves itself by ID,
+			// which is a no-op for a no-ID entry (see above): push the
+			// recomputed stop into it explicitly, or the highlight stays
+			// wherever transcript.ReplaceBlock left it (lost, or on the
+			// wrong Block) until some unrelated zone change/resize incidentally
+			// calls syncFocus next.
+			m.syncFocus()
 			return
 		}
 	} else if fe := m.transcript.FocusedEntry(); fe != nil {
