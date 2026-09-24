@@ -202,3 +202,53 @@ func TestError_IsRetryable(t *testing.T) {
 		t.Error("Retryable:true must report true")
 	}
 }
+
+// TestUsage_BillableTokens is the coordinator's follow-up regression test:
+// CacheReadTokens/ReasoningTokens are informational SUBSETS of
+// InputTokens/OutputTokens on "openai-compatible" (never added), but
+// CacheReadTokens/CacheWriteTokens are ADDITIVE, billed-separately totals
+// on "anthropic" (and the unrecognised-provider fallback).
+func TestUsage_BillableTokens(t *testing.T) {
+	u := Usage{
+		InputTokens:      100,
+		OutputTokens:     50,
+		CacheReadTokens:  20,
+		CacheWriteTokens: 5,
+		ReasoningTokens:  10,
+	}
+	cases := []struct {
+		provider string
+		want     int64
+	}{
+		// InputTokens+OutputTokens only: CacheReadTokens/ReasoningTokens
+		// are subsets already inside those two totals.
+		{"openai-compatible", 150},
+		// InputTokens+OutputTokens+CacheReadTokens+CacheWriteTokens:
+		// Anthropic bills cache reads/writes separately from input_tokens/
+		// output_tokens. ReasoningTokens is never added (no adapter
+		// populates it additively).
+		{"anthropic", 175},
+		// An unrecognised provider name falls back to the additive
+		// (Anthropic-style) formula rather than silently dropping a
+		// populated Cache*Tokens field.
+		{"some-future-provider", 175},
+		{"", 175},
+	}
+	for _, c := range cases {
+		if got := u.BillableTokens(c.provider); got != c.want {
+			t.Errorf("BillableTokens(%q) = %d, want %d", c.provider, got, c.want)
+		}
+	}
+}
+
+// TestUsage_BillableTokensZeroCacheFieldsMatchAcrossProviders covers the
+// common case where no cache tokens are reported at all (a request that
+// never hit the cache): both formulas must agree exactly.
+func TestUsage_BillableTokensZeroCacheFieldsMatchAcrossProviders(t *testing.T) {
+	u := Usage{InputTokens: 30, OutputTokens: 12}
+	openai := u.BillableTokens("openai-compatible")
+	anthropic := u.BillableTokens("anthropic")
+	if openai != 42 || anthropic != 42 {
+		t.Errorf("openai-compatible = %d, anthropic = %d, want both 42 with no cache tokens reported", openai, anthropic)
+	}
+}

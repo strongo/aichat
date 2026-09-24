@@ -223,23 +223,80 @@ type Event struct {
 }
 
 // Usage is token and allowance accounting for one response.
+//
+// The fields below are populated from each adapter's native usage object,
+// and their SUBSET-VS-ADDITIVE relationship to InputTokens/OutputTokens is
+// NOT the same across adapters — summing them naively double-counts on one
+// adapter and undercounts on the other. See CacheReadTokens/
+// CacheWriteTokens/ReasoningTokens doc below for the per-adapter semantics,
+// and BillableTokens for a helper that sums correctly for a named adapter.
 type Usage struct {
-	InputTokens      int64 `json:"inputTokens,omitempty"`
-	OutputTokens     int64 `json:"outputTokens,omitempty"`
-	CacheReadTokens  int64 `json:"cacheReadTokens,omitempty"`
+	InputTokens  int64 `json:"inputTokens,omitempty"`
+	OutputTokens int64 `json:"outputTokens,omitempty"`
+	// CacheReadTokens counts tokens served from a prompt cache.
+	// ai/openaicompat populates it from
+	// usage.prompt_tokens_details.cached_tokens: this is an INFORMATIONAL
+	// SUBSET already counted inside InputTokens (OpenAI's prompt_tokens
+	// includes cached tokens; the details object only breaks out how many
+	// of them were cache hits) — do NOT add it to InputTokens. ai/anthropic
+	// populates it from usage.cache_read_input_tokens: on the Messages API
+	// this is the OPPOSITE relationship — Anthropic's input_tokens counts
+	// ONLY the tokens actually processed fresh, and cache_read_input_tokens
+	// (billed at its own, cheaper per-token rate) is NOT included in it —
+	// so for ai/anthropic, CacheReadTokens IS additive to InputTokens.
+	CacheReadTokens int64 `json:"cacheReadTokens,omitempty"`
+	// CacheWriteTokens counts tokens written to a prompt cache. Only
+	// ai/anthropic populates it, from usage.cache_creation_input_tokens —
+	// same additive relationship to InputTokens as CacheReadTokens above
+	// (billed separately, at its own higher per-token rate, and not
+	// included in input_tokens). ai/openaicompat never populates this
+	// field: OpenAI's API has no separate cache-write concept to report.
 	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
 	// ReasoningTokens counts provider-side reasoning/thinking tokens, ONLY
 	// on adapters that report them SEPARATELY from OutputTokens.
 	// ai/openaicompat populates it from
 	// usage.completion_tokens_details.reasoning_tokens when the API returns
-	// that field. ai/anthropic leaves it zero: the Messages API's usage
-	// object has no separate thinking-token count — thinking tokens are
-	// already included in OutputTokens (usage.output_tokens), not broken
-	// out on top of it, so there is nothing distinct to report here without
-	// double-counting.
+	// that field: this is an INFORMATIONAL SUBSET already counted inside
+	// OutputTokens (OpenAI's completion_tokens includes reasoning tokens;
+	// the details object only breaks out how many of them were spent on
+	// reasoning) — do NOT add it to OutputTokens. ai/anthropic leaves it
+	// zero: the Messages API's usage object has no separate thinking-token
+	// count — thinking tokens are already included in OutputTokens
+	// (usage.output_tokens), not broken out on top of it, so there is
+	// nothing distinct to report here without double-counting.
 	ReasoningTokens int64 `json:"reasoningTokens,omitempty"`
 	// Allowance is set by the cloud provider (ai/cloud); nil for BYOK.
 	Allowance *Allowance `json:"allowance,omitempty"`
+}
+
+// BillableTokens sums u into the total tokens the named provider actually
+// bills for this response, without double-counting a subset field (see the
+// per-field doc on Usage) against the total it is already included in.
+// provider should be the ai.LLMProvider.Name() that produced this Usage:
+//
+//   - "openai-compatible": CacheReadTokens/ReasoningTokens are
+//     informational subsets already counted inside InputTokens/
+//     OutputTokens — Total = InputTokens + OutputTokens.
+//   - "anthropic" (and any other/unrecognised provider name — see below):
+//     CacheReadTokens/CacheWriteTokens are billed separately from
+//     InputTokens/OutputTokens — Total = InputTokens + OutputTokens +
+//     CacheReadTokens + CacheWriteTokens. ReasoningTokens is not added:
+//     no current adapter populates it additively.
+//
+// An unrecognised provider name falls back to the additive (Anthropic-
+// style) formula: silently ignoring a populated Cache*Tokens field would
+// undercount real spend, which is the worse failure mode for a billing
+// total than adding a field a future adapter turns out to already include
+// (there is currently no adapter where that would happen). Prefer passing
+// the adapter's own Name() over relying on this default for a provider
+// this function doesn't know the convention of.
+func (u Usage) BillableTokens(provider string) int64 {
+	switch provider {
+	case "openai-compatible":
+		return u.InputTokens + u.OutputTokens
+	default:
+		return u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens
+	}
 }
 
 // Allowance is the caller's cloud quota after this response.
