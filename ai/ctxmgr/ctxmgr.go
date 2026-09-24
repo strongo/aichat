@@ -6,8 +6,10 @@
 //
 // The policy is intentionally simple for the MVP:
 //
-//  1. Required scopes (from a decision.Decision, or all scopes when there
-//     was no decision) are always included.
+//  1. Required scopes (from a decision.Decision) are always included; when
+//     there was no decision at all, call SelectAll instead of Select -- it
+//     includes every available static scope, since the main LLM path needs
+//     the full cached context to classify and answer in one inference.
 //  2. A static scope, once sent in this conversation, is RETAINED on every
 //     later turn even if no longer required -- dropping it would shift the
 //     cached prefix and lose the cache. Only budget pressure drops it.
@@ -15,8 +17,13 @@
 //     stays byte-stable turn to turn.
 //  4. Only when the estimated token count (len(text)/4, a coarse but
 //     dependency-free estimate) exceeds Policy.BudgetTokens does the Manager
-//     drop retained-but-not-required static scopes, largest first, until it
-//     fits (or runs out of droppable scopes).
+//     drop retained-but-not-required static scopes, FROM THE TAIL of the
+//     stable order inward (never from the middle or front), so whatever
+//     survives is still the stable, cacheable PREFIX of what came before --
+//     dropping is never allowed to disturb it. A scope dropped this way is
+//     also forgotten from "sent": it is not implicitly retained again next
+//     turn just because it once appeared; it only comes back if required or
+//     re-added in the normal course of scopes growing.
 //  5. Dynamic blocks are included only for required scopes plus the
 //     pinnedScopes the product passes (e.g. sidebar/focused entities the
 //     user is actively looking at), since they are per-turn and not cached
@@ -44,7 +51,7 @@ func (p Policy) withDefaults() Policy {
 	return p
 }
 
-// Report explains what Select did, for diagnostics (see ai/diag).
+// Report explains what Select/SelectAll did, for diagnostics (see ai/diag).
 type Report struct {
 	Required        []string
 	Retained        []string
@@ -70,16 +77,29 @@ func NewManager(policy Policy) *Manager {
 	return &Manager{Policy: policy.withDefaults(), sentSet: map[string]bool{}}
 }
 
-// Select picks the ai.ContextBlock values for the next request.
-//
-// required is the set of scopes the current turn needs (from
-// decision.Decision.RequiredScopes; pass nil when there was no decision, in
-// which case every available static scope is included -- the main LLM path
-// needs the full cached context to classify and answer in one inference).
-// available is every context block the product can supply. pinnedScopes are
-// scopes of entities the user is actively focused on or has pinned, whose
-// dynamic data should be included even when not required.
+// Select picks the ai.ContextBlock values for the next request when a
+// decision.Decision was made. required is the set of scopes THIS turn needs
+// (from decision.Decision.RequiredScopes; an empty, non-nil slice is a valid
+// "this decision needs no scopes", distinct from "no decision was made" --
+// see SelectAll for that case). available is every context block the
+// product can supply. pinnedScopes are scopes of entities the user is
+// actively focused on or has pinned, whose dynamic data should be included
+// even when not required.
 func (m *Manager) Select(required []string, available []ai.ContextBlock, pinnedScopes []string) ([]ai.ContextBlock, Report) {
+	return m.selectImpl(required, false, available, pinnedScopes)
+}
+
+// SelectAll picks context for a turn with NO decision.Decision at all (Jev
+// off, or every decision.Provider abstained/errored): every available
+// static scope is included, plus every available dynamic scope for
+// required-equivalent purposes, since the main LLM must classify and answer
+// the turn in a single inference and needs the full cached context to do
+// it. pinnedScopes still works the same as in Select.
+func (m *Manager) SelectAll(available []ai.ContextBlock, pinnedScopes []string) ([]ai.ContextBlock, Report) {
+	return m.selectImpl(nil, true, available, pinnedScopes)
+}
+
+func (m *Manager) selectImpl(required []string, noDecision bool, available []ai.ContextBlock, pinnedScopes []string) ([]ai.ContextBlock, Report) {
 	requiredSet := toSet(required)
 	pinnedSet := toSet(pinnedScopes)
 
@@ -94,7 +114,6 @@ func (m *Manager) Select(required []string, available []ai.ContextBlock, pinnedS
 		}
 	}
 
-	noDecision := required == nil
 	wantStaticScopes := map[string]bool{}
 	if noDecision {
 		for _, s := range allStaticScopes {
@@ -154,21 +173,15 @@ func (m *Manager) Select(required []string, available []ai.ContextBlock, pinnedS
 	var dropped []string
 	compacted := false
 	if estimateTokens(total) > m.Policy.BudgetTokens {
-		// Rule 4: drop retained (non-required) scopes, largest first, until
-		// it fits or nothing droppable remains.
-		droppable := make([]string, 0, len(retained))
-		for _, s := range retained {
-			if !requiredSet[s] {
-				droppable = append(droppable, s)
-			}
-		}
-		sort.Slice(droppable, func(i, j int) bool {
-			return textLen(droppable[i]) > textLen(droppable[j])
-		})
+		// Rule 4: drop from the TAIL of orderedScopes inward -- never from
+		// the middle or front -- so what remains is still a stable prefix
+		// of what was sent before. A required scope is never dropped even
+		// if it happens to be at the tail.
 		dropSet := map[string]bool{}
-		for _, s := range droppable {
-			if estimateTokens(total) <= m.Policy.BudgetTokens {
-				break
+		for i := len(orderedScopes) - 1; i >= 0 && estimateTokens(total) > m.Policy.BudgetTokens; i-- {
+			s := orderedScopes[i]
+			if requiredSet[s] {
+				continue
 			}
 			total -= textLen(s)
 			dropSet[s] = true
@@ -190,6 +203,10 @@ func (m *Manager) Select(required []string, available []ai.ContextBlock, pinnedS
 				}
 			}
 			retained = keptRetained
+			// A dropped scope is forgotten from "sent" too: it must not be
+			// implicitly retained again next turn just because it appeared
+			// once before budget pressure removed it.
+			m.forget(dropSet)
 		}
 	}
 
@@ -234,6 +251,22 @@ func (m *Manager) Select(required []string, available []ai.ContextBlock, pinnedS
 		Compacted:       compacted,
 	}
 	return out, report
+}
+
+// forget removes scopes from m.sent/m.sentSet.
+func (m *Manager) forget(scopes map[string]bool) {
+	if len(scopes) == 0 {
+		return
+	}
+	var kept []string
+	for _, s := range m.sent {
+		if scopes[s] {
+			delete(m.sentSet, s)
+			continue
+		}
+		kept = append(kept, s)
+	}
+	m.sent = kept
 }
 
 func estimateTokens(charLen int) int { return (charLen + 3) / 4 }

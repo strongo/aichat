@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/strongo/aichat/ai"
 )
@@ -94,7 +95,7 @@ func TestStream_ModelAutoUsesConfigDefault(t *testing.T) {
 	}
 }
 
-func TestStream_SystemAndContextOrdering(t *testing.T) {
+func TestStream_SystemHoldsOnlyStaticContext(t *testing.T) {
 	var gotMessages []chatMessage
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body chatRequestBody
@@ -126,16 +127,29 @@ func TestStream_SystemAndContextOrdering(t *testing.T) {
 	if sysMsg.Role != "system" {
 		t.Fatalf("first message role = %q", sysMsg.Role)
 	}
-	iStatic := strings.Index(sysMsg.Content, "static instructions")
-	iDynamic := strings.Index(sysMsg.Content, "now=2026")
-	if iStatic < 0 || iDynamic < 0 || iStatic > iDynamic {
-		t.Errorf("static block must precede dynamic block in system message: %q", sysMsg.Content)
+	if !strings.Contains(sysMsg.Content, "static instructions") {
+		t.Errorf("system message missing static context: %q", sysMsg.Content)
+	}
+	if strings.Contains(sysMsg.Content, "now=2026") {
+		t.Errorf("dynamic context must NOT be in the cached system message: %q", sysMsg.Content)
 	}
 	if !strings.Contains(sysMsg.Content, "You are helpful.") {
 		t.Errorf("system prompt missing: %q", sysMsg.Content)
 	}
-	if gotMessages[1].Role != "user" || gotMessages[1].Content != "hi" {
-		t.Errorf("gotMessages[1] = %+v", gotMessages[1])
+	last := gotMessages[1]
+	if last.Role != "user" {
+		t.Fatalf("gotMessages[1].Role = %q", last.Role)
+	}
+	if !strings.Contains(last.Content, "now=2026") {
+		t.Errorf("dynamic context must prefix the last (current-turn) message: %q", last.Content)
+	}
+	if !strings.HasSuffix(last.Content, "hi") {
+		t.Errorf("last message must still end with the original user text: %q", last.Content)
+	}
+	iContext := strings.Index(last.Content, "[context]")
+	iText := strings.Index(last.Content, "hi")
+	if iContext < 0 || iContext > iText {
+		t.Errorf("dynamic context must be a clearly delimited PREFIX of the last message: %q", last.Content)
 	}
 }
 
@@ -165,6 +179,28 @@ func TestStream_ResponseSchemaProducesStructured(t *testing.T) {
 	}
 	if gotBody.ResponseFormat == nil || gotBody.ResponseFormat.Type != "json_schema" || !gotBody.ResponseFormat.JSONSchema.Strict {
 		t.Errorf("ResponseFormat = %+v", gotBody.ResponseFormat)
+	}
+}
+
+func TestStream_StrictSchemaOptOut(t *testing.T) {
+	var gotBody chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	no := false
+	req := ai.ChatRequest{ResponseSchema: json.RawMessage(`{"type":"object"}`), StrictSchema: &no}
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotBody.ResponseFormat.JSONSchema.Strict {
+		t.Error("StrictSchema=false must turn strict mode off")
 	}
 }
 
@@ -255,4 +291,209 @@ func TestNew_PanicsWithoutBaseURL(t *testing.T) {
 		}
 	}()
 	New(Config{})
+}
+
+func TestStream_UsesMaxCompletionTokens(t *testing.T) {
+	var gotBody chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{MaxTokens: 512}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotBody.MaxCompletionTokens != 512 {
+		t.Errorf("MaxCompletionTokens = %d, want 512", gotBody.MaxCompletionTokens)
+	}
+}
+
+func TestStream_TruncatedWithoutDoneIsFatal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[{"delta":{"content":"partial"}}]}`)
+		// connection just ends: no [DONE] marker.
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	text, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeUpstream {
+		t.Fatalf("err = %v, want upstream truncation error", err)
+	}
+	if text != "partial" {
+		t.Errorf("text = %q, want partial text kept before truncation", text)
+	}
+}
+
+func TestStream_MidStreamErrorChunkIsFatal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[{"delta":{"content":"partial"}}]}`)
+		sseWrite(w, `{"error":{"message":"content filtered","type":"content_policy"}}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	text, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Message != "content filtered" {
+		t.Fatalf("err = %v", err)
+	}
+	if text != "partial" {
+		t.Errorf("text = %q", text)
+	}
+}
+
+func TestStream_FinishReasonLengthFatalOnlyWithSchema(t *testing.T) {
+	newSrv := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			sseWrite(w, `{"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}`)
+			sseWrite(w, "[DONE]")
+		}))
+	}
+
+	srv1 := newSrv()
+	defer srv1.Close()
+	p1 := New(Config{BaseURL: srv1.URL, Model: "m"})
+	_, _, _, err := ai.Collect(p1.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("without ResponseSchema, finish_reason=length must not be fatal: %v", err)
+	}
+
+	srv2 := newSrv()
+	defer srv2.Close()
+	p2 := New(Config{BaseURL: srv2.URL, Model: "m"})
+	_, _, _, err = ai.Collect(p2.Stream(context.Background(), ai.ChatRequest{ResponseSchema: json.RawMessage(`{}`)}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) {
+		t.Fatalf("with ResponseSchema, finish_reason=length must be fatal: %v", err)
+	}
+}
+
+func TestStream_BadChunkIsFatalPair(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `not json at all`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	var lastEvent ai.Event
+	var lastErr error
+	n := 0
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{}) {
+		n++
+		lastEvent, lastErr = ev, err
+		if err != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		t.Fatal("expected a fatal error")
+	}
+	if lastEvent.Type != ai.EventError || lastEvent.Error == nil {
+		t.Fatalf("fatal yield must carry Event{Type: EventError, Error: e}, got %+v", lastEvent)
+	}
+	if n != 2 {
+		t.Fatalf("expected exactly 2 yields (EventStarted, fatal), got %d", n)
+	}
+}
+
+func TestStream_CtxCancelMidBodyIsCanceled(t *testing.T) {
+	started := make(chan struct{})
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[{"delta":{"content":"partial"}}]}`)
+		close(started)
+		<-r.Context().Done() // the server observes the client disconnect
+		close(block)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+	_, _, _, err := ai.Collect(p.Stream(ctx, ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeCanceled {
+		t.Fatalf("err = %v, want ErrCodeCanceled", err)
+	}
+	if aiErr.Retryable {
+		t.Error("a cancellation must never be retryable")
+	}
+	select {
+	case <-block:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never observed the client disconnect")
+	}
+}
+
+func TestStream_NoRetryOnceStreamingHasStarted(t *testing.T) {
+	// The retry helper only wraps the initial request (see
+	// ai/internal/retry's doc and Provider.Stream's use of it): once the
+	// server has responded 200 and events have started flowing, a
+	// mid-stream failure -- even a truncation, which looks superficially
+	// like the kind of transient condition retryable errors model -- must
+	// never trigger a second HTTP request.
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[{"delta":{"content":"partial"}}]}`)
+		// connection ends without [DONE]: a fatal truncation, not a retry trigger.
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err == nil {
+		t.Fatal("expected a truncation error")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want exactly 1 (no retry after the first byte)", attempts)
+	}
+}
+
+func TestStream_RetryAfterHonouredOn429(t *testing.T) {
+	attempts := 0
+	var firstAttempt, secondAttempt time.Time
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			firstAttempt = time.Now()
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"slow down"}}`))
+			return
+		}
+		secondAttempt = time.Now()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if secondAttempt.Sub(firstAttempt) < 900*time.Millisecond {
+		t.Errorf("retry happened after %v, want >= ~1s (Retry-After: 1)", secondAttempt.Sub(firstAttempt))
+	}
 }

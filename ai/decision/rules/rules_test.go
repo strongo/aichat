@@ -3,6 +3,7 @@ package rules
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/strongo/aichat/ai/decision"
 	"github.com/strongo/aichat/ai/session"
@@ -126,5 +127,46 @@ func TestProvider_UsesSessionState(t *testing.T) {
 	}
 	if !ok || d.Reference == nil || d.Reference.Kind != "happening" {
 		t.Fatalf("d=%v ok=%v", d, ok)
+	}
+}
+
+func TestProvider_FillsZeroConfidenceTo1(t *testing.T) {
+	p := New("rules", Rule{Name: "r", Match: func(text string, st session.State) (decision.Decision, bool) {
+		// deliberately leaves Confidence at its zero value.
+		return decision.Decision{
+			Module:      decision.Scored{Value: "calendar"},
+			Intent:      decision.Scored{Value: "show"},
+			Interaction: decision.InteractionCommand,
+		}, true
+	}})
+	d, ok, err := p.Decide(context.Background(), decision.Request{Text: "x"})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected a decision")
+	}
+	if d.Module.Confidence != 1.0 {
+		t.Errorf("Module.Confidence = %v, want 1.0", d.Module.Confidence)
+	}
+	if d.Intent.Confidence != 1.0 {
+		t.Errorf("Intent.Confidence = %v, want 1.0", d.Intent.Confidence)
+	}
+}
+
+func TestProvider_DoesNotFillConfidenceForEmptyValue(t *testing.T) {
+	p := New("rules", Rule{Name: "r", Match: func(text string, st session.State) (decision.Decision, bool) {
+		return decision.Decision{Interaction: decision.InteractionCancellation}, true
+	}})
+	d, _, _ := p.Decide(context.Background(), decision.Request{Text: "x"})
+	if d.Module.Confidence != 0 || d.Intent.Confidence != 0 {
+		t.Errorf("d = %+v, must not fabricate confidence for an empty Module/Intent value", d)
+	}
+}
+
+func TestProvider_DecisionTimeoutIs300ms(t *testing.T) {
+	p := New("rules")
+	if p.DecisionTimeout() != 300*time.Millisecond {
+		t.Errorf("DecisionTimeout() = %v, want 300ms", p.DecisionTimeout())
 	}
 }

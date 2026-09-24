@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/cloudproto"
@@ -120,8 +122,8 @@ func TestDecide_Decided(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")})
-	var p decision.Provider = c
-	if p.Name() != "cloud" {
+	p := c.Decider()
+	if p.Name() != "cloud-decision" {
 		t.Fatalf("Name() = %q", p.Name())
 	}
 	d, ok, err := p.Decide(context.Background(), decision.Request{Text: "show my calendar"})
@@ -142,12 +144,24 @@ func TestDecide_Abstain(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")})
-	_, ok, err := c.Decide(context.Background(), decision.Request{})
+	_, ok, err := c.Decider().Decide(context.Background(), decision.Request{})
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
 	if ok {
 		t.Fatal("expected abstention when decided=false")
+	}
+}
+
+func TestDecider_HonoursDecisionTimeoutInterface(t *testing.T) {
+	c := New(Config{BaseURL: "https://x/", Product: "sneat", Token: tokenFunc("t")})
+	p := c.Decider()
+	dt, ok := p.(interface{ DecisionTimeout() time.Duration })
+	if !ok {
+		t.Fatal("cloud decider must implement DecisionTimeout() time.Duration")
+	}
+	if dt.DecisionTimeout() != 4*time.Second {
+		t.Errorf("DecisionTimeout() = %v, want 4s", dt.DecisionTimeout())
 	}
 }
 
@@ -181,7 +195,61 @@ func TestNewRequest_TokenError(t *testing.T) {
 		return "", wantErr
 	}})
 	_, _, _, err := ai.Collect(c.Stream(context.Background(), ai.ChatRequest{}))
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("err = %v, want wrapping %v", err, wantErr)
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || !strings.Contains(aiErr.Message, wantErr.Error()) {
+		t.Fatalf("err = %v, want an *ai.Error mentioning %v", err, wantErr)
+	}
+}
+
+func TestStream_FatalPairShape(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"code":"upstream","message":"down"}}`))
+	}))
+	defer srv.Close()
+	c := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")})
+	var lastEvent ai.Event
+	var lastErr error
+	n := 0
+	for ev, err := range c.Stream(context.Background(), ai.ChatRequest{}) {
+		n++
+		lastEvent, lastErr = ev, err
+		if err != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		t.Fatal("expected a fatal error")
+	}
+	if lastEvent.Type != ai.EventError || lastEvent.Error == nil {
+		t.Fatalf("fatal yield must carry Event{Type: EventError, Error: e}, got %+v", lastEvent)
+	}
+	if n != 1 {
+		t.Fatalf("n = %d, want 1 (no EventStarted since the request never succeeded)", n)
+	}
+}
+
+func TestStream_Retries5xxBeforeFirstByte(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"code":"upstream","message":"try again","retryable":true}}`))
+			return
+		}
+		w.Header().Set("Content-Type", cloudproto.ContentTypeSSE)
+		w.WriteHeader(http.StatusOK)
+		_ = cloudproto.WriteEvent(w, ai.Event{Type: ai.EventCompleted})
+		w.(http.Flusher).Flush()
+	}))
+	defer srv.Close()
+	c := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")})
+	_, _, _, err := ai.Collect(c.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if attempts != 3 {
+		t.Errorf("attempts = %d, want 3", attempts)
 	}
 }

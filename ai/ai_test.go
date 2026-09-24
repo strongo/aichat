@@ -40,6 +40,18 @@ func evErr(err error) struct {
 	}{err: err}
 }
 
+// fatal builds the fatal-pair item per the LLMProvider contract: an
+// EventError event AND a non-nil Go error together, on the same yield.
+func fatal(aiErr *Error) struct {
+	ev  Event
+	err error
+} {
+	return struct {
+		ev  Event
+		err error
+	}{ev: Event{Type: EventError, Error: aiErr}, err: aiErr}
+}
+
 func TestCollect_TextAndUsage(t *testing.T) {
 	s := seq(
 		ev(Event{Type: EventStarted, Provider: "p", Model: "m"}),
@@ -109,11 +121,11 @@ func TestCollect_StreamError(t *testing.T) {
 	}
 }
 
-func TestCollect_EventError(t *testing.T) {
+func TestCollect_FatalEventError(t *testing.T) {
 	aiErr := &Error{Code: ErrCodeUpstream, Message: "down"}
 	s := seq(
 		ev(Event{Type: EventTextDelta, Text: "partial"}),
-		ev(Event{Type: EventError, Error: aiErr}),
+		fatal(aiErr),
 	)
 	text, _, _, err := Collect(s)
 	var got *Error
@@ -122,6 +134,24 @@ func TestCollect_EventError(t *testing.T) {
 	}
 	if text != "partial" {
 		t.Errorf("text = %q", text)
+	}
+}
+
+func TestCollect_NonFatalEventErrorDoesNotTerminate(t *testing.T) {
+	// Per the LLMProvider contract, an EventError with a nil Go error is
+	// explicitly non-fatal: Collect must keep draining past it.
+	s := seq(
+		ev(Event{Type: EventTextDelta, Text: "a"}),
+		ev(Event{Type: EventError, Error: &Error{Code: ErrCodeUpstream, Message: "transient"}}),
+		ev(Event{Type: EventTextDelta, Text: "b"}),
+		ev(Event{Type: EventCompleted}),
+	)
+	text, _, _, err := Collect(s)
+	if err != nil {
+		t.Fatalf("err = %v, want nil (non-fatal EventError must not surface as Collect's error)", err)
+	}
+	if text != "ab" {
+		t.Errorf("text = %q, want %q (Collect must keep draining past a non-fatal EventError)", text, "ab")
 	}
 }
 

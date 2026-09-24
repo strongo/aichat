@@ -6,11 +6,18 @@ package rules
 import (
 	"context"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/strongo/aichat/ai/decision"
 	"github.com/strongo/aichat/ai/session"
 )
+
+// decisionTimeout is how long decision.Chain should wait for a rules.Provider
+// call (see the optional `DecisionTimeout() time.Duration` hook Chain
+// honours). Matching is in-process and synchronous, so 300ms is generous
+// headroom, not a real expectation of taking that long.
+const decisionTimeout = 300 * time.Millisecond
 
 // Rule is one deterministic rule: Match inspects the raw user text and
 // session state and either returns a decision (ok=true) or abstains.
@@ -33,10 +40,20 @@ func New(name string, rules ...Rule) *Provider {
 // Name implements decision.Provider.
 func (p *Provider) Name() string { return p.name }
 
+// DecisionTimeout implements the optional interface decision.Chain honours.
+func (p *Provider) DecisionTimeout() time.Duration { return decisionTimeout }
+
 // Decide implements decision.Provider: it runs each rule's Match in order
 // against the normalised text and abstains if none match. Rules never block
 // on ctx; this loop only checks it between rules so a caller's timeout still
 // bounds a pathological rule set.
+//
+// A rule that leaves Module.Confidence or Intent.Confidence at its zero
+// value gets it filled to 1.0: a deterministic, exact-phrase rule that
+// matched IS certain, and asking every product rule author to remember to
+// write "Confidence: 1" is exactly the kind of boilerplate this package
+// exists to avoid. A rule that deliberately wants a lower confidence still
+// can -- this only fills the zero value.
 func (p *Provider) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
 	text := Normalize(req.Text)
 	for _, r := range p.rules {
@@ -44,6 +61,12 @@ func (p *Provider) Decide(ctx context.Context, req decision.Request) (decision.D
 			return decision.Decision{}, false, ctx.Err()
 		}
 		if d, ok := r.Match(text, req.State); ok {
+			if d.Module.Value != "" && d.Module.Confidence == 0 {
+				d.Module.Confidence = 1.0
+			}
+			if d.Intent.Value != "" && d.Intent.Confidence == 0 {
+				d.Intent.Confidence = 1.0
+			}
 			return d, true, nil
 		}
 	}

@@ -8,12 +8,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/internal/retry"
@@ -71,12 +73,12 @@ type streamOptions struct {
 }
 
 type chatRequestBody struct {
-	Model          string          `json:"model"`
-	Messages       []chatMessage   `json:"messages"`
-	Stream         bool            `json:"stream"`
-	StreamOptions  *streamOptions  `json:"stream_options,omitempty"`
-	MaxTokens      int             `json:"max_tokens,omitempty"`
-	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []chatMessage   `json:"messages"`
+	Stream              bool            `json:"stream"`
+	StreamOptions       *streamOptions  `json:"stream_options,omitempty"`
+	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
+	ResponseFormat      *responseFormat `json:"response_format,omitempty"`
 }
 
 type promptTokensDetails struct {
@@ -98,21 +100,29 @@ type chatChoice struct {
 	FinishReason string    `json:"finish_reason"`
 }
 
+type chatAPIError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+}
+
 type chatChunk struct {
-	Model   string       `json:"model"`
-	Choices []chatChoice `json:"choices"`
-	Usage   *chatUsage   `json:"usage"`
+	Model   string        `json:"model"`
+	Choices []chatChoice  `json:"choices"`
+	Usage   *chatUsage    `json:"usage"`
+	Error   *chatAPIError `json:"error,omitempty"`
 }
 
 type apiErrorBody struct {
-	Error struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Code    string `json:"code"`
-	} `json:"error"`
+	Error chatAPIError `json:"error"`
 }
 
 // Stream implements ai.LLMProvider.
+//
+// Fatal-error contract (see ai.LLMProvider doc): every fatal condition
+// yields exactly one final (ai.Event{Type: ai.EventError, Error: e}, e) and
+// returns; EventStarted is only yielded once the HTTP request has actually
+// succeeded.
 func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, error] {
 	return func(yield func(ai.Event, error) bool) {
 		model := req.Model
@@ -121,41 +131,38 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		}
 
 		body := chatRequestBody{
-			Model:         model,
-			Messages:      buildMessages(req),
-			Stream:        true,
-			StreamOptions: &streamOptions{IncludeUsage: true},
-			MaxTokens:     req.MaxTokens,
+			Model:               model,
+			Messages:            buildMessages(req),
+			Stream:              true,
+			StreamOptions:       &streamOptions{IncludeUsage: true},
+			MaxCompletionTokens: req.MaxTokens,
 		}
 		wantStructured := len(req.ResponseSchema) > 0
 		if wantStructured {
+			strict := req.StrictSchema == nil || *req.StrictSchema
 			body.ResponseFormat = &responseFormat{
 				Type: "json_schema",
 				JSONSchema: jsonSchemaFormat{
 					Name:   "response",
 					Schema: req.ResponseSchema,
-					Strict: true,
+					Strict: strict,
 				},
 			}
 		}
 		payload, err := json.Marshal(body)
 		if err != nil {
-			yield(ai.Event{}, err)
+			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeInvalid, Message: err.Error()})
 			return
 		}
 
 		var resp *http.Response
 		doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
 			r, e := p.doRequest(ctx, payload)
-			if e != nil {
-				resp = r
-				return e
-			}
 			resp = r
-			return nil
+			return e
 		})
 		if doErr != nil {
-			yield(ai.Event{}, doErr)
+			yieldFatal(yield, toAIError(ctx, doErr))
 			return
 		}
 		defer func() { _ = resp.Body.Close() }()
@@ -167,7 +174,9 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		var structuredBuf strings.Builder
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		sc.Split(scanSSELines)
 		var usage *ai.Usage
+		sawDone := false
 		for sc.Scan() {
 			line := sc.Text()
 			if !strings.HasPrefix(line, "data:") {
@@ -175,6 +184,7 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			}
 			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if data == "[DONE]" {
+				sawDone = true
 				break
 			}
 			if data == "" {
@@ -182,10 +192,12 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			}
 			var chunk chatChunk
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				if !yield(ai.Event{}, fmt.Errorf("openaicompat: bad chunk: %w", err)) {
-					return
-				}
-				continue
+				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: fmt.Sprintf("openaicompat: bad chunk: %v", err)})
+				return
+			}
+			if chunk.Error != nil {
+				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: chunk.Error.Message})
+				return
 			}
 			if chunk.Usage != nil {
 				u := &ai.Usage{
@@ -209,10 +221,18 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 						return
 					}
 				}
+				if c.FinishReason == "length" && wantStructured {
+					yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "openaicompat: response truncated at max_completion_tokens before a complete structured JSON object was produced"})
+					return
+				}
 			}
 		}
 		if err := sc.Err(); err != nil {
-			yield(ai.Event{}, err)
+			yieldFatal(yield, toAIError(ctx, err))
+			return
+		}
+		if !sawDone {
+			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "openaicompat: stream truncated (no [DONE] marker)"})
 			return
 		}
 
@@ -225,6 +245,28 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 
 		yield(ai.Event{Type: ai.EventCompleted, Usage: usage}, nil)
 	}
+}
+
+// yieldFatal yields the single fatal-pair event the LLMProvider contract
+// requires and nothing else. The caller must return immediately afterward.
+func yieldFatal(yield func(ai.Event, error) bool, e *ai.Error) {
+	yield(ai.Event{Type: ai.EventError, Error: e}, e)
+}
+
+// toAIError normalises err to *ai.Error, mapping context cancellation to
+// ErrCodeCanceled (never retryable) ahead of any other classification.
+func toAIError(ctx context.Context, err error) *ai.Error {
+	var aiErr *ai.Error
+	if errors.As(err, &aiErr) {
+		if ctx.Err() != nil {
+			return &ai.Error{Code: ai.ErrCodeCanceled, Message: ctx.Err().Error()}
+		}
+		return aiErr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
+	}
+	return &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
 }
 
 func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Response, error) {
@@ -243,6 +285,9 @@ func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Respons
 	}
 	resp, err := p.cfg.HTTPClient.Do(httpReq)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
+		}
 		return nil, &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -250,7 +295,39 @@ func (p *Provider) doRequest(ctx context.Context, payload []byte) (*http.Respons
 	}
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		waitOnRetryAfter(ctx, resp.Header.Get("Retry-After"))
+	}
 	return nil, httpStatusError(resp.StatusCode, b)
+}
+
+// waitOnRetryAfter blocks for the duration a 429 response's Retry-After
+// header asks for (seconds, or an HTTP-date), up to a sane cap, before the
+// retry helper's own backoff runs. It never blocks past ctx cancellation and
+// silently does nothing for a header it can't parse.
+func waitOnRetryAfter(ctx context.Context, header string) {
+	if header == "" {
+		return
+	}
+	var d time.Duration
+	if secs, err := strconv.Atoi(strings.TrimSpace(header)); err == nil {
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(header); err == nil {
+		d = time.Until(t)
+	} else {
+		return
+	}
+	if d <= 0 {
+		return
+	}
+	const maxWait = 30 * time.Second
+	if d > maxWait {
+		d = maxWait
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
 }
 
 func httpStatusError(status int, body []byte) error {
@@ -275,30 +352,27 @@ func httpStatusError(status int, body []byte) error {
 	}
 }
 
-// buildMessages renders System and Context as one leading system message
-// (static blocks first, in order, then dynamic blocks), followed by the
-// conversation. The Chat Completions API has no separate cache-control knob,
-// so keeping the same leading text stable across turns is what lets a
-// provider-side prefix cache (when the backend has one) still apply.
+// buildMessages renders System plus the STATIC context blocks as one leading
+// system message (stable across turns, so a provider-side prefix cache can
+// hit), then the conversation history unchanged, then splices the DYNAMIC
+// context blocks as a clearly delimited prefix of the last message (assumed
+// to be the current user turn) rather than into the cached system prefix --
+// per-turn data must never precede/pollute the stable, cacheable history.
 func buildMessages(req ai.ChatRequest) []chatMessage {
 	var sys strings.Builder
 	sys.WriteString(req.System)
-	writeBlocks := func(kind ai.ContextKind) {
-		for _, b := range req.Context {
-			if b.Kind != kind {
-				continue
-			}
-			if sys.Len() > 0 {
-				sys.WriteString("\n\n")
-			}
-			if b.Name != "" {
-				sys.WriteString("# " + b.Name + "\n")
-			}
-			sys.WriteString(b.Text)
+	for _, b := range req.Context {
+		if b.Kind != ai.ContextStatic {
+			continue
 		}
+		if sys.Len() > 0 {
+			sys.WriteString("\n\n")
+		}
+		if b.Name != "" {
+			sys.WriteString("# " + b.Name + "\n")
+		}
+		sys.WriteString(b.Text)
 	}
-	writeBlocks(ai.ContextStatic)
-	writeBlocks(ai.ContextDynamic)
 
 	msgs := make([]chatMessage, 0, len(req.Messages)+1)
 	if sys.Len() > 0 {
@@ -307,7 +381,34 @@ func buildMessages(req ai.ChatRequest) []chatMessage {
 	for _, m := range req.Messages {
 		msgs = append(msgs, chatMessage{Role: string(m.Role), Content: m.Text})
 	}
+
+	if dyn := renderDynamic(req.Context); dyn != "" && len(msgs) > 0 {
+		last := &msgs[len(msgs)-1]
+		last.Content = dyn + last.Content
+	}
 	return msgs
+}
+
+// renderDynamic renders the dynamic context blocks as a clearly delimited
+// block, or "" when there are none.
+func renderDynamic(blocks []ai.ContextBlock) string {
+	var dyn strings.Builder
+	for _, b := range blocks {
+		if b.Kind != ai.ContextDynamic {
+			continue
+		}
+		if dyn.Len() > 0 {
+			dyn.WriteString("\n\n")
+		}
+		if b.Name != "" {
+			dyn.WriteString("# " + b.Name + "\n")
+		}
+		dyn.WriteString(b.Text)
+	}
+	if dyn.Len() == 0 {
+		return ""
+	}
+	return "[context]\n" + dyn.String() + "\n[/context]\n\n"
 }
 
 // extractJSON tolerates a ```json fenced response, returning the JSON body.
@@ -320,4 +421,22 @@ func extractJSON(s string) string {
 		s = strings.TrimSpace(s)
 	}
 	return s
+}
+
+// scanSSELines is bufio.ScanLines but also splits on a bare '\r' (some SSE
+// producers use old Mac-style line endings), not just "\n" and "\r\n".
+func scanSSELines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		if data[i] == '\r' && i+1 < len(data) && data[i+1] == '\n' {
+			return i + 2, data[:i], nil
+		}
+		return i + 1, data[:i], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }

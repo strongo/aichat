@@ -173,6 +173,64 @@ func TestReadEvents_EventNameFallsBackForType(t *testing.T) {
 	}
 }
 
+func TestReadEvents_ErrorEventIsFatalPair(t *testing.T) {
+	raw := "event: text.delta\ndata: {\"type\":\"text.delta\",\"text\":\"partial\"}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"upstream\",\"message\":\"boom\"}}\n\n" +
+		"event: text.delta\ndata: {\"type\":\"text.delta\",\"text\":\"should not appear\"}\n\n"
+	var got []ai.Event
+	var lastErr error
+	for ev, err := range ReadEvents(strings.NewReader(raw)) {
+		got = append(got, ev)
+		lastErr = err
+		if err != nil {
+			break
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("got = %+v, want exactly 2 yields (text.delta, fatal error)", got)
+	}
+	if lastErr == nil {
+		t.Fatal("expected a fatal error on the error event")
+	}
+	last := got[len(got)-1]
+	if last.Type != ai.EventError || last.Error == nil || last.Error.Message != "boom" {
+		t.Fatalf("last event = %+v, want the fatal EventError", last)
+	}
+}
+
+func TestReadEvents_TruncatedWithoutCompletedIsFatal(t *testing.T) {
+	raw := "event: text.delta\ndata: {\"type\":\"text.delta\",\"text\":\"partial\"}\n\n"
+	// stream just ends -- no response.completed, no error event.
+	var got []ai.Event
+	var lastErr error
+	for ev, err := range ReadEvents(strings.NewReader(raw)) {
+		got = append(got, ev)
+		lastErr = err
+	}
+	if lastErr == nil {
+		t.Fatal("expected a fatal truncation error")
+	}
+	last := got[len(got)-1]
+	if last.Type != ai.EventError {
+		t.Fatalf("last event = %+v, want a fatal EventError for truncation", last)
+	}
+}
+
+func TestReadEvents_BareCRLineEndings(t *testing.T) {
+	raw := "event: text.delta\rdata: {\"type\":\"text.delta\",\"text\":\"hi\"}\r\r" +
+		"event: response.completed\rdata: {\"type\":\"response.completed\"}\r\r"
+	var got []ai.Event
+	for ev, err := range ReadEvents(strings.NewReader(raw)) {
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		got = append(got, ev)
+	}
+	if len(got) != 2 || got[0].Text != "hi" || got[1].Type != ai.EventCompleted {
+		t.Fatalf("got = %+v, want bare-CR line endings parsed like LF", got)
+	}
+}
+
 func TestErrorResponse_JSON(t *testing.T) {
 	er := ErrorResponse{Error: ai.Error{Code: ai.ErrCodeAuth, Message: "bad key"}}
 	b, err := json.Marshal(er)

@@ -5,6 +5,7 @@ package diag
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -47,9 +48,29 @@ type Turn struct {
 	DecisionLatency time.Duration `json:"decisionLatency,omitempty"`
 	LLMLatency      time.Duration `json:"llmLatency,omitempty"`
 
-	// Errors are error strings (never structured error values that might
-	// wrap sensitive data) collected while handling the turn.
+	// Errors are short CLASSIFIERS (an *ai.Error.Code such as "upstream" or
+	// "rate_limited", or "error" for anything else) collected while handling
+	// the turn -- NEVER a raw error message or upstream response body, which
+	// can carry arbitrary user content or provider-internal detail this
+	// package promises never to log. Build entries with ErrorCode, don't
+	// append err.Error() directly.
 	Errors []string `json:"errors,omitempty"`
+}
+
+// ErrorCode classifies err down to a short, safe-to-log string: an
+// *ai.Error's Code when err is (or wraps) one, or "error" otherwise. It
+// never returns err's message text. Use it to build Turn.Errors:
+//
+//	t.Errors = append(t.Errors, diag.ErrorCode(err))
+func ErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	var aiErr *ai.Error
+	if errors.As(err, &aiErr) && aiErr.Code != "" {
+		return aiErr.Code
+	}
+	return "error"
 }
 
 // Log emits t at Debug level via logger. It is a thin wrapper so callers
@@ -79,7 +100,19 @@ func Log(ctx context.Context, logger *slog.Logger, t Turn) {
 		attrs = append(attrs, slog.Any("actualScopes", t.ActualScopes))
 	}
 	if t.Usage != nil {
-		attrs = append(attrs, slog.Int64("inputTokens", t.Usage.InputTokens), slog.Int64("outputTokens", t.Usage.OutputTokens), slog.Int64("cacheReadTokens", t.Usage.CacheReadTokens))
+		attrs = append(attrs,
+			slog.Int64("inputTokens", t.Usage.InputTokens),
+			slog.Int64("outputTokens", t.Usage.OutputTokens),
+			slog.Int64("cacheReadTokens", t.Usage.CacheReadTokens),
+			slog.Int64("cacheWriteTokens", t.Usage.CacheWriteTokens),
+		)
+		if t.Usage.Allowance != nil {
+			attrs = append(attrs,
+				slog.String("allowanceUnit", t.Usage.Allowance.Unit),
+				slog.Int64("allowanceUsed", t.Usage.Allowance.Used),
+				slog.Int64("allowanceLimit", t.Usage.Allowance.Limit),
+			)
+		}
 	}
 	if len(t.Errors) > 0 {
 		attrs = append(attrs, slog.Any("errors", t.Errors))

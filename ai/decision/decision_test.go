@@ -3,6 +3,7 @@ package decision
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -21,8 +22,9 @@ func taxonomy() Taxonomy {
 
 func decided(module, intent string, conf float64) Decision {
 	return Decision{
-		Module: Scored{Value: module, Confidence: conf},
-		Intent: Scored{Value: intent, Confidence: conf},
+		Module:      Scored{Value: module, Confidence: conf},
+		Intent:      Scored{Value: intent, Confidence: conf},
+		Interaction: InteractionCommand,
 	}
 }
 
@@ -267,5 +269,151 @@ func TestRequest_State(t *testing.T) {
 	r.State = session.State{}
 	if r.State.Focused != nil {
 		t.Fatalf("State.Focused = %v", r.State.Focused)
+	}
+}
+
+func TestValidate_InteractionRequired(t *testing.T) {
+	d := decided("calendar", "show", 0.9)
+	d.Interaction = ""
+	err := Validate(d, taxonomy())
+	if err == nil || !strings.Contains(err.Error(), "interaction is required") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestValidate_UnknownInteraction(t *testing.T) {
+	d := decided("calendar", "show", 0.9)
+	d.Interaction = Interaction("nope")
+	err := Validate(d, taxonomy())
+	if err == nil || !strings.Contains(err.Error(), "unknown interaction") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestValidate_ModuleOptionalForConfirmationEtc(t *testing.T) {
+	for _, ia := range []Interaction{InteractionConfirmation, InteractionRejection, InteractionCancellation, InteractionUndo} {
+		d := Decision{Interaction: ia}
+		if err := Validate(d, taxonomy()); err != nil {
+			t.Errorf("interaction %q: unexpected error with empty module: %v", ia, err)
+		}
+	}
+}
+
+func TestValidate_ModuleStillRequiredForOtherInteractions(t *testing.T) {
+	d := Decision{Interaction: InteractionCommand}
+	err := Validate(d, taxonomy())
+	if err == nil || !strings.Contains(err.Error(), "unknown module") {
+		t.Fatalf("err = %v, want unknown module for a non-exempt interaction with empty Module", err)
+	}
+}
+
+func TestValidate_ReferenceKindAgainstEntityTypes(t *testing.T) {
+	tx := taxonomy()
+	tx.EntityTypes = []string{"happening"}
+	d := decided("calendar", "show", 0.9)
+	d.Reference = &Reference{Kind: "unknown_entity"}
+	err := Validate(d, tx)
+	if err == nil || !strings.Contains(err.Error(), "unknown reference kind") {
+		t.Fatalf("err = %v", err)
+	}
+	d.Reference.Kind = "happening"
+	if err := Validate(d, tx); err != nil {
+		t.Fatalf("unexpected error for a known reference kind: %v", err)
+	}
+}
+
+func TestValidate_RequiredDataAgainstDataKinds(t *testing.T) {
+	tx := taxonomy()
+	tx.DataKinds = []string{"relevant_happenings"}
+	d := decided("calendar", "show", 0.9)
+	d.RequiredData = []string{"nope"}
+	err := Validate(d, tx)
+	if err == nil || !strings.Contains(err.Error(), "unknown required data kind") {
+		t.Fatalf("err = %v", err)
+	}
+	d.RequiredData = []string{"relevant_happenings"}
+	if err := Validate(d, tx); err != nil {
+		t.Fatalf("unexpected error for a known data kind: %v", err)
+	}
+}
+
+func TestChain_ModuleOptionalDecisionAcceptedAtAnyConfidence(t *testing.T) {
+	p1 := providerFunc{"p1", func(ctx context.Context, r Request) (Decision, bool, error) {
+		return Decision{Interaction: InteractionConfirmation}, true, nil
+	}}
+	c := Chain{Providers: []Provider{p1}}
+	d, ok, tr := c.Decide(context.Background(), req())
+	if !ok {
+		t.Fatalf("expected a module-optional confirmation to be accepted: tr=%+v", tr)
+	}
+	if d.Interaction != InteractionConfirmation {
+		t.Fatalf("d = %+v", d)
+	}
+}
+
+func TestChain_MinConfidenceNegativeAcceptsAny(t *testing.T) {
+	p1 := providerFunc{"p1", func(ctx context.Context, r Request) (Decision, bool, error) {
+		return decided("calendar", "show", 0.01), true, nil
+	}}
+	c := Chain{Providers: []Provider{p1}, MinConfidence: -1}
+	_, ok, tr := c.Decide(context.Background(), req())
+	if !ok {
+		t.Fatalf("MinConfidence<0 must accept any confidence: tr=%+v", tr)
+	}
+}
+
+func TestChain_MinConfidenceZeroDefaultsTo07(t *testing.T) {
+	p1 := providerFunc{"p1", func(ctx context.Context, r Request) (Decision, bool, error) {
+		return decided("calendar", "show", 0.5), true, nil
+	}}
+	c := Chain{Providers: []Provider{p1}} // MinConfidence zero value
+	_, ok, tr := c.Decide(context.Background(), req())
+	if ok {
+		t.Fatalf("default MinConfidence 0.7 must reject a 0.5 decision: tr=%+v", tr)
+	}
+}
+
+// timeoutProbeProvider reports the ctx deadline it was actually given, so a
+// test can assert Chain honoured DecisionTimeout() instead of the chain
+// default.
+type timeoutProbeProvider struct {
+	name    string
+	timeout time.Duration
+	got     chan time.Duration
+}
+
+func (p timeoutProbeProvider) Name() string                   { return p.name }
+func (p timeoutProbeProvider) DecisionTimeout() time.Duration { return p.timeout }
+func (p timeoutProbeProvider) Decide(ctx context.Context, r Request) (Decision, bool, error) {
+	dl, _ := ctx.Deadline()
+	p.got <- time.Until(dl)
+	return Decision{}, false, nil
+}
+
+func TestChain_HonoursProviderDecisionTimeout(t *testing.T) {
+	got := make(chan time.Duration, 1)
+	p := timeoutProbeProvider{name: "p", timeout: 4 * time.Second, got: got}
+	c := Chain{Providers: []Provider{p}, Timeout: 50 * time.Millisecond}
+	_, _, _ = c.Decide(context.Background(), req())
+	d := <-got
+	if d < 3*time.Second {
+		t.Fatalf("provider's actual deadline was %v, want close to its own 4s DecisionTimeout (chain default is 50ms)", d)
+	}
+}
+
+func TestChain_TimeoutDetectionUsesErrorsIs(t *testing.T) {
+	// A provider that wraps context.DeadlineExceeded must still be
+	// classified as "timeout", not "error", per R3 (errors.Is, not ==).
+	p1 := providerFunc{"p1", func(ctx context.Context, r Request) (Decision, bool, error) {
+		<-ctx.Done()
+		return Decision{}, false, fmt.Errorf("wrapped: %w", ctx.Err())
+	}}
+	c := Chain{Providers: []Provider{p1}, Timeout: 10 * time.Millisecond}
+	_, ok, tr := c.Decide(context.Background(), req())
+	if ok {
+		t.Fatal("expected no decision")
+	}
+	if tr.Attempts[0].Outcome != "timeout" {
+		t.Fatalf("Attempts[0] = %+v, want outcome=timeout", tr.Attempts[0])
 	}
 }

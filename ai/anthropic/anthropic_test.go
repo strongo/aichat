@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/strongo/aichat/ai"
 )
@@ -108,13 +109,16 @@ func TestStream_SystemCacheControlOnLastStaticBlock(t *testing.T) {
 			{Scope: "s", Kind: ai.ContextStatic, Name: "skillB", Text: "static B"},
 			{Scope: "s", Kind: ai.ContextDynamic, Name: "now", Text: "dyn now"},
 		},
+		Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
 	}
 	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// blocks: [system, staticA, staticB(cache), dynamic]
-	if len(gotBody.System) != 4 {
+	// system blocks: [system, staticA, staticB(cache)] -- dynamic must NOT
+	// be in the cached system prefix at all (see M7: dynamic context must
+	// not precede history).
+	if len(gotBody.System) != 3 {
 		t.Fatalf("System blocks = %+v", gotBody.System)
 	}
 	if !strings.Contains(gotBody.System[0].Text, "You are helpful.") {
@@ -132,8 +136,54 @@ func TestStream_SystemCacheControlOnLastStaticBlock(t *testing.T) {
 	if gotBody.System[2].CacheControl == nil || gotBody.System[2].CacheControl.Type != "ephemeral" {
 		t.Errorf("System[2].CacheControl = %+v, want ephemeral on the LAST static block", gotBody.System[2].CacheControl)
 	}
-	if !strings.Contains(gotBody.System[3].Text, "dyn now") || gotBody.System[3].CacheControl != nil {
-		t.Errorf("System[3] (dynamic, must follow static, uncached) = %+v", gotBody.System[3])
+	if len(gotBody.Messages) != 1 || len(gotBody.Messages[0].Content) != 1 {
+		t.Fatalf("Messages = %+v", gotBody.Messages)
+	}
+	msgText := gotBody.Messages[0].Content[0].Text
+	if !strings.Contains(msgText, "dyn now") {
+		t.Errorf("dynamic context must be spliced into the last (current-turn) message: %q", msgText)
+	}
+	if !strings.HasSuffix(msgText, "hi") {
+		t.Errorf("last message must still end with the original user text: %q", msgText)
+	}
+}
+
+func TestStream_CacheControlOnLastHistoryMessage(t *testing.T) {
+	var gotBody messagesRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "first"},
+			{Role: ai.RoleAssistant, Text: "reply"},
+			{Role: ai.RoleUser, Text: "second"},
+		},
+	}
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotBody.Messages) != 3 {
+		t.Fatalf("Messages = %+v", gotBody.Messages)
+	}
+	// The last message BEFORE the final turn (index len-2, "reply") must
+	// carry cache_control so the history itself is cached, not just system.
+	histLast := gotBody.Messages[1].Content[0]
+	if histLast.CacheControl == nil || histLast.CacheControl.Type != "ephemeral" {
+		t.Errorf("Messages[1] (last history message) CacheControl = %+v, want ephemeral", histLast.CacheControl)
+	}
+	if gotBody.Messages[0].Content[0].CacheControl != nil {
+		t.Errorf("Messages[0] must not carry cache_control")
+	}
+	if gotBody.Messages[2].Content[0].CacheControl != nil {
+		t.Errorf("Messages[2] (current turn) must not carry cache_control")
 	}
 }
 
@@ -242,6 +292,118 @@ func TestStream_RetriesOnlyBeforeFirstByte(t *testing.T) {
 	}
 	if attempts != 3 {
 		t.Errorf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestStream_TruncatedWithoutMessageStopIsFatal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}`)
+		// connection ends without message_stop.
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	text, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeUpstream {
+		t.Fatalf("err = %v, want upstream truncation error", err)
+	}
+	if text != "partial" {
+		t.Errorf("text = %q", text)
+	}
+}
+
+func TestStream_MaxTokensFatalOnlyWithSchema(t *testing.T) {
+	newSrv := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}`)
+			sseWrite(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":5}}`)
+			sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+		}))
+	}
+
+	srv1 := newSrv()
+	defer srv1.Close()
+	p1 := New(Config{BaseURL: srv1.URL, APIKey: "k"})
+	_, _, _, err := ai.Collect(p1.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("without ResponseSchema, stop_reason=max_tokens must not be fatal: %v", err)
+	}
+
+	srv2 := newSrv()
+	defer srv2.Close()
+	p2 := New(Config{BaseURL: srv2.URL, APIKey: "k"})
+	_, _, _, err = ai.Collect(p2.Stream(context.Background(), ai.ChatRequest{ResponseSchema: json.RawMessage(`{}`)}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) {
+		t.Fatalf("with ResponseSchema, stop_reason=max_tokens must be fatal: %v", err)
+	}
+}
+
+func TestStream_PingEventTolerated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "ping", `{"type":"ping"}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	text, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if text != "ok" {
+		t.Errorf("text = %q", text)
+	}
+}
+
+func TestMergeUsage_DoesNotClobberWithZeroFields(t *testing.T) {
+	prev := &ai.Usage{InputTokens: 20, CacheReadTokens: 5, CacheWriteTokens: 2}
+	next := &ai.Usage{OutputTokens: 7} // message_delta typically carries only this
+	got := mergeUsage(prev, next)
+	if got.InputTokens != 20 || got.CacheReadTokens != 5 || got.CacheWriteTokens != 2 {
+		t.Errorf("mergeUsage clobbered earlier fields: %+v", got)
+	}
+	if got.OutputTokens != 7 {
+		t.Errorf("mergeUsage did not take the newer field: %+v", got)
+	}
+}
+
+func TestStream_CtxCancelMidBodyIsCanceled(t *testing.T) {
+	started := make(chan struct{})
+	disconnected := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}`)
+		close(started)
+		<-r.Context().Done()
+		close(disconnected)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+	_, _, _, err := ai.Collect(p.Stream(ctx, ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeCanceled {
+		t.Fatalf("err = %v, want ErrCodeCanceled", err)
+	}
+	if aiErr.Retryable {
+		t.Error("a cancellation must never be retryable")
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never observed the client disconnect")
 	}
 }
 

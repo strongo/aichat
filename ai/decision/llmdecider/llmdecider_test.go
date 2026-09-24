@@ -7,6 +7,7 @@ import (
 	"iter"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/decision"
@@ -15,6 +16,67 @@ import (
 func TestDecisionSchema_IsValidJSON(t *testing.T) {
 	if !json.Valid([]byte(decisionSchema)) {
 		t.Fatal("decisionSchema is not valid JSON")
+	}
+}
+
+func TestDecisionSchema_IsStrictValid(t *testing.T) {
+	// OpenAI's strict structured-output mode requires, recursively, on every
+	// object schema: "required" lists EVERY key in "properties" (optionality
+	// is expressed via a ["T","null"] type union, never by omission from
+	// required), and "additionalProperties": false is set. Walk the whole
+	// schema and check both.
+	var root map[string]any
+	if err := json.Unmarshal([]byte(decisionSchema), &root); err != nil {
+		t.Fatal(err)
+	}
+	walkStrict(t, "$", root)
+}
+
+func walkStrict(t *testing.T, path string, node map[string]any) {
+	t.Helper()
+	typ, _ := node["type"].(string)
+	isArrayOfTypes := false
+	if arr, ok := node["type"].([]any); ok {
+		isArrayOfTypes = true
+		for _, v := range arr {
+			if v == "object" {
+				typ = "object"
+			}
+		}
+	}
+	_ = isArrayOfTypes
+	if typ != "object" {
+		if props, ok := node["properties"]; ok {
+			t.Errorf("%s: has properties but type=%v (must be \"object\" or include it)", path, node["type"])
+			_ = props
+		}
+		// Recurse into array items and any nested object schemas we can find.
+		if items, ok := node["items"].(map[string]any); ok {
+			walkStrict(t, path+".items", items)
+		}
+		return
+	}
+	props, _ := node["properties"].(map[string]any)
+	addl, hasAddl := node["additionalProperties"]
+	if !hasAddl || addl != false {
+		t.Errorf("%s: additionalProperties must be exactly false, got %v (present=%v)", path, addl, hasAddl)
+	}
+	required, _ := node["required"].([]any)
+	requiredSet := map[string]bool{}
+	for _, r := range required {
+		if s, ok := r.(string); ok {
+			requiredSet[s] = true
+		}
+	}
+	for k := range props {
+		if !requiredSet[k] {
+			t.Errorf("%s: property %q is not in \"required\" (strict mode requires every property)", path, k)
+		}
+	}
+	for k, v := range props {
+		if sub, ok := v.(map[string]any); ok {
+			walkStrict(t, path+"."+k, sub)
+		}
 	}
 }
 
@@ -200,5 +262,23 @@ func TestDecide_SessionStateAndRecentInContext(t *testing.T) {
 	}
 	if !strings.Contains(block.Text, "turn2") || !strings.Contains(block.Text, "turn3") {
 		t.Errorf("expected the last 2 recent lines: %q", block.Text)
+	}
+}
+
+func TestDecide_MaxRecentNegativeMeansNoLimit(t *testing.T) {
+	llm := &fakeLLM{events: []ai.Event{{Type: ai.EventCompleted}}}
+	dec := New(llm, Options{MaxRecent: -1})
+	req := decision.Request{Text: "x", Taxonomy: taxonomy(), Recent: []string{"turn1", "turn2", "turn3"}}
+	_, _, _ = dec.Decide(context.Background(), req)
+	block := llm.lastReq.Context[0]
+	if !strings.Contains(block.Text, "turn1") {
+		t.Errorf("MaxRecent<0 must send every recent line, got %q", block.Text)
+	}
+}
+
+func TestDecider_DecisionTimeoutIs4s(t *testing.T) {
+	dec := New(&fakeLLM{}, Options{})
+	if dec.DecisionTimeout() != 4*time.Second {
+		t.Errorf("DecisionTimeout() = %v, want 4s", dec.DecisionTimeout())
 	}
 }

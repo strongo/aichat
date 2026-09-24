@@ -1,28 +1,40 @@
 // Package cloud is the client for the cloudproto protocol (see
-// ai/cloudproto): it implements ai.LLMProvider (chat) and decision.Provider
-// (decision), plus a Usage lookup.
+// ai/cloudproto): it implements ai.LLMProvider (chat) and exposes a separate
+// decision.Provider via Decider(), plus a Usage lookup.
 package cloud
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/cloudproto"
 	"github.com/strongo/aichat/ai/decision"
+	"github.com/strongo/aichat/ai/internal/retry"
 )
+
+// decisionTimeout is how long Chain should wait for the cloud decision
+// service per call (see decision.Chain's optional DecisionTimeout hook). A
+// remote decision call is inherently slower than a local rule/LLM call
+// running against a nearby model, so it gets a longer allowance than
+// Chain's 1500ms default.
+const decisionTimeout = 4 * time.Second
 
 // Config configures a Client.
 type Config struct {
 	// BaseURL is the API base URL including its version prefix, e.g.
-	// "https://api.sneat.cloud/v0/". A trailing slash is added if missing.
+	// "https://api.example.com/v0/". A trailing slash is added if missing.
+	// The product supplies this (see ai/aiconfig); this package has no
+	// default of its own.
 	BaseURL string
 	// Product identifies the consuming product for metering/limits/routing
 	// and is sent as the X-AI-Product header and ai.ChatRequest.Product /
@@ -33,8 +45,11 @@ type Config struct {
 	HTTPClient *http.Client
 }
 
-// Client implements ai.LLMProvider (Name "cloud") and decision.Provider
-// (Name "cloud-decision").
+// Client implements ai.LLMProvider (Name "cloud"). Its decision.Provider
+// role is a SEPARATE value returned by Decider() (Name "cloud-decision"):
+// Go dispatches one Name() per concrete type, so a single type cannot report
+// two different names to two different interfaces, and Decider() is how
+// that split is actually satisfied.
 type Client struct {
 	cfg Config
 }
@@ -57,19 +72,34 @@ func New(cfg Config) *Client {
 	return &Client{cfg: cfg}
 }
 
-// Name implements both ai.LLMProvider and decision.Provider. Go method sets
-// cannot return a different string per interface on the same type (the
-// brief's "Name cloud" / "Name cloud-decision" split is not literally
-// satisfiable from one Name() method); *Client reports "cloud" for both
-// roles. diag.Turn.Provider plus the fact that a Turn's Decision != nil
-// already disambiguates which role produced a given diagnostic record.
-const clientName = "cloud"
+// Name implements ai.LLMProvider.
+func (c *Client) Name() string { return "cloud" }
 
-// Name implements ai.LLMProvider and decision.Provider.
-func (c *Client) Name() string { return clientName }
+// Decider returns c's decision.Provider role (Name "cloud-decision"),
+// backed by POST ai/decision. It also implements the optional
+// `DecisionTimeout() time.Duration` interface decision.Chain honours, so a
+// remote decision call gets more time than Chain's local-call default.
+func (c *Client) Decider() decision.Provider { return decider{c} }
+
+type decider struct{ c *Client }
+
+func (d decider) Name() string { return "cloud-decision" }
+
+func (d decider) DecisionTimeout() time.Duration { return decisionTimeout }
+
+func (d decider) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
+	return d.c.decide(ctx, req)
+}
 
 // Stream implements ai.LLMProvider by POSTing ai/chat and parsing the SSE
 // response with cloudproto.ReadEvents.
+//
+// Fatal-error contract (see ai.LLMProvider doc): every fatal condition
+// yields exactly one final (ai.Event{Type: ai.EventError, Error: e}, e) and
+// returns; EventStarted is only yielded once the HTTP request has actually
+// succeeded. cloudproto.ReadEvents already conforms (an EventError frame or
+// an unterminated stream is fatal there too), so Stream relays its events
+// unchanged and only has to normalise its OWN pre-body errors the same way.
 func (c *Client) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, error] {
 	return func(yield func(ai.Event, error) bool) {
 		if req.Product == "" {
@@ -77,26 +107,22 @@ func (c *Client) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Ev
 		}
 		payload, err := json.Marshal(req)
 		if err != nil {
-			yield(ai.Event{}, err)
+			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeInvalid, Message: err.Error()})
 			return
 		}
-		httpReq, err := c.newRequest(ctx, cloudproto.PathChat, payload)
-		if err != nil {
-			yield(ai.Event{}, err)
-			return
-		}
-		httpReq.Header.Set("Accept", cloudproto.ContentTypeSSE)
 
-		resp, err := c.cfg.HTTPClient.Do(httpReq)
-		if err != nil {
-			yield(ai.Event{}, &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true})
+		var resp *http.Response
+		doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
+			r, e := c.doStreamRequest(ctx, payload)
+			resp = r
+			return e
+		})
+		if doErr != nil {
+			yieldFatal(yield, toAIError(ctx, doErr))
 			return
 		}
 		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			yield(ai.Event{}, decodeHTTPError(resp))
-			return
-		}
+
 		for ev, err := range cloudproto.ReadEvents(resp.Body) {
 			if !yield(ev, err) {
 				return
@@ -108,8 +134,50 @@ func (c *Client) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Ev
 	}
 }
 
-// Decide implements decision.Provider.
-func (c *Client) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
+func (c *Client) doStreamRequest(ctx context.Context, payload []byte) (*http.Response, error) {
+	httpReq, err := c.newRequest(ctx, cloudproto.PathChat, payload)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Accept", cloudproto.ContentTypeSSE)
+	resp, err := c.cfg.HTTPClient.Do(httpReq)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
+		}
+		return nil, &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp, nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return nil, decodeHTTPError(resp)
+}
+
+// yieldFatal yields the single fatal-pair event the LLMProvider contract
+// requires and nothing else. The caller must return immediately afterward.
+func yieldFatal(yield func(ai.Event, error) bool, e *ai.Error) {
+	yield(ai.Event{Type: ai.EventError, Error: e}, e)
+}
+
+// toAIError normalises err to *ai.Error, mapping context cancellation to
+// ErrCodeCanceled (never retryable) ahead of any other classification.
+func toAIError(ctx context.Context, err error) *ai.Error {
+	var aiErr *ai.Error
+	if errors.As(err, &aiErr) {
+		if ctx.Err() != nil {
+			return &ai.Error{Code: ai.ErrCodeCanceled, Message: ctx.Err().Error()}
+		}
+		return aiErr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
+	}
+	return &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
+}
+
+// decide implements the decision.Provider role.
+func (c *Client) decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
 	if req.Product == "" {
 		req.Product = c.cfg.Product
 	}
@@ -117,20 +185,34 @@ func (c *Client) Decide(ctx context.Context, req decision.Request) (decision.Dec
 	if err != nil {
 		return decision.Decision{}, false, err
 	}
-	httpReq, err := c.newRequest(ctx, cloudproto.PathDecision, payload)
-	if err != nil {
-		return decision.Decision{}, false, err
-	}
-	httpReq.Header.Set("Accept", "application/json")
 
-	resp, err := c.cfg.HTTPClient.Do(httpReq)
-	if err != nil {
-		return decision.Decision{}, false, &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
+	var resp *http.Response
+	doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
+		httpReq, e := c.newRequest(ctx, cloudproto.PathDecision, payload)
+		if e != nil {
+			return e
+		}
+		httpReq.Header.Set("Accept", "application/json")
+		r, e := c.cfg.HTTPClient.Do(httpReq)
+		if e != nil {
+			resp = nil
+			if ctx.Err() != nil {
+				return &ai.Error{Code: ai.ErrCodeCanceled, Message: e.Error()}
+			}
+			return &ai.Error{Code: ai.ErrCodeUpstream, Message: e.Error(), Retryable: true}
+		}
+		if r.StatusCode >= 200 && r.StatusCode < 300 {
+			resp = r
+			return nil
+		}
+		defer func() { _ = r.Body.Close() }()
+		return decodeHTTPError(r)
+	})
+	if doErr != nil {
+		return decision.Decision{}, false, toAIError(ctx, doErr)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return decision.Decision{}, false, decodeHTTPError(resp)
-	}
+
 	var dr cloudproto.DecisionResponse
 	if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
 		return decision.Decision{}, false, fmt.Errorf("cloud: decode decision response: %w", err)
@@ -143,20 +225,33 @@ func (c *Client) Decide(ctx context.Context, req decision.Request) (decision.Dec
 
 // Usage calls GET ai/usage.
 func (c *Client) Usage(ctx context.Context) (cloudproto.UsageResponse, error) {
-	httpReq, err := c.newRequestMethod(ctx, http.MethodGet, cloudproto.PathUsage, nil)
-	if err != nil {
-		return cloudproto.UsageResponse{}, err
-	}
-	httpReq.Header.Set("Accept", "application/json")
-
-	resp, err := c.cfg.HTTPClient.Do(httpReq)
-	if err != nil {
-		return cloudproto.UsageResponse{}, &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
+	var resp *http.Response
+	doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
+		httpReq, e := c.newRequestMethod(ctx, http.MethodGet, cloudproto.PathUsage, nil)
+		if e != nil {
+			return e
+		}
+		httpReq.Header.Set("Accept", "application/json")
+		r, e := c.cfg.HTTPClient.Do(httpReq)
+		if e != nil {
+			resp = nil
+			if ctx.Err() != nil {
+				return &ai.Error{Code: ai.ErrCodeCanceled, Message: e.Error()}
+			}
+			return &ai.Error{Code: ai.ErrCodeUpstream, Message: e.Error(), Retryable: true}
+		}
+		if r.StatusCode >= 200 && r.StatusCode < 300 {
+			resp = r
+			return nil
+		}
+		defer func() { _ = r.Body.Close() }()
+		return decodeHTTPError(r)
+	})
+	if doErr != nil {
+		return cloudproto.UsageResponse{}, toAIError(ctx, doErr)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return cloudproto.UsageResponse{}, decodeHTTPError(resp)
-	}
+
 	var ur cloudproto.UsageResponse
 	if err := json.NewDecoder(resp.Body).Decode(&ur); err != nil {
 		return cloudproto.UsageResponse{}, fmt.Errorf("cloud: decode usage response: %w", err)
@@ -197,6 +292,13 @@ func decodeHTTPError(resp *http.Response) error {
 	var er cloudproto.ErrorResponse
 	if err := json.Unmarshal(b, &er); err == nil && er.Error.Code != "" {
 		e := er.Error
+		// The HTTP status is authoritative for retryability even when the
+		// JSON body's own "retryable" was left false/omitted: a 429/5xx is
+		// always worth retrying before the first byte, regardless of
+		// whether the server remembered to say so in the body.
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			e.Retryable = true
+		}
 		return &e
 	}
 	msg := strings.TrimSpace(string(b))

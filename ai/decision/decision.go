@@ -109,22 +109,70 @@ type Provider interface {
 	Decide(ctx context.Context, req Request) (Decision, bool, error)
 }
 
-// Validate checks d against the taxonomy: module and intent must be declared,
-// confidences in [0,1], scopes and presentation known when the taxonomy lists
-// them. A decision that fails validation is treated as an abstention.
+// moduleOptionalInteractions is the set of Interaction values that make
+// sense with no Module/Intent at all -- "Yes", "No", "Cancel", "Undo that"
+// answer the PREVIOUS turn's pending action rather than naming a module, so
+// a deterministic rules.Provider handling them has nothing module-shaped to
+// report. See REQ: rules-friendly-validation.
+var moduleOptionalInteractions = map[Interaction]bool{
+	InteractionConfirmation: true,
+	InteractionRejection:    true,
+	InteractionCancellation: true,
+	InteractionUndo:         true,
+}
+
+// knownInteractions is the full Interaction enum.
+var knownInteractions = map[Interaction]bool{
+	InteractionCommand:      true,
+	InteractionQuestion:     true,
+	InteractionConfirmation: true,
+	InteractionRejection:    true,
+	InteractionCorrection:   true,
+	InteractionContinuation: true,
+	InteractionCancellation: true,
+	InteractionUndo:         true,
+	InteractionChat:         true,
+}
+
+// Validate checks d against the taxonomy: Interaction must be a known, non-
+// empty value; module and intent must be declared UNLESS Interaction is one
+// of the module-optional kinds (confirmation/rejection/cancellation/undo)
+// and Module is empty, in which case both checks are skipped; confidences
+// must be in [0,1]; scopes, presentation, Reference.Kind and RequiredData
+// must be known to the taxonomy when the taxonomy declares a non-empty list
+// for that dimension. A decision that fails validation is treated as an
+// abstention.
 func Validate(d Decision, t Taxonomy) error {
 	var errs []error
+	if d.Interaction == "" {
+		errs = append(errs, errors.New("interaction is required"))
+	} else if !knownInteractions[d.Interaction] {
+		errs = append(errs, fmt.Errorf("unknown interaction %q", d.Interaction))
+	}
 	if d.Module.Confidence < 0 || d.Module.Confidence > 1 || d.Intent.Confidence < 0 || d.Intent.Confidence > 1 {
 		errs = append(errs, errors.New("confidence out of range"))
 	}
-	i := slices.IndexFunc(t.Modules, func(m ModuleSpec) bool { return m.Name == d.Module.Value })
-	if i < 0 {
-		errs = append(errs, fmt.Errorf("unknown module %q", d.Module.Value))
-	} else if d.Intent.Value != "" && !slices.Contains(t.Modules[i].Intents, d.Intent.Value) {
-		errs = append(errs, fmt.Errorf("unknown intent %q for module %q", d.Intent.Value, d.Module.Value))
+	moduleOptional := d.Module.Value == "" && moduleOptionalInteractions[d.Interaction]
+	if !moduleOptional {
+		i := slices.IndexFunc(t.Modules, func(m ModuleSpec) bool { return m.Name == d.Module.Value })
+		if i < 0 {
+			errs = append(errs, fmt.Errorf("unknown module %q", d.Module.Value))
+		} else if d.Intent.Value != "" && !slices.Contains(t.Modules[i].Intents, d.Intent.Value) {
+			errs = append(errs, fmt.Errorf("unknown intent %q for module %q", d.Intent.Value, d.Module.Value))
+		}
 	}
 	if d.Presentation != "" && len(t.Presentations) > 0 && !slices.Contains(t.Presentations, d.Presentation) {
 		errs = append(errs, fmt.Errorf("unknown presentation %q", d.Presentation))
+	}
+	if d.Reference != nil && d.Reference.Kind != "" && len(t.EntityTypes) > 0 && !slices.Contains(t.EntityTypes, d.Reference.Kind) {
+		errs = append(errs, fmt.Errorf("unknown reference kind %q", d.Reference.Kind))
+	}
+	if len(t.DataKinds) > 0 {
+		for _, dk := range d.RequiredData {
+			if !slices.Contains(t.DataKinds, dk) {
+				errs = append(errs, fmt.Errorf("unknown required data kind %q", dk))
+			}
+		}
 	}
 	known := map[string]bool{}
 	for _, m := range t.Modules {
@@ -161,10 +209,27 @@ type Trace struct {
 type Chain struct {
 	Providers []Provider
 	// MinConfidence is the minimum Module and Intent confidence to accept a
-	// decision (default 0.7). Intent confidence is ignored when Intent is "".
+	// decision. Intent confidence is ignored when Intent is "", and Module
+	// confidence is ignored entirely for a module-optional decision (see
+	// Validate). Three cases:
+	//   - MinConfidence == 0 (the zero value): default 0.7.
+	//   - MinConfidence > 0: used as given.
+	//   - MinConfidence < 0: "accept any" -- no confidence floor at all
+	//     (a valid Scored.Confidence is always >= 0, so nothing is ever
+	//     rejected on confidence grounds). Use this for a chain whose
+	//     providers are deterministic and don't produce calibrated
+	//     probabilities worth thresholding.
 	MinConfidence float64
-	// Timeout bounds each provider call (default 1500ms).
+	// Timeout bounds each provider call (default 1500ms) UNLESS the
+	// provider itself implements `interface{ DecisionTimeout() time.Duration }`,
+	// in which case that provider's own value is used instead -- a remote
+	// decision call reasonably wants more time than a local one.
 	Timeout time.Duration
+}
+
+// decisionTimeouter is the optional per-provider timeout override.
+type decisionTimeouter interface {
+	DecisionTimeout() time.Duration
 }
 
 // Decide runs the chain.
@@ -173,17 +238,26 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 	if minConf == 0 {
 		minConf = 0.7
 	}
-	timeout := c.Timeout
-	if timeout == 0 {
-		timeout = 1500 * time.Millisecond
+	defaultTimeout := c.Timeout
+	if defaultTimeout == 0 {
+		defaultTimeout = 1500 * time.Millisecond
 	}
 	var tr Trace
 	for _, p := range c.Providers {
+		timeout := defaultTimeout
+		if dt, ok := p.(decisionTimeouter); ok {
+			if v := dt.DecisionTimeout(); v > 0 {
+				timeout = v
+			}
+		}
 		pctx, cancel := context.WithTimeout(ctx, timeout)
 		start := time.Now()
 		d, ok, err := p.Decide(pctx, req)
 		a := Attempt{Provider: p.Name(), Latency: time.Since(start)}
-		timedOut := pctx.Err() == context.DeadlineExceeded
+		// errors.Is (not ==) so a provider that wraps ctx.Err() (e.g.
+		// fmt.Errorf("...: %w", ctx.Err())) still classifies as a timeout
+		// rather than a generic error.
+		timedOut := err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(pctx.Err(), context.DeadlineExceeded))
 		cancel()
 		switch {
 		case err != nil && timedOut:
@@ -195,7 +269,7 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 		default:
 			if verr := Validate(d, req.Taxonomy); verr != nil {
 				a.Outcome, a.Detail = "invalid", verr.Error()
-			} else if d.Module.Confidence < minConf || (d.Intent.Value != "" && d.Intent.Confidence < minConf) {
+			} else if lowConfidence(d, minConf) {
 				a.Outcome = "low_confidence"
 				a.Detail = fmt.Sprintf("module=%.2f intent=%.2f", d.Module.Confidence, d.Intent.Confidence)
 			} else {
@@ -212,4 +286,22 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 		}
 	}
 	return Decision{}, false, tr
+}
+
+// lowConfidence reports whether d fails the minConf floor. A module-optional
+// decision (see Validate) with an empty Module is exempt from the Module
+// confidence check -- there is no module confidence to have an opinion
+// about. minConf < 0 means "accept any": nothing is ever low-confidence.
+func lowConfidence(d Decision, minConf float64) bool {
+	if minConf < 0 {
+		return false
+	}
+	moduleOptional := d.Module.Value == "" && moduleOptionalInteractions[d.Interaction]
+	if !moduleOptional && d.Module.Confidence < minConf {
+		return true
+	}
+	if d.Intent.Value != "" && d.Intent.Confidence < minConf {
+		return true
+	}
+	return false
 }

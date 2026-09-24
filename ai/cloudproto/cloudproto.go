@@ -1,15 +1,17 @@
 // Package cloudproto is the small, product-neutral wire protocol between
-// clients and an AI cloud boundary such as api.sneat.cloud. It is
-// OpenAI-inspired and event-oriented but deliberately NOT a provider's
-// protocol: upstream providers (and any gateway such as Cloudflare AI Gateway
-// behind the boundary) can change without changing this contract.
+// clients and an AI cloud boundary. It is OpenAI-inspired and event-oriented
+// but deliberately NOT a provider's protocol: upstream providers (and any
+// gateway such as Cloudflare AI Gateway behind the boundary) can change
+// without changing this contract. The cloud boundary's base URL is supplied
+// by the product (see ai/cloud.Config.BaseURL / ai/aiconfig); this package
+// has no default of its own.
 //
 //	POST {base}ai/chat      body: ai.ChatRequest     → text/event-stream of ai.Event
 //	POST {base}ai/decision  body: decision.Request   → application/json DecisionResponse
 //	GET  {base}ai/usage     → application/json UsageResponse
 //
 // {base} is the API base URL including its version prefix, e.g.
-// https://api.sneat.cloud/v0/. Requests carry the product's normal bearer
+// https://api.example.com/v0/. Requests carry the product's normal bearer
 // authentication and the X-AI-Product header.
 //
 // SSE framing: each ai.Event is sent as
@@ -19,12 +21,16 @@
 //	<blank line>
 //
 // Unknown event names must be ignored by clients. The stream ends after
-// response.completed or a terminal error event. Errors before streaming starts
-// are ordinary HTTP errors with an ErrorResponse JSON body.
+// response.completed or a fatal error event (see ai.LLMProvider's
+// fatal-error contract, which ReadEvents follows: an EventError frame is
+// always fatal on this wire and ReadEvents stops after yielding it).
+// Errors before streaming starts are ordinary HTTP errors with an
+// ErrorResponse JSON body.
 package cloudproto
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -75,13 +81,23 @@ func WriteEvent(w io.Writer, ev ai.Event) error {
 
 // ReadEvents parses an SSE stream of ai.Event. It yields events as soon as
 // each frame completes (no buffering of the whole response), skips comments
-// and unknown event names, and stops after response.completed.
+// and unknown event names, and stops after response.completed or after a
+// fatal error.
+//
+// On this wire, an EventError frame is always fatal: ReadEvents yields it as
+// the fatal pair (ev, err) with err a non-nil *ai.Error built from
+// ev.Error, per the ai.LLMProvider contract, and returns immediately
+// afterward. A transport EOF that arrives before either response.completed
+// or an error frame was seen is itself a fatal truncation and is reported
+// the same way.
 func ReadEvents(r io.Reader) iter.Seq2[ai.Event, error] {
 	return func(yield func(ai.Event, error) bool) {
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		sc.Split(scanSSELines)
 		var name string
 		var data strings.Builder
+		sawTerminal := false
 		flush := func() (stop bool) {
 			defer func() { name = ""; data.Reset() }()
 			if data.Len() == 0 {
@@ -89,7 +105,10 @@ func ReadEvents(r io.Reader) iter.Seq2[ai.Event, error] {
 			}
 			var ev ai.Event
 			if err := json.Unmarshal([]byte(data.String()), &ev); err != nil {
-				return !yield(ai.Event{}, fmt.Errorf("cloudproto: bad event %q: %w", name, err))
+				sawTerminal = true
+				aiErr := &ai.Error{Code: ai.ErrCodeUpstream, Message: fmt.Sprintf("cloudproto: bad event %q: %v", name, err)}
+				yield(ai.Event{Type: ai.EventError, Error: aiErr}, aiErr)
+				return true
 			}
 			if ev.Type == "" {
 				ev.Type = ai.EventType(name)
@@ -97,10 +116,23 @@ func ReadEvents(r io.Reader) iter.Seq2[ai.Event, error] {
 			if !known(ev.Type) {
 				return false
 			}
+			if ev.Type == ai.EventError {
+				sawTerminal = true
+				aiErr := ev.Error
+				if aiErr == nil {
+					aiErr = &ai.Error{Code: ai.ErrCodeUpstream, Message: "cloudproto: error event with no detail"}
+				}
+				yield(ai.Event{Type: ai.EventError, Error: aiErr}, aiErr)
+				return true
+			}
 			if !yield(ev, nil) {
 				return true
 			}
-			return ev.Type == ai.EventCompleted
+			if ev.Type == ai.EventCompleted {
+				sawTerminal = true
+				return true
+			}
+			return false
 		}
 		for sc.Scan() {
 			line := sc.Text()
@@ -123,7 +155,13 @@ func ReadEvents(r io.Reader) iter.Seq2[ai.Event, error] {
 			yield(ai.Event{}, err)
 			return
 		}
-		flush()
+		if flush() {
+			return
+		}
+		if !sawTerminal {
+			aiErr := &ai.Error{Code: ai.ErrCodeUpstream, Message: "cloudproto: stream truncated (no response.completed)"}
+			yield(ai.Event{Type: ai.EventError, Error: aiErr}, aiErr)
+		}
 	}
 }
 
@@ -133,4 +171,23 @@ func known(t ai.EventType) bool {
 		return true
 	}
 	return false
+}
+
+// scanSSELines is bufio.ScanLines but also splits on a bare '\r' (some SSE
+// producers/proxies use old Mac-style line endings), not just "\n" and
+// "\r\n".
+func scanSSELines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		if data[i] == '\r' && i+1 < len(data) && data[i+1] == '\n' {
+			return i + 2, data[:i], nil
+		}
+		return i + 1, data[:i], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }

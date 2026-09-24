@@ -1,6 +1,6 @@
 // Package ai is the product-neutral AI contract shared by Sneat, DataTug and
 // future products: chat requests, the normalised streaming event model, and
-// the LLMProvider interface every adapter (Sneat Cloud, OpenAI-compatible,
+// the LLMProvider interface every adapter (the ai/cloud client, OpenAI-compatible,
 // Anthropic) implements.
 //
 // Products own their scopes, actions, prompts and controls. This package owns
@@ -50,7 +50,7 @@ type ContextBlock struct {
 	Text  string      `json:"text"`
 }
 
-// ModelAuto asks the serving side to pick the model (Sneat Cloud routing).
+// ModelAuto asks the serving side to pick the model (ai/cloud routing).
 // BYOK adapters treat it as "use the configured model".
 const ModelAuto = "auto"
 
@@ -74,6 +74,14 @@ type ChatRequest struct {
 	// and otherwise instruct the model; either way the final object arrives as
 	// an EventStructured event (text deltas may still stream first).
 	ResponseSchema json.RawMessage `json:"responseSchema,omitempty"`
+	// StrictSchema controls whether an adapter with a native "strict" JSON
+	// Schema mode (e.g. OpenAI's response_format.json_schema.strict) turns
+	// it on for ResponseSchema. Strict mode requires the schema to follow
+	// stricter authoring rules (every property required, no bare optional
+	// fields, additionalProperties:false throughout); a caller whose schema
+	// doesn't meet them sets StrictSchema to a false pointer to opt out. Nil
+	// (the default) means strict when the adapter supports it.
+	StrictSchema *bool `json:"strictSchema,omitempty"`
 	// Metadata is opaque key/value data forwarded to the cloud for diagnostics
 	// (e.g. "path": "llm-fallback"). Never put secrets or user content here.
 	Metadata map[string]string `json:"metadata,omitempty"`
@@ -116,7 +124,7 @@ type Usage struct {
 	OutputTokens     int64 `json:"outputTokens,omitempty"`
 	CacheReadTokens  int64 `json:"cacheReadTokens,omitempty"`
 	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
-	// Allowance is set by Sneat Cloud; nil for BYOK.
+	// Allowance is set by the cloud provider (ai/cloud); nil for BYOK.
 	Allowance *Allowance `json:"allowance,omitempty"`
 }
 
@@ -153,13 +161,26 @@ func (e *Error) IsRetryable() bool { return e != nil && e.Retryable }
 
 // LLMProvider streams one chat response.
 //
-// Stream yields events in order: EventStarted first, then any number of
-// EventTextDelta / EventStructured / EventUsage, then exactly one of
-// EventCompleted or a terminal (error != nil) pair. A non-nil error in the
-// sequence ends it. Implementations must not buffer the full response and
-// must stop promptly when ctx is cancelled or the consumer stops iterating.
+// Stream yields events in order: EventStarted (only once the HTTP request
+// has actually succeeded; a request that fails before any response is
+// received produces no EventStarted at all), then any number of
+// EventTextDelta / EventStructured / EventUsage, then exactly one of:
+//
+//   - EventCompleted, ending the sequence successfully, or
+//   - a FATAL error: exactly one final yield of
+//     (Event{Type: EventError, Error: e}, e), where e is a non-nil *Error
+//     (wrapped in the returned error). Nothing is yielded after it, and the
+//     implementation must return immediately afterward.
+//
+// An EventError yielded with a nil Go error (second return value) is NOT
+// fatal -- it reports a problem the stream is continuing past (e.g. a
+// dropped mid-stream diagnostic) and consumers must keep ranging.
+// Implementations must not buffer the full response and must stop promptly
+// when ctx is cancelled or the consumer stops iterating. A stream ended by
+// context cancellation must yield the fatal pair with Code ErrCodeCanceled
+// (never Retryable).
 type LLMProvider interface {
-	// Name identifies the provider in diagnostics ("sneat-cloud",
+	// Name identifies the provider in diagnostics ("cloud",
 	// "openai-compatible", "anthropic").
 	Name() string
 	Stream(ctx context.Context, req ChatRequest) iter.Seq2[Event, error]
@@ -168,6 +189,12 @@ type LLMProvider interface {
 // Collect drains a stream into its concatenated text, the last structured
 // output and the last usage seen. It is a convenience for non-interactive
 // callers and tests; interactive UIs should consume Stream directly.
+//
+// Per the LLMProvider contract, a non-nil error (the iterator's second
+// value) is always fatal and always terminates the stream, so Collect
+// returns as soon as it sees one. A non-fatal EventError (nil Go error) is
+// NOT terminal: Collect keeps draining past it, since the stream itself
+// says it is continuing.
 func Collect(stream iter.Seq2[Event, error]) (text string, structured json.RawMessage, usage *Usage, err error) {
 	var b []byte
 	for ev, e := range stream {
@@ -182,10 +209,6 @@ func Collect(stream iter.Seq2[Event, error]) (text string, structured json.RawMe
 		case EventUsage, EventCompleted:
 			if ev.Usage != nil {
 				usage = ev.Usage
-			}
-		case EventError:
-			if ev.Error != nil {
-				return string(b), structured, usage, ev.Error
 			}
 		}
 	}

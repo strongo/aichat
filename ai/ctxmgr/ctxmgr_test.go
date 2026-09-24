@@ -26,15 +26,32 @@ func TestSelect_RequiredAlwaysIncluded(t *testing.T) {
 	}
 }
 
-func TestSelect_NoDecisionIncludesAllStatic(t *testing.T) {
+func TestSelectAll_IncludesAllStatic(t *testing.T) {
 	m := NewManager(Policy{})
 	available := []ai.ContextBlock{
 		block("calendar", ai.ContextStatic, "skill", "calendar skill"),
 		block("tasks", ai.ContextStatic, "skill", "tasks skill"),
 	}
-	got, _ := m.Select(nil, available, nil)
+	got, report := m.SelectAll(available, nil)
 	if len(got) != 2 {
-		t.Fatalf("got = %+v, want both static scopes when required is nil", got)
+		t.Fatalf("got = %+v, want both static scopes with no decision", got)
+	}
+	if len(report.Required) != 0 {
+		t.Errorf("report.Required = %v, want empty (SelectAll has no decision)", report.Required)
+	}
+}
+
+func TestSelect_EmptyNonNilRequiredMeansZeroScopes(t *testing.T) {
+	// A decision that explicitly required nothing (RequiredScopes == []) is
+	// NOT the same as no decision at all -- Select must not fall back to
+	// "include everything" for it. That is SelectAll's job.
+	m := NewManager(Policy{})
+	available := []ai.ContextBlock{
+		block("calendar", ai.ContextStatic, "skill", "calendar skill"),
+	}
+	got, _ := m.Select([]string{}, available, nil)
+	if len(got) != 0 {
+		t.Fatalf("got = %+v, want empty: an explicit empty required list must not pull in every static scope", got)
 	}
 }
 
@@ -106,6 +123,56 @@ func TestSelect_CompactsWhenOverBudget(t *testing.T) {
 	}
 	if !contains(report.Dropped, "big") {
 		t.Errorf("report.Dropped = %v, want big", report.Dropped)
+	}
+}
+
+func TestSelect_DropsFromTailPreservingPrefix(t *testing.T) {
+	m := NewManager(Policy{BudgetTokens: 1})
+	available := []ai.ContextBlock{
+		block("first", ai.ContextStatic, "skill", "aa"),
+		block("second", ai.ContextStatic, "skill", "bb"),
+		block("third", ai.ContextStatic, "skill", "cc"),
+	}
+	// Turn 1: all three required and sent, in this order.
+	_, _ = m.Select([]string{"first", "second", "third"}, available, nil)
+	// Turn 2: nothing required; budget forces dropping. The survivor(s) must
+	// be a PREFIX of [first, second, third], i.e. "second" can never be
+	// dropped while "third" survives.
+	got, report := m.Select([]string{}, available, nil)
+	scopes := scopesOf(got)
+	for i := 1; i < len(scopes); i++ {
+		if indexOf([]string{"first", "second", "third"}, scopes[i]) < indexOf([]string{"first", "second", "third"}, scopes[i-1]) {
+			t.Fatalf("scopes = %v, not a stable prefix of [first second third]", scopes)
+		}
+	}
+	if len(scopes) > 0 && scopes[0] != "first" {
+		t.Fatalf("scopes = %v, want to start with 'first' (the earliest-sent) if anything survives", scopes)
+	}
+	if !report.Compacted {
+		t.Fatal("expected compaction")
+	}
+}
+
+func TestSelect_DroppedScopeForgottenFromSent(t *testing.T) {
+	m := NewManager(Policy{BudgetTokens: 1})
+	available := []ai.ContextBlock{
+		block("big", ai.ContextStatic, "skill", strings.Repeat("x", 400)),
+	}
+	// Turn 1: required and sent.
+	_, _ = m.Select([]string{"big"}, available, nil)
+	// Turn 2: not required, budget still tiny -> dropped (nothing else to
+	// keep it under budget; "big" is the only scope so this call keeps it
+	// only if required, otherwise it's dropped since it's not required).
+	_, report := m.Select([]string{}, available, nil)
+	if !contains(report.Dropped, "big") {
+		t.Fatalf("report.Dropped = %v, want big dropped", report.Dropped)
+	}
+	// Turn 3: still not required. If "big" had NOT been forgotten from
+	// "sent", rule 2 (retain previously-sent statics) would pull it back in
+	// even though nothing requires it -- it must stay gone.
+	got, _ := m.Select([]string{}, available, nil)
+	if len(got) != 0 {
+		t.Fatalf("got = %+v, want empty: a budget-dropped scope must not be implicitly retained again", got)
 	}
 }
 

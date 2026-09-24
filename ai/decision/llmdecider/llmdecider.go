@@ -24,8 +24,10 @@ type Options struct {
 	// Model, when set, overrides the LLM provider's default model for this
 	// decider's inference only.
 	Model string
-	// MaxRecent bounds how many Request.Recent lines are sent (default 8;
-	// <=0 means "all").
+	// MaxRecent bounds how many trailing Request.Recent lines are sent. The
+	// zero value (unset) defaults to 8. A NEGATIVE value means "no limit,
+	// send every line" -- 0 itself cannot mean that, since New treats a
+	// zero value as "unset" and fills in the default.
 	MaxRecent int
 }
 
@@ -46,8 +48,16 @@ func New(llm ai.LLMProvider, opts Options) *Decider {
 	return &Decider{llm: llm, opts: opts}
 }
 
+// decisionTimeout is how long decision.Chain should wait for a Decider call
+// (see the optional `DecisionTimeout() time.Duration` hook Chain honours).
+// An inference call reasonably wants more time than Chain's 1500ms default.
+const decisionTimeout = 4 * time.Second
+
 // Name implements decision.Provider.
 func (d *Decider) Name() string { return d.opts.Name }
+
+// DecisionTimeout implements the optional interface decision.Chain honours.
+func (d *Decider) DecisionTimeout() time.Duration { return decisionTimeout }
 
 // Decide implements decision.Provider.
 func (d *Decider) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
@@ -70,11 +80,73 @@ func (d *Decider) Decide(ctx context.Context, req decision.Request) (decision.De
 	if len(raw) == 0 {
 		return decision.Decision{}, false, fmt.Errorf("llmdecider: no structured output and no parseable text")
 	}
-	var out decision.Decision
-	if err := json.Unmarshal(raw, &out); err != nil {
+	var w wireDecision
+	if err := json.Unmarshal(raw, &w); err != nil {
 		return decision.Decision{}, false, fmt.Errorf("llmdecider: malformed decision JSON: %w", err)
 	}
-	return out, true, nil
+	return w.toDecision(), true, nil
+}
+
+// wireDecision mirrors decisionSchema's wire shape exactly (see schema.go's
+// doc comment for why it differs from decision.Decision: strict structured
+// output has no open-map type, so Slots travels as an array).
+type wireDecision struct {
+	Module                     decision.Scored      `json:"module"`
+	Intent                     decision.Scored      `json:"intent"`
+	Interaction                decision.Interaction `json:"interaction"`
+	Reference                  *wireReference       `json:"reference"`
+	RequiredScopes             []string             `json:"requiredScopes"`
+	RequiredData               []string             `json:"requiredData"`
+	Slots                      []wireSlot           `json:"slots"`
+	CanHandleDeterministically bool                 `json:"canHandleDeterministically"`
+	NeedsLLM                   bool                 `json:"needsLLM"`
+	Presentation               *string              `json:"presentation"`
+}
+
+type wireReference struct {
+	Kind       string `json:"kind"`
+	Expression string `json:"expression"`
+	Pronoun    bool   `json:"pronoun"`
+}
+
+type wireSlot struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// toDecision converts the wire shape to decision.Decision, folding the
+// slots array back into a map and treating an empty Reference.Kind or a nil
+// Presentation the same as "not set".
+func (w wireDecision) toDecision() decision.Decision {
+	d := decision.Decision{
+		Module:                     w.Module,
+		Intent:                     w.Intent,
+		Interaction:                w.Interaction,
+		RequiredScopes:             w.RequiredScopes,
+		RequiredData:               w.RequiredData,
+		CanHandleDeterministically: w.CanHandleDeterministically,
+		NeedsLLM:                   w.NeedsLLM,
+	}
+	if w.Reference != nil && w.Reference.Kind != "" {
+		ref := decision.Reference{Kind: w.Reference.Kind, Expression: w.Reference.Expression, Pronoun: w.Reference.Pronoun}
+		d.Reference = &ref
+	}
+	if len(w.Slots) > 0 {
+		m := make(map[string]string, len(w.Slots))
+		for _, s := range w.Slots {
+			if s.Name == "" {
+				continue
+			}
+			m[s.Name] = s.Value
+		}
+		if len(m) > 0 {
+			d.Slots = m
+		}
+	}
+	if w.Presentation != nil {
+		d.Presentation = *w.Presentation
+	}
+	return d
 }
 
 // systemPrompt is a compact, product-neutral instruction: the taxonomy the
