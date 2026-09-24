@@ -141,6 +141,28 @@ func (m *Model) Append(e Entry) {
 	m.Rebuild(m.shouldAutoFollow())
 }
 
+// ReplaceBlock replaces the Block of the entry identified by id in place
+// (same position, same ID), e.g. to refresh or re-run a grid without
+// disturbing surrounding transcript order or focus. It is a no-op if no
+// entry has that ID.
+func (m *Model) ReplaceBlock(id string, b Block) {
+	for i := range m.entries {
+		if m.entries[i].ID != "" && m.entries[i].ID == id {
+			m.entries[i].Block = b
+			m.entries[i].renderValid = false
+			m.Rebuild(m.shouldAutoFollow())
+			return
+		}
+	}
+}
+
+// Clear removes every entry and clears focus.
+func (m *Model) Clear() {
+	m.entries = nil
+	m.focusIndex = -1
+	m.Rebuild(false)
+}
+
 // AppendDelta appends text to the streaming entry identified by id, creating
 // it (as an assistant entry) on first use. It is the transcript half of
 // tui/stream's channel re-arm pattern: each EventMsg's text delta lands here.

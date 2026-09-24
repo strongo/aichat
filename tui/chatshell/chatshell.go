@@ -67,6 +67,29 @@ type MsgHandler interface {
 	OnMsg(msg tea.Msg) tea.Cmd
 }
 
+// SidePanel replaces the default sidebar (working-context list) when set,
+// e.g. a product workspace pane with its own tabs, explorer and bookmarks.
+// It participates in the focus ring exactly as the built-in sidebar does
+// (Shift+Right/Left, F6 toggle, Ctrl+←/→ split 40–75%).
+type SidePanel interface {
+	Title() string
+	View(width, height int, focused bool) string
+	Update(msg tea.Msg) (SidePanel, tea.Cmd)
+}
+
+// Overlay is a modal dialog: once pushed (PushOverlay) it captures every key
+// event until its Update returns done, and renders centred over the screen.
+type Overlay interface {
+	View(width, height int) string
+	Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)
+}
+
+// GlobalKeysFunc is checked before chatshell's own key handling (so a
+// product can claim keys like F3/F4 pickers ahead of chatshell's defaults).
+// cmd is returned as-is; consumed true stops chatshell from handling the key
+// at all this cycle.
+type GlobalKeysFunc func(msg tea.KeyPressMsg) (cmd tea.Cmd, consumed bool)
+
 // Option configures a Model at construction time.
 type Option func(*Model)
 
@@ -78,6 +101,35 @@ func WithCommands(commands []Command) Option {
 // WithSidebarRenderer sets how sidebar entries render.
 func WithSidebarRenderer(render sidebar.Renderer) Option {
 	return func(m *Model) { m.sidebar = sidebar.New(render) }
+}
+
+// WithSidePanel installs a product SidePanel in place of the default
+// sidebar. It starts visible, matching the default sidebar's own start
+// state.
+func WithSidePanel(p SidePanel) Option {
+	return func(m *Model) {
+		m.sidePanel = p
+		m.sidePanelVisible = true
+		m.sidePanelChatPercent = 65
+	}
+}
+
+// WithGlobalKeys sets a product key hook checked before chatshell's own key
+// handling (see GlobalKeysFunc).
+func WithGlobalKeys(fn GlobalKeysFunc) Option {
+	return func(m *Model) { m.globalKeys = fn }
+}
+
+// WithTopBar sets a product-rendered top bar, replacing the default bold
+// title line.
+func WithTopBar(render func(width int) string) Option {
+	return func(m *Model) { m.topBarFn = render }
+}
+
+// WithStatusBar sets a product-rendered status bar, replacing the default
+// SetStatus-driven status line(s).
+func WithStatusBar(render func(width int) string) Option {
+	return func(m *Model) { m.statusBarFn = render }
 }
 
 // WithContext sets the context streamed responses and Handler calls run
@@ -102,6 +154,17 @@ type Model struct {
 	sidebar    *sidebar.Model
 	focusRing  *focus.Ring
 	spinner    spinner.Model
+
+	// sidePanel, when set (WithSidePanel), replaces sidebar for the whole
+	// sidebar zone: visibility, split percent and rendering all route
+	// through it instead of the sidebar field above.
+	sidePanel            SidePanel
+	sidePanelVisible     bool
+	sidePanelChatPercent int
+	globalKeys           GlobalKeysFunc
+	topBarFn             func(width int) string
+	statusBarFn          func(width int) string
+	overlays             []Overlay
 
 	commands             []Command
 	commandMenuIndex     int
@@ -326,18 +389,113 @@ func (m *Model) SidebarRefs() []session.EntityRef {
 // flight.
 func (m *Model) Busy() bool { return m.busy }
 
+// ReplaceBlock refreshes/re-runs a grid (or any other transcript.Block) in
+// place: the entry identified by entryID keeps its position and ID, but
+// renders b from now on.
+func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
+	m.transcript.ReplaceBlock(entryID, b)
+}
+
+// SetComposerText sets the composer's text and moves the cursor to the end,
+// e.g. an edit-previous-message flow.
+func (m *Model) SetComposerText(s string) {
+	m.input.SetValue(s)
+	m.input.CursorEnd()
+}
+
+// ClearTranscript empties the transcript and returns focus to the composer,
+// e.g. /clear or a session switch.
+func (m *Model) ClearTranscript() {
+	m.transcript.Clear()
+	m.focusRing.FocusInput()
+	m.syncFocus()
+}
+
+// PushOverlay pushes a modal dialog onto the overlay stack. The top overlay
+// captures every key event (and every other message chatshell would
+// otherwise handle itself) until its Update returns done, and is rendered
+// centred over the screen.
+func (m *Model) PushOverlay(o Overlay) tea.Cmd {
+	m.overlays = append(m.overlays, o)
+	return nil
+}
+
+// --- side panel / sidebar unification -------------------------------------
+
+// panelVisible reports whether the sidebar zone (SidePanel or the default
+// sidebar, whichever is active) is currently visible.
+func (m *Model) panelVisible() bool {
+	if m.sidePanel != nil {
+		return m.sidePanelVisible
+	}
+	return m.sidebar.Visible()
+}
+
+// togglePanel implements F6.
+func (m *Model) togglePanel() {
+	if m.sidePanel != nil {
+		m.sidePanelVisible = !m.sidePanelVisible
+		return
+	}
+	m.sidebar.Toggle()
+}
+
+// panelChatPercent returns the chat pane's current width share when split.
+func (m *Model) panelChatPercent() int {
+	if m.sidePanel != nil {
+		return m.sidePanelChatPercent
+	}
+	return m.sidebar.ChatPercent()
+}
+
+// growPanelChat implements Ctrl+←/→, clamped to [sidebar.MinChatPercent,
+// sidebar.MaxChatPercent] for both the SidePanel and the default sidebar.
+func (m *Model) growPanelChat(delta int) {
+	if m.sidePanel != nil {
+		m.sidePanelChatPercent = max(sidebar.MinChatPercent, min(sidebar.MaxChatPercent, m.sidePanelChatPercent+delta))
+		return
+	}
+	m.sidebar.GrowChat(delta)
+}
+
+// panelView renders the active sidebar-zone content (SidePanel or the
+// default sidebar) at width, focused as given.
+func (m *Model) panelView(width int, focused bool) string {
+	if m.sidePanel != nil {
+		return m.sidePanel.View(width, m.historyHeight(), focused)
+	}
+	return m.sidebar.View(width, focused)
+}
+
+// updatePanel forwards msg to the active sidebar-zone content.
+func (m *Model) updatePanel(msg tea.Msg) tea.Cmd {
+	if m.sidePanel != nil {
+		var cmd tea.Cmd
+		m.sidePanel, cmd = m.sidePanel.Update(msg)
+		return cmd
+	}
+	return m.sidebar.Update(msg)
+}
+
 // --- tea.Model -----------------------------------------------------------
 
 func (m *Model) Init() tea.Cmd { return textarea.Blink }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
+	// A WindowSizeMsg always resizes the shell, even with an overlay open
+	// (the overlay renders over the freshly resized screen next).
+	if wsz, ok := msg.(tea.WindowSizeMsg); ok {
+		m.width, m.height = wsz.Width, wsz.Height
 		m.resize()
 		cmd := m.transcript.Update(msg)
 		return m, cmd
+	}
 
+	if len(m.overlays) > 0 {
+		return m.updateOverlay(msg)
+	}
+
+	switch msg := msg.(type) {
 	case tui.AddToSidebarMsg:
 		m.PinToSidebar(msg.Ref)
 		return m, nil
@@ -369,6 +527,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	default:
 		return m, m.dispatchUnhandled(msg)
 	}
+}
+
+// updateOverlay forwards msg exclusively to the top overlay on the stack,
+// popping it once its Update reports done. Called only while len(m.overlays)
+// > 0 (see Update): an active overlay captures every message chatshell would
+// otherwise handle itself, per the Overlay contract.
+func (m *Model) updateOverlay(msg tea.Msg) (tea.Model, tea.Cmd) {
+	top := len(m.overlays) - 1
+	updated, cmd, done := m.overlays[top].Update(msg)
+	if done {
+		m.overlays = m.overlays[:top]
+	} else {
+		m.overlays[top] = updated
+	}
+	return m, cmd
 }
 
 // dispatchUnhandled forwards a message chatshell does not itself recognise
@@ -451,19 +624,19 @@ func isCanceled(err error) bool {
 func (m *Model) resize() {
 	m.transcript.SetSize(m.chatWidth(), m.historyHeight())
 	m.input.SetWidth(max(1, m.chatWidth()-2))
-	if m.sidebar.Visible() {
+	if m.sidePanel == nil && m.sidebar.Visible() {
 		m.sidebar.SetWidth(m.sidebarWidth())
 	}
 }
 
-func (m *Model) splitEnabled() bool { return m.width >= splitMinWidth && m.sidebar.Visible() }
+func (m *Model) splitEnabled() bool { return m.width >= splitMinWidth && m.panelVisible() }
 
 func (m *Model) chatWidth() int {
 	if !m.splitEnabled() {
 		return max(1, m.width-2)
 	}
 	inner := max(1, m.width-2)
-	return max(42, min(inner-24, inner*m.sidebar.ChatPercent()/100))
+	return max(42, min(inner-24, inner*m.panelChatPercent()/100))
 }
 
 func (m *Model) sidebarWidth() int {
@@ -485,6 +658,11 @@ func (m *Model) statusLines() []string {
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.globalKeys != nil {
+		if cmd, consumed := m.globalKeys(msg); consumed {
+			return m, cmd
+		}
+	}
 	if msg.String() != "ctrl+c" {
 		m.ctrlCArmed = false
 	}
@@ -525,9 +703,9 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.syncFocus()
 		return m, nil
 	case "f6":
-		m.sidebar.Toggle()
-		if !m.sidebar.Visible() && m.focusRing.Zone() == focus.ZoneSidebar {
-			// Hiding the sidebar while it holds focus returns focus to
+		m.togglePanel()
+		if !m.panelVisible() && m.focusRing.Zone() == focus.ZoneSidebar {
+			// Hiding the sidebar zone while it holds focus returns focus to
 			// wherever it was before Shift+Right (or the input, if there is
 			// nowhere to return to).
 			m.focusRing.ShiftLeft(m.transcript.Stops())
@@ -540,7 +718,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+right" {
 			delta = 5
 		}
-		m.sidebar.GrowChat(delta)
+		m.growPanelChat(delta)
 		m.resize()
 		return m, nil
 	case "shift+up":
@@ -573,7 +751,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	switch m.focusRing.Zone() {
 	case focus.ZoneSidebar:
-		cmd := m.sidebar.Update(msg)
+		cmd := m.updatePanel(msg)
 		return m, cmd
 	case focus.ZoneTranscript:
 		cmd := m.transcript.Update(msg)
@@ -663,6 +841,9 @@ func (m *Model) commandMenuMatches() []Command {
 
 func (m *Model) View() tea.View {
 	top := lipgloss.NewStyle().Bold(true).Render(m.title)
+	if m.topBarFn != nil {
+		top = m.topBarFn(m.width)
+	}
 	history := m.transcript.View()
 	if m.busy {
 		history += "\n" + m.spinner.View() + " thinking…"
@@ -676,14 +857,27 @@ func (m *Model) View() tea.View {
 	chat := lipgloss.JoinVertical(lipgloss.Left, chatParts...)
 	body := chat
 	if m.splitEnabled() {
-		side := m.sidebar.View(m.sidebarWidth(), m.focusRing.Zone() == focus.ZoneSidebar)
+		side := m.panelView(m.sidebarWidth(), m.focusRing.Zone() == focus.ZoneSidebar)
 		body = lipgloss.JoinHorizontal(lipgloss.Top, chat, " │ ", side)
 	}
 	status := strings.Join(m.statusLines(), "\n")
+	if m.statusBarFn != nil {
+		status = m.statusBarFn(m.width)
+	}
 	content := lipgloss.JoinVertical(lipgloss.Left, top, body, status)
+	if n := len(m.overlays); n > 0 {
+		content = m.renderOverlay(content, m.overlays[n-1])
+	}
 	view := tea.NewView(content)
 	view.AltScreen = true
 	return view
+}
+
+// renderOverlay composes the top overlay's view centred over base.
+func (m *Model) renderOverlay(base string, o Overlay) string {
+	ow, oh := max(1, m.width*2/3), max(1, m.height*2/3)
+	overlayView := o.View(ow, oh)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlayView, lipgloss.WithWhitespaceChars(" "))
 }
 
 func (m *Model) commandMenuView() string {

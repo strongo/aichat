@@ -832,3 +832,229 @@ func firstFromBatch(t *testing.T, cmd tea.Cmd) tea.Msg {
 	t.Fatal("no stream message found in batch")
 	return nil
 }
+
+// fakeSidePanel is a minimal SidePanel used to test that it fully replaces
+// the default sidebar in the focus ring, split layout and key routing.
+type fakeSidePanel struct {
+	title     string
+	updates   int
+	lastFocus bool
+	lastMsg   tea.Msg
+}
+
+func (p *fakeSidePanel) Title() string { return p.title }
+
+func (p *fakeSidePanel) View(width, height int, focused bool) string {
+	p.lastFocus = focused
+	return "sidepanel"
+}
+
+func (p *fakeSidePanel) Update(msg tea.Msg) (SidePanel, tea.Cmd) {
+	p.updates++
+	p.lastMsg = msg
+	return p, nil
+}
+
+func TestSidePanelReplacesSidebarInFocusRingAndSplit(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{title: "workspace"}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	if !m.splitEnabled() {
+		t.Fatal("expected split enabled with a SidePanel set and starting visible")
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift})
+	if m.focusRing.Zone() != focus.ZoneSidebar {
+		t.Fatalf("Zone() = %v, want ZoneSidebar after Shift+Right", m.focusRing.Zone())
+	}
+	m.Update(tea.KeyPressMsg{Text: "x"})
+	if panel.updates == 0 {
+		t.Error("expected the SidePanel to receive key updates while focused")
+	}
+
+	view := m.View()
+	_ = view // View() must not panic when a SidePanel is active.
+
+	// F6 hides it; splitEnabled must follow the SidePanel's own visibility,
+	// not the (unused, but still constructed) default sidebar's.
+	m.focusRing.FocusInput()
+	m.syncFocus()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	if m.splitEnabled() {
+		t.Error("expected splitEnabled() false after F6 hides the SidePanel")
+	}
+}
+
+func TestSidePanelCtrlLeftRightResizesSplit(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	before := m.panelChatPercent()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModCtrl})
+	if m.panelChatPercent() <= before {
+		t.Errorf("panelChatPercent() = %d, want > %d after Ctrl+Right", m.panelChatPercent(), before)
+	}
+}
+
+// fakeOverlay is a minimal Overlay that closes itself the first time it sees
+// a KeyPressMsg with text "q", and otherwise just records what it saw.
+type fakeOverlay struct {
+	name     string
+	seen     []tea.Msg
+	closeKey string
+}
+
+func (o *fakeOverlay) View(width, height int) string { return "overlay:" + o.name }
+
+func (o *fakeOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd, bool) {
+	o.seen = append(o.seen, msg)
+	if k, ok := msg.(tea.KeyPressMsg); ok && k.Text == o.closeKey {
+		return o, nil, true
+	}
+	return o, nil, false
+}
+
+func TestOverlayCapturesKeysUntilDone(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ov := &fakeOverlay{name: "dialog", closeKey: "q"}
+	m.PushOverlay(ov)
+
+	// While the overlay is up, a key that would normally submit the composer
+	// must be captured by the overlay instead.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(h.submitted) != 0 {
+		t.Fatalf("submitted = %v, want none (overlay should have captured Enter)", h.submitted)
+	}
+	if len(ov.seen) != 1 {
+		t.Fatalf("overlay saw %d messages, want 1", len(ov.seen))
+	}
+
+	m.Update(tea.KeyPressMsg{Text: "q"})
+	if len(m.overlays) != 0 {
+		t.Fatalf("overlays = %v, want empty after done", m.overlays)
+	}
+
+	// Now Enter reaches the composer again.
+	m.input.SetValue("hi")
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(h.submitted) != 1 {
+		t.Fatalf("submitted = %v, want 1 after overlay closed", h.submitted)
+	}
+}
+
+func TestOverlayStacking(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	first := &fakeOverlay{name: "first", closeKey: "1"}
+	second := &fakeOverlay{name: "second", closeKey: "2"}
+	m.PushOverlay(first)
+	m.PushOverlay(second)
+
+	// The TOP overlay (second) gets keys first.
+	m.Update(tea.KeyPressMsg{Text: "x"})
+	if len(second.seen) != 1 || len(first.seen) != 0 {
+		t.Fatalf("second.seen=%d first.seen=%d, want top overlay only", len(second.seen), len(first.seen))
+	}
+
+	m.Update(tea.KeyPressMsg{Text: "2"})
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays = %d, want 1 after popping the top", len(m.overlays))
+	}
+	m.Update(tea.KeyPressMsg{Text: "1"})
+	if len(m.overlays) != 0 {
+		t.Fatalf("overlays = %d, want 0 after popping the last", len(m.overlays))
+	}
+}
+
+func TestGlobalKeysCheckedBeforeShellDefaults(t *testing.T) {
+	h := &fakeHandler{}
+	var seen []string
+	m := New(h, WithGlobalKeys(func(msg tea.KeyPressMsg) (tea.Cmd, bool) {
+		if msg.Text == "f3" || msg.String() == "f3" {
+			seen = append(seen, "f3")
+			return nil, true
+		}
+		return nil, false
+	}))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF3})
+	if len(seen) != 1 {
+		t.Fatalf("global key hook fired %d times, want 1", len(seen))
+	}
+
+	// A key the hook doesn't consume still reaches the normal composer path.
+	m.input.SetValue("hi")
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(h.submitted) != 1 {
+		t.Fatalf("submitted = %v, want the Enter that the hook did not consume to reach the composer", h.submitted)
+	}
+}
+
+func TestReplaceBlockUpdatesInPlace(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	first := &fakeBlock{}
+	m.AppendBlock(transcript.Entry{ID: "grid-1", Block: first}.Block)
+	m.transcript.Append(transcript.Entry{ID: "grid-1", Block: first})
+	second := &fakeBlock{}
+	m.ReplaceBlock("grid-1", second)
+	entries := m.transcript.Entries()
+	found := false
+	for _, e := range entries {
+		if e.ID == "grid-1" {
+			found = true
+			if e.Block != transcript.Block(second) {
+				t.Errorf("entry Block not replaced")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("entry grid-1 not found")
+	}
+}
+
+func TestSetComposerTextSetsInputValue(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetComposerText("edit this")
+	if m.input.Value() != "edit this" {
+		t.Errorf("input.Value() = %q, want %q", m.input.Value(), "edit this")
+	}
+}
+
+func TestClearTranscriptEmptiesAndFocusesInput(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.AppendUser("hi")
+	m.AppendAssistant("hello")
+	if len(m.transcript.Entries()) == 0 {
+		t.Fatal("expected entries before Clear")
+	}
+	m.ClearTranscript()
+	if len(m.transcript.Entries()) != 0 {
+		t.Errorf("Entries() = %v, want empty after ClearTranscript", m.transcript.Entries())
+	}
+	if m.focusRing.Zone() != focus.ZoneInput {
+		t.Errorf("Zone() = %v, want ZoneInput after ClearTranscript", m.focusRing.Zone())
+	}
+}
+
+func TestWithTopBarAndStatusBarOverrideDefaults(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h,
+		WithTopBar(func(width int) string { return "TOP" }),
+		WithStatusBar(func(width int) string { return "STATUS" }),
+	)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	view := m.View()
+	content := view.Content
+	if !strings.Contains(content, "TOP") {
+		t.Error("expected product-rendered top bar in the view")
+	}
+	if !strings.Contains(content, "STATUS") {
+		t.Error("expected product-rendered status bar in the view")
+	}
+}
