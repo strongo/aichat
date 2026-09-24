@@ -92,13 +92,15 @@ An optional `SidePanelPinner` capability (`PinRef(ref session.EntityRef) bool`, 
 
 #### REQ: chatshell-transcript-ops
 
-`chatshell.Model.ReplaceBlock(entryID string, b transcript.Block)` MUST replace the `Block` of the transcript entry identified by `entryID` IN PLACE (same position, same ID) -- e.g. to refresh or re-run a grid -- and MUST be a no-op when no entry has that ID. If the CURRENTLY FOCUSED transcript entry (by ID, not raw stop index -- either the one being replaced or a different one whose stop shifted because this swap changed an earlier entry's `Focusable()` answer) is still focusable afterward, focus MUST stay on that same entry.
+`chatshell.Model.ReplaceBlock(entryID string, b transcript.Block)` MUST replace the `Block` of the transcript entry identified by `entryID` IN PLACE (same position, same ID) -- e.g. to refresh or re-run a grid -- and MUST be a no-op when no entry has that ID. If the CURRENTLY FOCUSED transcript entry (by ID, not raw stop index -- either the one being replaced or a different one whose stop shifted because this swap changed an earlier entry's `Focusable()` answer) is still focusable afterward, focus MUST stay on that same entry -- this includes `chatshell.Model`'s OWN `focusRing` (zone/stop tracker), not just `transcript.Model`'s internal focus index: `ReplaceBlock` MUST resync `focusRing`'s stop to the (possibly shifted) focused entry too, since a later `syncFocus` (a resize, a zone change) reapplies `focusRing`'s stop INTO the transcript and would otherwise silently undo the fix with a stale value.
 
-`SetComposerText(s string)` MUST set the composer's text and move the cursor to the end (an edit-previous-message flow). `ClearTranscript()` MUST cancel any in-flight stream, remove every transcript entry, and return focus to the composer (`/clear`, a session switch); an `EventMsg` for the just-cancelled stream's ID that arrives afterward MUST NOT mutate the (now-cleared) transcript. `FocusEntry(id string) bool` MUST move focus to the transcript entry identified by `id`, scrolling it into view, and report whether such a focusable entry exists (`false` leaves focus unchanged) -- e.g. DataTug's Ctrl+G "jump to latest grid". `AppendBlockWithID(id string, b transcript.Block)` MUST append a `transcript.Block` under a caller-chosen id, same as `StartStream`'s id, so the appended entry is later addressable via `FocusEntry`/`ReplaceBlock` -- `AppendBlock` (no id) remains for blocks a product never needs to address again.
+`SetComposerText(s string)` MUST set the composer's text and move the cursor to the end (an edit-previous-message flow). `ClearTranscript()` MUST cancel any in-flight stream, remove every transcript entry, and return focus to the composer (`/clear`, a session switch); an `EventMsg` for the just-cancelled stream's ID that arrives afterward MUST NOT mutate the (now-cleared) transcript. A product's own `SetBusy(true)` phase (no stream, e.g. a decision chain) has no `DoneMsg` to cancel it asynchronously, so `ClearTranscript` MUST also invoke the registered `SetBusyCancel` callback directly, same as Esc/Ctrl+C's cancel-while-busy path. `FocusEntry(id string) bool` MUST move focus to the transcript entry identified by `id`, scrolling it into view, and report whether such a focusable entry exists (`false` leaves focus unchanged) -- e.g. DataTug's Ctrl+G "jump to latest grid". `AppendBlockWithID(id string, b transcript.Block) bool` MUST append a `transcript.Block` under a caller-chosen id, same as `StartStream`'s id, so the appended entry is later addressable via `FocusEntry`/`ReplaceBlock` -- `AppendBlock` (no id) remains for blocks a product never needs to address again. It MUST reject (return `false`, append nothing) an empty id, an id already held by a live transcript entry, or an id currently owned by an in-flight `StartStream`/`StartStreamMarkdown` call, since both identify a transcript entry the same way and a collision would corrupt `FocusEntry`/`ReplaceBlock` addressing.
 
 #### REQ: chatshell-markdown-renderer
 
-`chatshell.WithMarkdownRenderer(r transcript.MarkdownRenderer)` MUST configure the renderer `AppendAssistantMarkdown(text string)` — and any `transcript.Entry` with `Markdown` set — uses (e.g. a glamour-backed renderer for agent or HTTP-response markdown), equivalent to `transcript.New(transcript.WithMarkdownRenderer(r))` but settable on a `chatshell.Model`'s already-constructed transcript. `StartStreamMarkdown(id string, open func(ctx context.Context) iter.Seq2[ai.Event, error]) tea.Cmd` MUST behave exactly like `StartStream` except the streaming entry is created with `Markdown` set, so each delta re-renders the FULL accumulated text through the configured renderer as it streams (progressive, since `transcript.Model` invalidates and re-renders the entry on every `AppendDelta`), and at minimum on completion; with no renderer configured it behaves identically to `StartStream` (the flag is inert).
+`chatshell.WithMarkdownRenderer(r transcript.MarkdownRenderer)` MUST configure the renderer `AppendAssistantMarkdown(text string)` — and any `transcript.Entry` with `Markdown` set — uses (e.g. a glamour-backed renderer for agent or HTTP-response markdown), equivalent to `transcript.New(transcript.WithMarkdownRenderer(r))` but settable on a `chatshell.Model`'s already-constructed transcript. `StartStreamMarkdown(id string, open func(ctx context.Context) iter.Seq2[ai.Event, error]) tea.Cmd` MUST behave exactly like `StartStream` except the streaming entry is created with `Markdown` set; with no renderer configured it behaves identically to `StartStream` (the flag is inert).
+
+Every delta's text MUST be accumulated onto the entry immediately (so the final `Text` is always complete), but re-running the renderer over that accumulated text on every single delta is NOT required and MUST be throttled: at most once per a bounded time window (`markdownRenderThrottle`, 100ms), PLUS any delta whose text crosses a newline (a likely-stable rendering point such as a completed list item or paragraph) forces an immediate re-render even inside that window, PLUS the stream's completion MUST always force one final re-render regardless of the window, so the displayed markdown is never stale once the stream ends. `chatshell.Model` exposes no way to disable this throttle; a product that needs every-delta rendering re-renders its own copy of the accumulated `Text` outside `chatshell`.
 
 ### Sidebar
 
@@ -241,6 +243,20 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **When** `Model.ReplaceBlock("grid-1", newBlock)` is called
 **Then** the entry at that position now renders `newBlock`, its `ID` and position are unchanged, focus is still on that entry, and `ClearTranscript()` afterward cancels any active stream, empties the transcript, and returns focus to the composer
 
+### AC: replace-block-syncs-focus-ring-stop-not-just-transcript
+**Requirements:** tui-kit#req:chatshell-transcript-ops
+
+**Given** two transcript entries where an EARLIER entry's `Focusable()` answer changes (shifting a LATER, currently-focused entry's stop index) and `Model.ReplaceBlock` is called for the earlier entry
+**When** a later, unrelated `syncFocus` runs (e.g. a resize) that reapplies `focusRing.Stop()` into the transcript
+**Then** focus is still on the same later entry -- `ReplaceBlock` must have updated `focusRing`'s own stop, not only `transcript.Model`'s internal focus index, or the later `syncFocus` would silently revert it
+
+### AC: clear-transcript-calls-set-busy-cancel
+**Requirements:** tui-kit#req:chatshell-transcript-ops
+
+**Given** a `chatshell.Model` with `SetBusy(true)` and a `SetBusyCancel` callback registered, no stream active
+**When** `ClearTranscript()` is called
+**Then** the registered callback fires and `Busy()` is false afterward
+
 ### AC: focus-entry-jumps-to-entry-by-id
 **Requirements:** tui-kit#req:chatshell-transcript-ops
 
@@ -267,14 +283,28 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 
 **Given** a `chatshell.Model`
 **When** `AppendBlockWithID("grid-1", b)` is called
-**Then** the transcript has one entry with `ID == "grid-1"` and `FocusEntry("grid-1")` returns `true`
+**Then** it returns `true`, the transcript has one entry with `ID == "grid-1"`, and `FocusEntry("grid-1")` returns `true`
+
+### AC: append-block-with-id-rejects-collisions
+**Requirements:** tui-kit#req:chatshell-transcript-ops
+
+**Given** a `chatshell.Model` that already has a transcript entry `ID: "grid-1"` and a `StartStream` call in flight under id `"turn-1"`
+**When** `AppendBlockWithID("grid-1", b)`, `AppendBlockWithID("turn-1", b)`, and `AppendBlockWithID("", b)` are each called
+**Then** every call returns `false` and appends no entry
 
 ### AC: start-stream-markdown-renders-accumulated-text-progressively
 **Requirements:** tui-kit#req:chatshell-markdown-renderer
 
 **Given** a `chatshell.Model` built `WithMarkdownRenderer(r)`
 **When** `StartStreamMarkdown(id, open)` streams several text deltas to completion
-**Then** the entry's `Markdown` field is set, its final `Text` is the full accumulated string, its rendered view is `r`'s output over that accumulated text (not the raw text), and `r` is invoked more than once (progressively) as deltas arrive; with no renderer configured, `StartStreamMarkdown` behaves identically to `StartStream`
+**Then** the entry's `Markdown` field is set, its final `Text` is the full accumulated string, its rendered view is `r`'s output over that accumulated text (not the raw text), and `r` is invoked more than once as deltas arrive; with no renderer configured, `StartStreamMarkdown` behaves identically to `StartStream`
+
+### AC: start-stream-markdown-throttles-re-render
+**Requirements:** tui-kit#req:chatshell-markdown-renderer
+
+**Given** a `chatshell.Model` built `WithMarkdownRenderer(r)`
+**When** `StartStreamMarkdown` streams many rapid, newline-free deltas followed by completion
+**Then** `r` is invoked far fewer times than there are deltas (throttled to the render window plus the guaranteed completion render) while the entry's final `Text` is still the complete accumulated string; a delta whose text crosses a newline forces an extra render even inside the throttle window
 
 ## Open Questions
 

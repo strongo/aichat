@@ -204,6 +204,39 @@ func (m *Model) AppendDelta(id, text string) {
 	m.Rebuild(m.shouldAutoFollow())
 }
 
+// AppendDeltaNoRender is AppendDelta's text-only half: it appends text to
+// the entry identified by id (creating it, as an assistant entry, on first
+// use, same as AppendDelta) but leaves its cached render untouched and does
+// NOT Rebuild the viewport. It exists for a caller (chatshell's
+// StartStreamMarkdown) that wants to throttle an expensive re-render (e.g.
+// re-running a markdown renderer) to less than once per delta while still
+// accumulating every delta's text immediately; pair it with
+// InvalidateAndRebuild once per throttle window, and always at least once
+// more when the stream completes.
+func (m *Model) AppendDeltaNoRender(id, text string) {
+	for i := range m.entries {
+		if m.entries[i].ID != "" && m.entries[i].ID == id {
+			m.entries[i].Text += text
+			return
+		}
+	}
+	m.entries = append(m.entries, Entry{ID: id, Role: RoleAssistant, Text: text})
+}
+
+// InvalidateAndRebuild forces the entry identified by id to re-render on the
+// next Rebuild (which this also triggers), picking up whatever text
+// AppendDeltaNoRender has accumulated since the last render. A no-op if no
+// entry has that id.
+func (m *Model) InvalidateAndRebuild(id string) {
+	for i := range m.entries {
+		if m.entries[i].ID != "" && m.entries[i].ID == id {
+			m.entries[i].renderValid = false
+			m.Rebuild(m.shouldAutoFollow())
+			return
+		}
+	}
+}
+
 // shouldAutoFollow reports whether new content should scroll the viewport to
 // the bottom: when nothing in the transcript is focused (focus is on the
 // composer or sidebar) or the viewport was already scrolled to the bottom.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"iter"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
@@ -23,6 +24,13 @@ import (
 // splitMinWidth is the terminal width at or above which the sidebar renders
 // as a split pane (DataTug's splitEnabled: u.width >= 104).
 const splitMinWidth = 104
+
+// markdownRenderThrottle caps how often StartStreamMarkdown re-runs the
+// configured MarkdownRenderer while a stream is in flight: at most once per
+// window, plus once on any delta crossing a newline (a likely-stable
+// rendering point, e.g. a completed list item or paragraph), plus always
+// once more on completion so the final render is never stale.
+const markdownRenderThrottle = 100 * time.Millisecond
 
 // Command is one slash command the composer's menu offers.
 type Command struct {
@@ -191,6 +199,18 @@ type Model struct {
 	streamID     string
 	streamCancel context.CancelFunc
 
+	// streamMarkdown and lastMarkdownRender throttle StartStreamMarkdown's
+	// re-render: streamMarkdown is true while the current stream renders
+	// through the MarkdownRenderer, and lastMarkdownRender is when it last
+	// actually re-rendered (as opposed to merely accumulating text via
+	// transcript.AppendDeltaNoRender) — see handleStreamEvent.
+	streamMarkdown     bool
+	lastMarkdownRender time.Time
+	// nowFunc, when set, replaces time.Now for the markdown-render throttle
+	// (tests only, via a fake clock — avoids real sleeps in a wall-clock
+	// throttle test). nil means time.Now.
+	nowFunc func() time.Time
+
 	// busyCancel is the cancel func for a product's own SetBusy(true) phase
 	// (e.g. a decision chain), set via SetBusyCancel. Esc/Ctrl+C while busy
 	// and no stream is active calls it directly, since — unlike a stream —
@@ -263,9 +283,25 @@ func (m *Model) AppendBlock(block transcript.Block) {
 // AppendBlockWithID appends a rich transcript.Block under a caller-chosen,
 // stable id, so a product can later FocusEntry(id) (e.g. DataTug's Ctrl+G
 // "jump to latest grid") or ReplaceBlock(id, ...) it. id must be non-empty
-// and unique among live entries, same requirement as StartStream's id.
-func (m *Model) AppendBlockWithID(id string, block transcript.Block) {
+// and unique among live entries (and must not clash with an in-flight
+// StartStream id, since both identify a transcript entry the same way);
+// AppendBlockWithID reports false and does not append on any such
+// collision, so a caller can generate a fresh id and retry instead of
+// silently corrupting FocusEntry/ReplaceBlock addressing.
+func (m *Model) AppendBlockWithID(id string, block transcript.Block) bool {
+	if id == "" {
+		return false
+	}
+	if id == m.streamID {
+		return false
+	}
+	for _, e := range m.transcript.Entries() {
+		if e.ID == id {
+			return false
+		}
+	}
 	m.transcript.Append(transcript.Entry{ID: id, Block: block})
+	return true
 }
 
 // StartStream starts a streamed assistant entry. id must be unique per
@@ -299,6 +335,8 @@ func (m *Model) startStream(id string, markdown bool, open func(ctx context.Cont
 	m.cancelStream()
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.streamID, m.streamCancel = id, cancel
+	m.streamMarkdown = markdown
+	m.lastMarkdownRender = time.Time{}
 	m.busy = true
 	m.ctrlCArmed = false
 	m.transcript.Append(transcript.Entry{ID: id, Role: transcript.RoleAssistant, Text: "", Markdown: markdown})
@@ -471,8 +509,21 @@ func (m *Model) Busy() bool { return m.busy }
 // keeps it (the focus ring stop is recomputed for the entry, not left
 // pointing at whatever raw index it used to occupy — necessary because
 // replacing a Block can change its own Focusable() answer).
+//
+// m.focusRing (chatshell's own zone/stop tracker) is resynced to whatever
+// transcript.ReplaceBlock decided too: syncFocus later reapplies
+// focusRing.Stop() into the transcript on the next zone change or resize, so
+// leaving it stale would silently undo transcript's own recomputed focus the
+// next time that happens.
 func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
 	m.transcript.ReplaceBlock(entryID, b)
+	if m.focusRing.Zone() == focus.ZoneTranscript {
+		if fe := m.transcript.FocusedEntry(); fe != nil {
+			if stop := m.transcript.StopForID(fe.ID); stop >= 0 {
+				m.focusRing.FocusStop(stop)
+			}
+		}
+	}
 }
 
 // FocusEntry moves focus to the transcript entry identified by id (e.g.
@@ -502,11 +553,18 @@ func (m *Model) SetComposerText(s string) {
 // transcript) matters because handleStreamEvent only applies an EventMsg
 // whose ID still matches the current stream — a stray delta for the
 // cancelled stream is otherwise silently dropped instead of resurrecting a
-// transcript entry the clear just removed.
+// transcript entry the clear just removed. A product's own SetBusy(true)
+// phase (no stream, e.g. a decision chain) has no DoneMsg to cancel it
+// asynchronously, so ClearTranscript also invokes the registered
+// SetBusyCancel callback directly, same as cancelBusy does for Esc/Ctrl+C.
 func (m *Model) ClearTranscript() {
 	m.cancelStream()
 	m.streamID = ""
 	m.streamCancel = nil
+	if m.busyCancel != nil {
+		m.busyCancel()
+		m.busyCancel = nil
+	}
 	m.busy = false
 	m.transcript.Clear()
 	m.focusRing.FocusInput()
@@ -713,7 +771,20 @@ func (m *Model) handleStreamEvent(msg stream.EventMsg) (tea.Model, tea.Cmd) {
 	if msg.ID == m.streamID {
 		switch msg.Event.Type {
 		case ai.EventTextDelta:
-			m.transcript.AppendDelta(msg.ID, msg.Event.Text)
+			if m.streamMarkdown {
+				// Throttle the (potentially expensive) markdown re-render to
+				// at most once per markdownRenderThrottle window, plus any
+				// delta that crosses a newline — text still accumulates on
+				// every delta via AppendDeltaNoRender regardless, so the
+				// final Text is always complete even between re-renders.
+				m.transcript.AppendDeltaNoRender(msg.ID, msg.Event.Text)
+				if strings.Contains(msg.Event.Text, "\n") || m.now().Sub(m.lastMarkdownRender) >= markdownRenderThrottle {
+					m.transcript.InvalidateAndRebuild(msg.ID)
+					m.lastMarkdownRender = m.now()
+				}
+			} else {
+				m.transcript.AppendDelta(msg.ID, msg.Event.Text)
+			}
 		case ai.EventError:
 			// Per the event contract, EventError with a nil Go error (this
 			// path — a fatal error arrives as a DoneMsg instead, see
@@ -740,6 +811,13 @@ func (m *Model) handleStreamDone(msg stream.DoneMsg) (tea.Model, tea.Cmd) {
 	if msg.ID == m.streamID {
 		m.busy = false
 		m.streamCancel = nil
+		if m.streamMarkdown {
+			// Guarantee the final accumulated text is rendered even if the
+			// last delta(s) landed inside a throttle window and never
+			// triggered their own re-render.
+			m.transcript.InvalidateAndRebuild(msg.ID)
+			m.streamMarkdown = false
+		}
 		switch {
 		case isCanceled(msg.Err):
 			m.AppendSystem("(stopped)")
@@ -906,6 +984,15 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	default:
 		return m.handleInputKey(msg)
 	}
+}
+
+// now returns the current time for the markdown-render throttle, using
+// nowFunc when a test has installed a fake clock.
+func (m *Model) now() time.Time {
+	if m.nowFunc != nil {
+		return m.nowFunc()
+	}
+	return time.Now()
 }
 
 func (m *Model) syncFocus() {

@@ -5,6 +5,7 @@ import (
 	"iter"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -1043,6 +1044,27 @@ func TestClearTranscriptEmptiesAndFocusesInput(t *testing.T) {
 	}
 }
 
+// TestClearTranscriptCallsSetBusyCancel covers r2's m6: a product's own
+// SetBusy(true) phase (no stream, e.g. a decision chain) has no DoneMsg to
+// cancel it asynchronously, so ClearTranscript must invoke the registered
+// SetBusyCancel callback directly, same as Esc/Ctrl+C's cancelBusy does.
+func TestClearTranscriptCallsSetBusyCancel(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	var canceled bool
+	m.SetBusy(true)
+	m.SetBusyCancel(func() { canceled = true })
+
+	m.ClearTranscript()
+
+	if !canceled {
+		t.Error("ClearTranscript did not call the registered SetBusyCancel callback")
+	}
+	if m.Busy() {
+		t.Error("still busy after ClearTranscript")
+	}
+}
+
 func TestWithTopBarAndStatusBarOverrideDefaults(t *testing.T) {
 	h := &fakeHandler{}
 	m := New(h,
@@ -1167,6 +1189,52 @@ func TestReplaceBlockKeepsFocusOnSameEntryWhenFocusabilityChanges(t *testing.T) 
 	after := m.transcript.FocusedEntry()
 	if after == nil || after.ID != "b1" {
 		t.Fatalf("after = %+v, want still focused on b1 (same entry) after ReplaceBlock", after)
+	}
+}
+
+// variableFocusBlock is a fakeBlock whose Focusable() answer can flip, used
+// to reproduce the "an EARLIER entry's ReplaceBlock shifts a LATER entry's
+// stop index" scenario.
+type variableFocusBlock struct {
+	fakeBlock
+	focusable bool
+}
+
+func (b *variableFocusBlock) Focusable() bool { return b.focusable }
+
+// TestReplaceBlockSyncsFocusRingStopNotJustTranscript covers r2's m5:
+// ReplaceBlock must resync m.focusRing's own stop, not just
+// transcript.Model's internal focusIndex — otherwise the next syncFocus
+// call (e.g. a WindowSizeMsg) reapplies the OLD, stale focusRing.Stop()
+// value into the transcript, silently undoing the fix
+// TestReplaceBlockKeepsFocusOnSameEntryWhenFocusabilityChanges checks for.
+func TestReplaceBlockSyncsFocusRingStopNotJustTranscript(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	// "a" starts non-focusable, so "b1" is the only stop (index 0).
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &variableFocusBlock{focusable: false}})
+	m.transcript.Append(transcript.Entry{ID: "b1", Block: &fakeBlock{}})
+
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	before := m.transcript.FocusedEntry()
+	if before == nil || before.ID != "b1" {
+		t.Fatalf("before = %+v, want focused on b1", before)
+	}
+
+	// Replacing "a" with a NOW-focusable block shifts "b1" from stop 0 to
+	// stop 1 — the transcript-level fix follows the focused entry by id, but
+	// chatshell's own focusRing.Stop() must be updated too.
+	m.ReplaceBlock("a", &variableFocusBlock{focusable: true})
+
+	// Simulate an unrelated later event that re-applies focusRing.Stop()
+	// into the transcript, the way syncFocus normally runs on a zone change
+	// or resize.
+	m.syncFocus()
+
+	after := m.transcript.FocusedEntry()
+	if after == nil || after.ID != "b1" {
+		t.Fatalf("after re-sync = %+v, want still focused on b1 — focusRing.Stop() must have been updated by ReplaceBlock, not left stale", after)
 	}
 }
 
@@ -1334,7 +1402,9 @@ func TestAppendBlockWithIDIsLaterFocusable(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
 	m.ctx = context.Background()
-	m.AppendBlockWithID("grid-1", &fakeBlock{})
+	if !m.AppendBlockWithID("grid-1", &fakeBlock{}) {
+		t.Fatal("AppendBlockWithID(\"grid-1\", ...) = false, want true for a fresh id")
+	}
 
 	entries := m.transcript.Entries()
 	if len(entries) != 1 || entries[0].ID != "grid-1" {
@@ -1342,6 +1412,33 @@ func TestAppendBlockWithIDIsLaterFocusable(t *testing.T) {
 	}
 	if !m.FocusEntry("grid-1") {
 		t.Fatal("FocusEntry(\"grid-1\") = false, want true: AppendBlockWithID must make the block focusable by id")
+	}
+}
+
+func TestAppendBlockWithIDRejectsDuplicateAndStreamIDClashes(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+
+	if !m.AppendBlockWithID("grid-1", &fakeBlock{}) {
+		t.Fatal("first AppendBlockWithID(\"grid-1\", ...) = false, want true")
+	}
+	if m.AppendBlockWithID("grid-1", &fakeBlock{}) {
+		t.Error("AppendBlockWithID(\"grid-1\", ...) = true on a duplicate id, want false (no second entry appended)")
+	}
+	if m.AppendBlockWithID("", &fakeBlock{}) {
+		t.Error("AppendBlockWithID(\"\", ...) = true, want false (empty id rejected)")
+	}
+
+	events := []ai.Event{{Type: ai.EventStarted}}
+	m.StartStream("turn-1", openSeq(events...))
+	if m.AppendBlockWithID("turn-1", &fakeBlock{}) {
+		t.Error("AppendBlockWithID(\"turn-1\", ...) = true while a stream owns that id, want false")
+	}
+
+	entries := m.transcript.Entries()
+	if len(entries) != 2 {
+		t.Fatalf("entries = %+v, want exactly 2 (grid-1, and the streaming entry) after the rejected calls", entries)
 	}
 }
 
@@ -1378,6 +1475,99 @@ func TestStartStreamMarkdownRendersAccumulatedTextThroughRenderer(t *testing.T) 
 	}
 	if lastText != "# Hello" {
 		t.Errorf("last render call text = %q, want the fully accumulated text", lastText)
+	}
+}
+
+// TestStartStreamMarkdownThrottlesReRenderAcrossRapidDeltas covers r2's m8:
+// a burst of rapid deltas with no newline must not re-run the (potentially
+// expensive) markdown renderer once per delta — only the throttle window's
+// first hit, plus the guaranteed final render on completion. The
+// accumulated Text is still complete even though intermediate renders were
+// skipped.
+func TestStartStreamMarkdownThrottlesReRenderAcrossRapidDeltas(t *testing.T) {
+	h := &fakeHandler{}
+	var renderCalls int
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		renderCalls++
+		return "RENDERED:" + text
+	}))
+	m.ctx = context.Background()
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// A fake clock that advances 1ms per call (far under
+	// markdownRenderThrottle's 100ms window) makes the throttle
+	// deterministic without depending on how fast the test itself runs —
+	// real wall-clock deltas between rapid, back-to-back events are not
+	// reliably sub-100ms in a loaded test environment.
+	fakeNow := time.Now()
+	m.nowFunc = func() time.Time {
+		fakeNow = fakeNow.Add(time.Millisecond)
+		return fakeNow
+	}
+
+	const n = 20
+	events := make([]ai.Event, 0, n+2)
+	events = append(events, ai.Event{Type: ai.EventStarted})
+	for i := 0; i < n; i++ {
+		events = append(events, ai.Event{Type: ai.EventTextDelta, Text: "x"})
+	}
+	events = append(events, ai.Event{Type: ai.EventCompleted})
+
+	cmd := m.StartStreamMarkdown("turn-1", openSeq(events...))
+	drainCmd(t, m, cmd, 4*n+20)
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || entries[0].Text != strings.Repeat("x", n) {
+		t.Fatalf("entries = %+v, want the fully accumulated %d-char text despite throttled rendering", entries, n)
+	}
+	// Rapid, newline-free deltas fired back-to-back land inside one 100ms
+	// throttle window: at most the window's first hit plus the guaranteed
+	// completion render, well under one render per delta.
+	if renderCalls >= n {
+		t.Errorf("renderCalls = %d for %d deltas, want throttled (well under one call per delta)", renderCalls, n)
+	}
+	view := m.transcript.View()
+	if !strings.Contains(view, "RENDERED:"+strings.Repeat("x", n)) {
+		t.Fatalf("view = %q, want the final render to reflect the complete accumulated text", view)
+	}
+}
+
+// TestStartStreamMarkdownRendersOnNewlineBoundary covers r2's m8's other
+// throttle trigger: a delta crossing a newline forces a re-render even
+// inside the throttle window, not just the timer.
+func TestStartStreamMarkdownRendersOnNewlineBoundary(t *testing.T) {
+	h := &fakeHandler{}
+	var renderTexts []string
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		renderTexts = append(renderTexts, text)
+		return "RENDERED:" + text
+	}))
+	m.ctx = context.Background()
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventTextDelta, Text: "line one\n"},
+		{Type: ai.EventTextDelta, Text: "line two"},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStreamMarkdown("turn-1", openSeq(events...))
+	drainCmd(t, m, cmd, 20)
+
+	if len(renderTexts) < 2 {
+		t.Fatalf("renderTexts = %v, want at least 2 renders: one triggered by the newline-crossing delta, one on completion", renderTexts)
+	}
+	var sawNewlineRender bool
+	for _, txt := range renderTexts {
+		if txt == "line one\n" {
+			sawNewlineRender = true
+		}
+	}
+	if !sawNewlineRender {
+		t.Errorf("renderTexts = %v, want a render with exactly the text as of the newline-crossing delta", renderTexts)
+	}
+	if last := renderTexts[len(renderTexts)-1]; last != "line one\nline two" {
+		t.Errorf("last render text = %q, want the full accumulated text on completion", last)
 	}
 }
 
