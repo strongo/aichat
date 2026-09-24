@@ -329,19 +329,76 @@ func gridKeyMap() table.KeyMap {
 
 // rebuildTable reconstructs the inner bubble-table from the current
 // columns/rows/cells/selectedColumn/style, preserving horizontal scroll
-// offset, the active filter text, and the highlighted row (by its SOURCE
-// index, resolved via CurrentIndex before the old table is replaced — not
-// bubble-table's raw cursor position, which indexes the filtered/visible
-// subset and would land on the wrong row once the new table's visible set
-// differs). Ported from DataTug's gridState.rebuild.
+// offset, the active filter text and its focus state, and the highlighted
+// row (by its SOURCE index, resolved via CurrentIndex before the old table
+// is replaced — not bubble-table's raw cursor position, which indexes the
+// filtered/visible subset and would land on the wrong row once the new
+// table's visible set differs). Ported from DataTug's gridState.rebuild.
 func (m *Model) rebuildTable() {
 	previousOffset := m.table.GetHorizontalScrollColumnOffset()
 	filterText := m.table.GetCurrentFilter()
+	filterFocused := m.table.GetIsFilterInputFocused()
 	highlightedSource := m.CurrentIndex()
+
+	newTable := m.buildTable(m.width, func(input table.RowStyleFuncInput) lipgloss.Style {
+		// Read the highlighted row dynamically off m.table (not a value
+		// captured at rebuild time): plain row-up/row-down navigation
+		// updates m.table's cursor directly, via bubble-table's own
+		// Update, without a rebuildTable call. Only valid for the table
+		// this Model actually keeps navigating — see tableViewAt for the
+		// one-shot alternative a throwaway render-at-another-width needs.
+		if input.Index != m.table.GetHighlightedRowIndex() {
+			if m.focused {
+				return lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(lipgloss.Color("235"))
+			}
+			return lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(lipgloss.Color("232"))
+		}
+		if m.focused {
+			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57"))
+		}
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250")).Background(lipgloss.Color("239"))
+	})
+	if filterText != "" {
+		newTable = newTable.WithFilterInputValue(filterText)
+		if filterFocused {
+			// WithFilterInputValue always blurs (bubble-table v0.23.0), so a
+			// rebuild while the user is actively typing into the filter
+			// (e.g. a resize mid-filter) must explicitly re-focus it or the
+			// very next keystroke silently falls through to the grid's own
+			// key handling instead of extending the filter text.
+			newTable = newTable.StartFilterTyping()
+		}
+	}
+	if len(m.rows) > 0 {
+		pos := visiblePositionForSource(newTable.GetVisibleRows(), highlightedSource)
+		if pos < 0 {
+			// The previously-highlighted row is filtered out of the new
+			// visible set (or there was none highlighted yet): fall back to
+			// the first visible row rather than an arbitrary position.
+			pos = 0
+		}
+		newTable = newTable.WithHighlightedRow(pos)
+	}
+	m.table = newTable
+	for i := 0; i < previousOffset; i++ {
+		m.table = m.table.ScrollRight()
+	}
+	m.ensureSelectedColumnVisible()
+}
+
+// buildTable constructs a bubble-table for the given width from the current
+// columns/rows/cells/selectedColumn/style — the config common to both the
+// real table (rebuildTable, which then carries over filter/highlight/scroll
+// state and assigns the result to m.table) and a one-shot render of the
+// table at a DIFFERENT width (tableViewAt, for a split layout's primary
+// pane) that must never touch m.table itself. rowStyleFunc is supplied by
+// the caller since the two uses need different highlighted-row tracking
+// (see rebuildTable's and tableViewAt's own comments).
+func (m *Model) buildTable(width int, rowStyleFunc func(table.RowStyleFuncInput) lipgloss.Style) table.Model {
 	columns := make([]table.Column, len(m.columns))
 	for i := range m.columns {
 		style := columnStyle(m.columns[i], i == m.selectedColumn)
-		columns[i] = table.NewColumn(columnKey(i), m.header(i), m.columnWidth(i)).WithStyle(style).WithFiltered(true)
+		columns[i] = table.NewColumn(columnKey(i), m.header(i), m.columnWidthFor(width, i)).WithStyle(style).WithFiltered(true)
 	}
 	rows := make([]table.Row, len(m.rows))
 	for i := range m.rows {
@@ -358,12 +415,12 @@ func (m *Model) rebuildTable() {
 		rows[i] = table.NewRow(data)
 	}
 	focused := m.focused
-	newTable := table.New(columns).
+	t := table.New(columns).
 		WithRows(rows).
 		WithBaseStyle(m.style.dividerStyle()).
 		WithBorderForeground(m.style.BorderColor).
 		HeaderStyle(m.style.HeaderStyle).
-		WithMaxTotalWidth(m.tableWidth()).
+		WithMaxTotalWidth(m.tableWidthFor(width)).
 		WithPaginationWrapping(false).
 		WithOuterBorder(false).
 		WithRowBorder(false).
@@ -372,43 +429,11 @@ func (m *Model) rebuildTable() {
 		Filtered(true).
 		WithKeyMap(gridKeyMap()).
 		Focused(focused && !m.secondaryFocus).
-		WithRowStyleFunc(func(input table.RowStyleFuncInput) lipgloss.Style {
-			// Read the highlighted row dynamically (not a value captured at
-			// rebuild time): plain row-up/row-down navigation updates
-			// m.table's cursor directly, via bubble-table's own Update,
-			// without a rebuildTable call.
-			if input.Index != m.table.GetHighlightedRowIndex() {
-				if m.focused {
-					return lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(lipgloss.Color("235"))
-				}
-				return lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(lipgloss.Color("232"))
-			}
-			if m.focused {
-				return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57"))
-			}
-			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250")).Background(lipgloss.Color("239"))
-		})
+		WithRowStyleFunc(rowStyleFunc)
 	if m.maxVisibleRows > 0 {
-		newTable = newTable.WithPageSize(m.maxVisibleRows)
+		t = t.WithPageSize(m.maxVisibleRows)
 	}
-	if filterText != "" {
-		newTable = newTable.WithFilterInputValue(filterText)
-	}
-	if len(rows) > 0 {
-		pos := visiblePositionForSource(newTable.GetVisibleRows(), highlightedSource)
-		if pos < 0 {
-			// The previously-highlighted row is filtered out of the new
-			// visible set (or there was none highlighted yet): fall back to
-			// the first visible row rather than an arbitrary position.
-			pos = 0
-		}
-		newTable = newTable.WithHighlightedRow(pos)
-	}
-	m.table = newTable
-	for i := 0; i < previousOffset; i++ {
-		m.table = m.table.ScrollRight()
-	}
-	m.ensureSelectedColumnVisible()
+	return t
 }
 
 // visiblePositionForSource returns the bubble-table cursor position (an
@@ -561,21 +586,27 @@ func (m *Model) NaturalWidth() int {
 	return width
 }
 
-// columnWidth is DataTug's gridState.columnWidth, generalised over cells.
-func (m *Model) columnWidth(columnIndex int) int {
+// columnWidthFor is DataTug's gridState.columnWidth, generalised over cells
+// and an explicit width rather than always m.width — used to build/measure
+// a table at a width other than the Model's own (a split layout's primary
+// pane; see tableViewAt).
+func (m *Model) columnWidthFor(width, columnIndex int) int {
 	if columnIndex < 0 || columnIndex >= len(m.columns) {
 		return 1
 	}
-	width := lipgloss.Width(m.header(columnIndex))
+	w := lipgloss.Width(m.header(columnIndex))
 	for _, row := range m.cells {
-		if columnIndex < len(row) && lipgloss.Width(row[columnIndex]) > width {
-			width = lipgloss.Width(row[columnIndex])
+		if columnIndex < len(row) && lipgloss.Width(row[columnIndex]) > w {
+			w = lipgloss.Width(row[columnIndex])
 		}
 	}
-	return max(1, min(m.tableWidth()-1, min(28, max(6, width))))
+	return max(1, min(m.tableWidthFor(width)-1, min(28, max(6, w))))
 }
 
-func (m *Model) tableWidth() int { return max(2, m.width-2) }
+func (m *Model) tableWidth() int { return m.tableWidthFor(m.width) }
+
+// tableWidthFor is tableWidth at an explicit width rather than m.width.
+func (m *Model) tableWidthFor(width int) int { return max(2, width-2) }
 
 // visibleColumnWindow mirrors bubble-table's no-outer-border width rules:
 // each non-final rendered column consumes its content width plus the right
@@ -583,22 +614,29 @@ func (m *Model) tableWidth() int { return max(2, m.width-2) }
 // horizontal overflow view reserves two cells for the marker column. Ported
 // from DataTug's gridState.visibleColumnWindow.
 func (m *Model) visibleColumnWindow() (int, int) {
+	return m.visibleColumnWindowFor(m.table.GetHorizontalScrollColumnOffset(), m.width)
+}
+
+// visibleColumnWindowFor is visibleColumnWindow for an explicit
+// offset/width rather than m.table's/m.width — used to keep the selected
+// column scrolled into view for a table built at a width other than the
+// Model's own (see scrollColumnIntoView/tableViewAt).
+func (m *Model) visibleColumnWindowFor(offset, width int) (int, int) {
 	if len(m.columns) == 0 {
 		return 0, -1
 	}
-	offset := m.table.GetHorizontalScrollColumnOffset()
 	used := 0
 	if offset > 0 {
 		used = 2 // bubble-table's left overflow marker and divider
 	}
 	last := offset - 1
 	for i := offset; i < len(m.columns); i++ {
-		targetWidth := m.tableWidth() - 2 // reserve the right overflow marker
+		targetWidth := m.tableWidthFor(width) - 2 // reserve the right overflow marker
 		finalColumn := i == len(m.columns)-1
 		if finalColumn {
-			targetWidth = m.tableWidth()
+			targetWidth = m.tableWidthFor(width)
 		}
-		renderedWidth := m.columnWidth(i)
+		renderedWidth := m.columnWidthFor(width, i)
 		if !finalColumn {
 			renderedWidth++ // non-final cell plus right divider
 		}
@@ -625,25 +663,34 @@ func (m *Model) visibleColumnRange() (int, int) {
 func (m *Model) VisibleColumnRange() (int, int) { return m.visibleColumnRange() }
 
 func (m *Model) ensureSelectedColumnVisible() {
+	m.table = m.scrollColumnIntoView(m.table, m.width)
+}
+
+// scrollColumnIntoView is ensureSelectedColumnVisible generalised to an
+// arbitrary table.Model/width rather than m.table/m.width, so tableViewAt
+// can scroll a one-shot render-at-another-width table without touching the
+// real one.
+func (m *Model) scrollColumnIntoView(t table.Model, width int) table.Model {
 	if len(m.columns) == 0 {
-		return
+		return t
 	}
-	for m.table.GetHorizontalScrollColumnOffset() > m.selectedColumn {
-		before := m.table.GetHorizontalScrollColumnOffset()
-		m.table = m.table.ScrollLeft()
-		if m.table.GetHorizontalScrollColumnOffset() == before {
+	for t.GetHorizontalScrollColumnOffset() > m.selectedColumn {
+		before := t.GetHorizontalScrollColumnOffset()
+		t = t.ScrollLeft()
+		if t.GetHorizontalScrollColumnOffset() == before {
 			break
 		}
 	}
-	_, last := m.visibleColumnWindow()
-	for m.selectedColumn > last && m.table.GetHorizontalScrollColumnOffset() < m.selectedColumn {
-		before := m.table.GetHorizontalScrollColumnOffset()
-		m.table = m.table.ScrollRight()
-		if m.table.GetHorizontalScrollColumnOffset() == before {
+	_, last := m.visibleColumnWindowFor(t.GetHorizontalScrollColumnOffset(), width)
+	for m.selectedColumn > last && t.GetHorizontalScrollColumnOffset() < m.selectedColumn {
+		before := t.GetHorizontalScrollColumnOffset()
+		t = t.ScrollRight()
+		if t.GetHorizontalScrollColumnOffset() == before {
 			break
 		}
-		_, last = m.visibleColumnWindow()
+		_, last = m.visibleColumnWindowFor(t.GetHorizontalScrollColumnOffset(), width)
 	}
+	return t
 }
 
 // VisibleIndices returns the display-index range (inclusive) of the table's

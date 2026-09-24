@@ -7,6 +7,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/evertras/bubble-table/table"
 )
 
 // View implements transcript.Block: a bordered card (title + view switcher,
@@ -140,20 +141,58 @@ func (m *Model) paneHeight() int {
 	return DefaultMaxVisibleRows
 }
 
-// tableViewAt renders the bare table at a specific width without disturbing
-// the Model's own width (used for the primary pane of a split layout).
+// tableViewAt renders the bare table at a specific width — used for the
+// primary pane of a split layout, typically narrower than m.width — WITHOUT
+// disturbing the Model's own width, table, or filter focus. It builds a
+// throwaway table.Model via buildTable rather than temporarily mutating
+// m.width/m.table and rebuilding twice (once at the new width, once back):
+// that used to run on every single View() call for a split-active grid
+// (layout.PrimaryWidth is almost never equal to m.width), and each
+// rebuildTable call blurs the real filter input (bubble-table v0.23.0's
+// WithFilterInputValue always does), so a user typing into the filter under
+// a split layout had it silently blurred on the very next render — the next
+// keystroke fell through to the grid's own key handling instead of
+// extending the filter text. View must be side-effect free; this is.
 func (m *Model) tableViewAt(width int) string {
-	previousWidth := m.width
-	if width != m.width {
-		m.width = max(1, width)
-		m.rebuildTable()
+	if width == m.width {
+		return m.table.View()
 	}
-	view := m.table.View()
-	if width != previousWidth {
-		m.width = previousWidth
-		m.rebuildTable()
+	highlightedSource := m.CurrentIndex()
+	filterText := m.table.GetCurrentFilter()
+	highlighted := -1 // set below, once the throwaway table's visible set is known; the row-style closure reads it by reference at render time.
+	t := m.buildTable(width, func(input table.RowStyleFuncInput) lipgloss.Style {
+		// A snapshot, unlike rebuildTable's dynamic m.table.GetHighlightedRowIndex()
+		// read: this table is rendered once, right here, and discarded —
+		// it is never separately navigated — so there is no "later" state
+		// for a dynamic read to need to catch up with.
+		if input.Index != highlighted {
+			if m.focused {
+				return lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(lipgloss.Color("235"))
+			}
+			return lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(lipgloss.Color("232"))
+		}
+		if m.focused {
+			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57"))
+		}
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250")).Background(lipgloss.Color("239"))
+	})
+	if filterText != "" {
+		// This throwaway copy's own filter focus doesn't matter — it's
+		// rendered once and discarded — only the REAL m.table's filter
+		// input (never touched here) determines whether the next keypress
+		// reaches it.
+		t = t.WithFilterInputValue(filterText)
 	}
-	return view
+	if len(m.rows) > 0 {
+		pos := visiblePositionForSource(t.GetVisibleRows(), highlightedSource)
+		if pos < 0 {
+			pos = 0
+		}
+		highlighted = pos
+		t = t.WithHighlightedRow(pos)
+	}
+	t = m.scrollColumnIntoView(t, width)
+	return t.View()
 }
 
 // ActiveViewContent renders just the active view's own body (table or the

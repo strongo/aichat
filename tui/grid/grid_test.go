@@ -821,3 +821,84 @@ func TestJKeyDefaultsToRowDownUnlessKeyHandlerClaimsIt(t *testing.T) {
 		t.Fatalf("CurrentIndex() after j with a claiming KeyHandler = %d, want 0 (KeyHandler owned it)", i)
 	}
 }
+
+// TestSplitLayoutFilterFocusSurvivesRender is the regression test for M1:
+// bubble-table v0.23.0's WithFilterInputValue always blurs the filter
+// input, and tableViewAt used to rebuild the whole table (mutating m.table)
+// on every single View() call whenever a split layout was active — since
+// layout.PrimaryWidth is essentially never equal to m.width. That blurred
+// the real filter on the very next render after "/" opened it, so the next
+// keystroke fell through to the grid's own key handling (e.g. "s" sorts,
+// "j" moves) instead of extending the filter text. tableViewAt must render
+// a split's primary pane without touching the real table/filter at all.
+func TestSplitLayoutFilterFocusSurvivesRender(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows,
+		WithExtraViews(ExtraView{Label: "Charts", Render: func(m *Model, w, h int) string { return "chart" }}),
+		WithSplitLayout(func(totalWidth, naturalWidth int, view View) SplitLayout {
+			return SplitLayout{Split: true, PrimaryWidth: 20, SecondaryWidth: totalWidth - 20}
+		}),
+	)
+	m.SetView(View(firstExtraView))
+	m.SetFocused(true) // before the filter opens, so this rebuild (a legitimate one) doesn't need to restore anything
+	var cmd tea.Cmd
+	m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: "/", Code: '/'})
+	_ = cmd
+	if !m.table.GetIsFilterInputFocused() {
+		t.Fatal("filter did not focus on /")
+	}
+
+	// Render at the SAME width/focused View was last called with (via
+	// SetFocused/New, both m.width==80): the top-level width/focused check
+	// in View() sees no change and skips its own rebuild, isolating what's
+	// under test — the split layout's tableViewAt path, which must not
+	// touch the real table/filter as a side effect of rendering the
+	// primary pane at a different (narrower) width.
+	_ = m.View(m.Width(), m.Focused())
+	if !m.table.GetIsFilterInputFocused() {
+		t.Fatal("filter lost focus after View() with a split layout active")
+	}
+
+	m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: "A", Code: 'A'})
+	_ = cmd
+	if got := m.table.GetCurrentFilter(); got != "A" {
+		t.Fatalf("filter text after typing A = %q, want %q (keystroke reached the filter, not grid key handling)", got, "A")
+	}
+}
+
+// TestFilterFocusSurvivesResizeWhileTyping is the other regression test for
+// M1: a resize (SetWidth/View with a new width) legitimately calls
+// rebuildTable, which builds a brand-new bubble-table with no filter focus
+// of its own (WithFilterInputValue always blurs). rebuildTable must
+// explicitly restore focus when the filter was focused going in.
+func TestFilterFocusSurvivesResizeWhileTyping(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.SetWidth(60)
+	m.SetFocused(true) // the Model's own focus, not just m.table's — rebuildTable rebuilds the table from THIS, and an unfocused table drops all Update()s, filter included
+	var cmd tea.Cmd
+	m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: "/", Code: '/'})
+	_ = cmd
+	for _, r := range "Pr" {
+		m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: string(r), Code: r})
+		_ = cmd
+	}
+	if !m.table.GetIsFilterInputFocused() {
+		t.Fatal("filter did not focus/accept text before resize")
+	}
+
+	m.SetWidth(45) // triggers rebuildTable directly (width changed)
+
+	if got := m.table.GetCurrentFilter(); got != "Pr" {
+		t.Fatalf("filter text after resize = %q, want %q", got, "Pr")
+	}
+	if !m.table.GetIsFilterInputFocused() {
+		t.Fatal("filter lost focus after a resize while typing")
+	}
+
+	m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: "a", Code: 'a'})
+	_ = cmd
+	if got := m.table.GetCurrentFilter(); got != "Pra" {
+		t.Fatalf("filter text after typing post-resize = %q, want %q", got, "Pra")
+	}
+}
