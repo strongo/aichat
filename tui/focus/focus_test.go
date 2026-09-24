@@ -167,6 +167,36 @@ func TestFocusStopNegativeClampsToInput(t *testing.T) {
 	}
 }
 
+func TestFocusSidebarDirectlyIsNoopWhenAlreadyFocused(t *testing.T) {
+	r := New()
+	r.FocusStop(1)
+	r.FocusSidebar()
+	if r.Zone() != ZoneSidebar {
+		t.Fatalf("zone = %v, want sidebar", r.Zone())
+	}
+	// Calling FocusSidebar again while already in the sidebar must not
+	// clobber the remembered return zone/stop.
+	r.FocusSidebar()
+	if !r.ShiftLeft(3) {
+		t.Fatal("ShiftLeft did not move")
+	}
+	if r.Zone() != ZoneTranscript || r.Stop() != 1 {
+		t.Fatalf("zone=%v stop=%d, want transcript/1 (return state preserved)", r.Zone(), r.Stop())
+	}
+}
+
+func TestShiftUpFromSidebarIsNoop(t *testing.T) {
+	r := New()
+	r.FocusStop(1)
+	r.ShiftRight()
+	if moved := r.ShiftUp(3); moved {
+		t.Fatal("ShiftUp moved from sidebar")
+	}
+	if r.Zone() != ZoneSidebar {
+		t.Fatalf("zone = %v, want sidebar", r.Zone())
+	}
+}
+
 func TestZoneString(t *testing.T) {
 	cases := map[Zone]string{ZoneInput: "input", ZoneTranscript: "transcript", ZoneSidebar: "sidebar"}
 	for zone, want := range cases {

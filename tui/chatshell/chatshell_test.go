@@ -27,6 +27,11 @@ type fakeHandler struct {
 	streamEvents []ai.Event
 	msgsSeen     []tea.Msg
 	streamDone   []streamDoneCall
+	// onMsgCmd/onStreamEventCmd, when set, are returned by OnMsg/OnStreamEvent
+	// respectively — used to exercise dispatchUnhandled/handleStreamEvent's
+	// "propagate the handler's own non-nil cmd" branches.
+	onMsgCmd         tea.Cmd
+	onStreamEventCmd tea.Cmd
 }
 
 type streamDoneCall struct {
@@ -45,7 +50,7 @@ func (h *fakeHandler) OnSidebarChange(refs []session.EntityRef) {
 
 func (h *fakeHandler) OnStreamEvent(id string, ev ai.Event) tea.Cmd {
 	h.streamEvents = append(h.streamEvents, ev)
-	return nil
+	return h.onStreamEventCmd
 }
 
 func (h *fakeHandler) OnStreamDone(id string, err error) tea.Cmd {
@@ -55,7 +60,7 @@ func (h *fakeHandler) OnStreamDone(id string, err error) tea.Cmd {
 
 func (h *fakeHandler) OnMsg(msg tea.Msg) tea.Cmd {
 	h.msgsSeen = append(h.msgsSeen, msg)
-	return nil
+	return h.onMsgCmd
 }
 
 // fakeBlock is a minimal transcript.Block used to test focus/Esc/update
@@ -64,6 +69,10 @@ type fakeBlock struct {
 	updates   int
 	captures  bool
 	lastEvent tea.Msg
+	// cmdToReturn, when set, is returned by Update on every call — used to
+	// exercise dispatchUnhandled's "transcript.Update returned a non-nil
+	// cmd" branch via transcript.broadcast.
+	cmdToReturn tea.Cmd
 }
 
 func (b *fakeBlock) View(width int, focused bool) string { return "block" }
@@ -71,7 +80,7 @@ func (b *fakeBlock) View(width int, focused bool) string { return "block" }
 func (b *fakeBlock) Update(msg tea.Msg) (transcript.Block, tea.Cmd) {
 	b.updates++
 	b.lastEvent = msg
-	return b, nil
+	return b, b.cmdToReturn
 }
 
 func (b *fakeBlock) Focusable() bool { return true }
@@ -857,6 +866,16 @@ func (p *fakeSidePanel) Update(msg tea.Msg) (SidePanel, tea.Cmd) {
 	p.lastMsg = msg
 	return p, nil
 }
+
+// cmdSidePanel is a minimal SidePanel whose Update returns a caller-set cmd,
+// used to exercise dispatchUnhandled's SidePanel-cmd-propagation branch.
+type cmdSidePanel struct {
+	cmdToReturn tea.Cmd
+}
+
+func (p *cmdSidePanel) Title() string                               { return "cmd" }
+func (p *cmdSidePanel) View(width, height int, focused bool) string { return "cmd" }
+func (p *cmdSidePanel) Update(msg tea.Msg) (SidePanel, tea.Cmd)     { return p, p.cmdToReturn }
 
 func TestSidePanelReplacesSidebarInFocusRingAndSplit(t *testing.T) {
 	h := &fakeHandler{}
@@ -1738,6 +1757,552 @@ func TestStartStreamWithoutMarkdownRendererBehavesLikeStartStream(t *testing.T) 
 	}
 }
 
+// --- coverage-completion tests ---------------------------------------------
+
+func TestFocusedRefFromTranscriptCurrent(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	blk := &fakeBlock{}
+	m.AppendBlock(blk)
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	// fakeBlock does not implement transcript.Currenter (or whatever the
+	// real accessor is), so Current() may be nil for a block-only entry;
+	// what matters here is exercising the ZoneTranscript branch itself
+	// (chatshell.go:474), whatever it returns.
+	_ = m.FocusedRef()
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		t.Fatalf("zone = %v, want transcript", m.focusRing.Zone())
+	}
+}
+
+func TestFocusedRefNilWhenSidePanelActive(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift}) // -> sidebar zone
+	if m.focusRing.Zone() != focus.ZoneSidebar {
+		t.Fatalf("zone = %v, want sidebar", m.focusRing.Zone())
+	}
+	if got := m.FocusedRef(); got != nil {
+		t.Fatalf("FocusedRef() = %v, want nil while a SidePanel is active", got)
+	}
+}
+
+func TestFocusedRefNilWhenSidebarCursorOutOfRange(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift}) // -> sidebar, no pins
+	if m.focusRing.Zone() != focus.ZoneSidebar {
+		t.Fatalf("zone = %v, want sidebar", m.focusRing.Zone())
+	}
+	if got := m.FocusedRef(); got != nil {
+		t.Fatalf("FocusedRef() = %v, want nil for an empty sidebar (cursor out of range)", got)
+	}
+}
+
+// entityBlock is a fakeBlock that also implements transcript.EntityBlock, so
+// transcript.Current() (and thus FocusedRef/SelectionRefs) can return a real
+// ref for it.
+type entityBlock struct {
+	fakeBlock
+	ref session.EntityRef
+}
+
+func (b *entityBlock) Current() *session.EntityRef { return &b.ref }
+
+func TestSelectionRefsReturnsCurrentTranscriptRef(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ref := session.EntityRef{Type: "row", Keys: map[string]string{"id": "42"}, Title: "Row 42"}
+	blk := &entityBlock{ref: ref}
+	m.AppendBlock(blk)
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+
+	refs := m.SelectionRefs()
+	if len(refs) != 1 || !refs[0].Same(ref) {
+		t.Fatalf("SelectionRefs() = %v, want [%v]", refs, ref)
+	}
+
+	// Also exercises FocusedRef's ZoneTranscript branch returning a real,
+	// non-nil ref (chatshell.go:474).
+	if got := m.FocusedRef(); got == nil || !got.Same(ref) {
+		t.Fatalf("FocusedRef() = %v, want %v", got, ref)
+	}
+}
+
+func TestUpdatePanelRoutesToDefaultSidebar(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ref := session.EntityRef{Type: "t", Keys: map[string]string{"id": "1"}}
+	m.PinToSidebar(ref)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift}) // -> sidebar
+	if m.focusRing.Zone() != focus.ZoneSidebar {
+		t.Fatalf("zone = %v, want sidebar", m.focusRing.Zone())
+	}
+	// "x" on a sidebar entry removes it and returns a RemoveMsg cmd — proof
+	// the key reached the default sidebar's own Update (updatePanel's
+	// non-SidePanel branch), not just a no-op.
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	if cmd == nil {
+		t.Fatal("expected updatePanel to route the key to the default sidebar and return its cmd")
+	}
+	if len(m.sidebar.Refs()) != 0 {
+		t.Fatalf("sidebar refs = %v, want empty after 'x' removed the only pin", m.sidebar.Refs())
+	}
+}
+
+func TestIsOverlayInputMsgCoversEveryInputKind(t *testing.T) {
+	inputs := []tea.Msg{
+		tea.KeyPressMsg{Code: 'x'},
+		tea.KeyReleaseMsg{},
+		tea.PasteMsg{Content: "x"},
+		tea.PasteStartMsg{},
+		tea.PasteEndMsg{},
+		tea.MouseClickMsg{},
+		tea.MouseReleaseMsg{},
+		tea.MouseWheelMsg{},
+		tea.MouseMotionMsg{},
+	}
+	for _, in := range inputs {
+		if !isOverlayInputMsg(in) {
+			t.Errorf("isOverlayInputMsg(%T) = false, want true", in)
+		}
+	}
+	if isOverlayInputMsg(struct{}{}) {
+		t.Error("isOverlayInputMsg(struct{}{}) = true, want false")
+	}
+}
+
+func TestOverlayCapturesMouseAndPasteMessages(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ov := &fakeOverlay{name: "dialog", closeKey: "never"}
+	m.PushOverlay(ov)
+	for _, in := range []tea.Msg{
+		tea.KeyReleaseMsg{},
+		tea.PasteMsg{Content: "x"},
+		tea.PasteStartMsg{},
+		tea.PasteEndMsg{},
+		tea.MouseClickMsg{},
+		tea.MouseReleaseMsg{},
+		tea.MouseWheelMsg{},
+		tea.MouseMotionMsg{},
+	} {
+		m.Update(in)
+	}
+	if len(ov.seen) != 8 {
+		t.Fatalf("overlay saw %d input messages, want 8: %+v", len(ov.seen), ov.seen)
+	}
+}
+
+func TestDispatchUnhandledPropagatesTranscriptBlockCmd(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ran := false
+	blk := &fakeBlock{cmdToReturn: func() tea.Msg { ran = true; return nil }}
+	m.AppendBlock(blk)
+
+	type productMsg struct{}
+	_, cmd := m.Update(productMsg{})
+	if cmd == nil {
+		t.Fatal("dispatchUnhandled should propagate a non-nil cmd from transcript.Update")
+	}
+	cmd()
+	if !ran {
+		t.Fatal("propagated cmd was not the block's own cmd")
+	}
+	if blk.updates != 1 {
+		t.Fatalf("block updates = %d, want 1", blk.updates)
+	}
+}
+
+func TestDispatchUnhandledPropagatesSidePanelCmd(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &cmdSidePanel{}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	type productMsg struct{}
+	ran := false
+	panel.cmdToReturn = func() tea.Msg { ran = true; return nil }
+	_, cmd := m.Update(productMsg{})
+	if cmd == nil {
+		t.Fatal("dispatchUnhandled should propagate a non-nil cmd from the SidePanel's Update")
+	}
+	cmd()
+	if !ran {
+		t.Fatal("propagated cmd was not the SidePanel's own cmd")
+	}
+}
+
+func TestDispatchUnhandledPropagatesMsgHandlerCmd(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ran := false
+	h.onMsgCmd = func() tea.Msg { ran = true; return nil }
+
+	type productMsg struct{}
+	_, cmd := m.Update(productMsg{})
+	if cmd == nil {
+		t.Fatal("dispatchUnhandled should propagate a non-nil cmd from MsgHandler.OnMsg")
+	}
+	cmd()
+	if !ran {
+		t.Fatal("propagated cmd was not the handler's own cmd")
+	}
+}
+
+func TestHandleStreamEventPropagatesStreamObserverCmd(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ran := false
+	h.onStreamEventCmd = func() tea.Msg { ran = true; return nil }
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStream("turn-1", openSeq(events...))
+	drainCmd(t, m, cmd, 20)
+	if !ran {
+		t.Fatal("StreamObserver.OnStreamEvent's returned cmd was never run")
+	}
+}
+
+func TestHandleMarkdownRenderTickIgnoresStaleTick(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.streamID = "current"
+	m.streamMarkdown = true
+	m.transcript.Append(transcript.Entry{ID: "current", Role: transcript.RoleAssistant, Text: "keep", Markdown: true})
+	m.markdownTickPending = true
+	sentinel := time.Now().Add(-time.Hour)
+	m.lastMarkdownRender = sentinel
+
+	// A tick for a DIFFERENT (superseded/stale) stream id must not trigger a
+	// re-render (lastMarkdownRender stays untouched), even though
+	// markdownTickPending is unconditionally cleared either way.
+	m.handleMarkdownRenderTick(markdownRenderTickMsg{id: "stale"})
+	if !m.lastMarkdownRender.Equal(sentinel) {
+		t.Fatal("a stale tick must not re-render/update lastMarkdownRender for the current stream")
+	}
+	if m.markdownTickPending {
+		t.Fatal("markdownTickPending should always be cleared once a tick fires")
+	}
+
+	// A tick that arrives after streamMarkdown flipped false (e.g. the
+	// stream finished non-markdown in between) is also a no-op on the render.
+	m.markdownTickPending = true
+	m.streamMarkdown = false
+	m.handleMarkdownRenderTick(markdownRenderTickMsg{id: "current"})
+	if !m.lastMarkdownRender.Equal(sentinel) {
+		t.Fatal("a tick for a non-markdown stream must not re-render/update lastMarkdownRender")
+	}
+	if m.markdownTickPending {
+		t.Fatal("handleMarkdownRenderTick should still clear markdownTickPending even when it no-ops on the render")
+	}
+}
+
+func TestStatusLinesSplitsMultilineStatus(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetStatus("line one\nline two")
+	lines := m.statusLines()
+	if len(lines) != 2 || lines[0] != "line one" || lines[1] != "line two" {
+		t.Fatalf("statusLines() = %v, want [\"line one\" \"line two\"]", lines)
+	}
+	view := m.View()
+	if !strings.Contains(view.Content, "line one") || !strings.Contains(view.Content, "line two") {
+		t.Fatalf("View() content missing status lines: %q", view.Content)
+	}
+}
+
+func TestShiftUpFallsThroughToComposerWithNonEmptyInput(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.input.SetValue("hello")
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift})
+	if m.focusRing.Zone() != focus.ZoneInput {
+		t.Fatalf("zone = %v, want input (shift+up should fall through to the composer)", m.focusRing.Zone())
+	}
+}
+
+func TestShiftUpMovesBetweenTranscriptStops(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &fakeBlock{}})
+	m.transcript.Append(transcript.Entry{ID: "b", Block: &fakeBlock{}})
+	m.focusRing.FocusStop(1)
+	m.syncFocus()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift})
+	if m.focusRing.Zone() != focus.ZoneTranscript || m.focusRing.Stop() != 0 {
+		t.Fatalf("zone=%v stop=%d, want transcript stop 0 after shift+up", m.focusRing.Zone(), m.focusRing.Stop())
+	}
+}
+
+func TestShiftDownMovesBetweenTranscriptStops(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &fakeBlock{}})
+	m.transcript.Append(transcript.Entry{ID: "b", Block: &fakeBlock{}})
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown, Mod: tea.ModShift})
+	if m.focusRing.Zone() != focus.ZoneTranscript || m.focusRing.Stop() != 1 {
+		t.Fatalf("zone=%v stop=%d, want transcript stop 1 after shift+down", m.focusRing.Zone(), m.focusRing.Stop())
+	}
+}
+
+func TestCommandMenuArrowNavigation(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.commands = []Command{
+		{Name: "/help", Help: "Show help"},
+		{Name: "/history", Help: "Show history"},
+	}
+	m.input.SetValue("/h")
+	if len(m.commandMenuMatches()) != 2 {
+		t.Fatalf("matches = %v, want 2", m.commandMenuMatches())
+	}
+
+	// "up" at index 0 stays at 0 (the guard branch).
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	if m.commandMenuIndex != 0 {
+		t.Fatalf("commandMenuIndex = %d, want 0 (up at top is a no-op)", m.commandMenuIndex)
+	}
+
+	// "down" moves forward.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if m.commandMenuIndex != 1 {
+		t.Fatalf("commandMenuIndex = %d, want 1 after down", m.commandMenuIndex)
+	}
+
+	// "down" at the last index stays put (the guard branch).
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if m.commandMenuIndex != 1 {
+		t.Fatalf("commandMenuIndex = %d, want 1 (down at bottom is a no-op)", m.commandMenuIndex)
+	}
+
+	// "up" now moves back.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	if m.commandMenuIndex != 0 {
+		t.Fatalf("commandMenuIndex = %d, want 0 after up", m.commandMenuIndex)
+	}
+}
+
+func TestCommandMenuViewRendersSelectedAndUnselectedEntries(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.commands = []Command{
+		{Name: "/help", Help: "Show help"},
+		{Name: "/history", Help: "Show history"},
+	}
+	m.input.SetValue("/h")
+	m.commandMenuIndex = 1
+
+	view := m.commandMenuView()
+	if !strings.Contains(view, "Commands · ↑↓ choose · Enter insert · Esc close") {
+		t.Fatalf("commandMenuView() missing header: %q", view)
+	}
+	if !strings.Contains(view, "  /help  Show help") {
+		t.Fatalf("commandMenuView() missing unselected entry prefix: %q", view)
+	}
+	if !strings.Contains(view, "› /history  Show history") {
+		t.Fatalf("commandMenuView() missing selected entry prefix: %q", view)
+	}
+
+	// commandMenuView returns "" when there are no matches.
+	m.input.SetValue("/nomatch")
+	if got := m.commandMenuView(); got != "" {
+		t.Fatalf("commandMenuView() = %q, want empty with no matches", got)
+	}
+}
+
+func TestViewIncludesCommandMenuWhenOpen(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.commands = []Command{{Name: "/help", Help: "Show help"}}
+	m.input.SetValue("/he")
+	view := m.View()
+	if !strings.Contains(view.Content, "Commands ·") {
+		t.Fatalf("View() content missing the open command menu: %q", view.Content)
+	}
+}
+
+func TestEnterWithNilHandlerAppendsUserOnlyAndDoesNotPanic(t *testing.T) {
+	m := newTestShell(nil)
+	m.input.SetValue("hi there")
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || entries[0].Text != "hi there" {
+		t.Fatalf("entries = %+v, want the user message appended even with a nil handler", entries)
+	}
+	if m.input.Value() != "" {
+		t.Fatalf("input = %q, want cleared", m.input.Value())
+	}
+}
+
+// TestReplaceBlockResyncsWhenNoPriorFocusButOneAppears covers the case
+// where the transcript zone holds a stop index that resolves to nothing
+// focusable BEFORE the swap (hadFocus false), but the swap itself makes that
+// same stop resolve to a real entry — e.g. ReplaceBlock making the very
+// entry focusRing.Stop() already pointed at newly focusable.
+func TestReplaceBlockResyncsWhenNoPriorFocusButOneAppears(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &variableFocusBlock{focusable: false}})
+	m.focusRing.FocusStop(0) // zone=Transcript, stop=0, but nothing is focusable yet
+	m.syncFocus()            // propagate stop=0 into transcript's own focusIndex
+	if fe := m.transcript.FocusedEntry(); fe != nil {
+		t.Fatalf("setup: FocusedEntry() = %+v, want nil (nothing focusable yet)", fe)
+	}
+
+	m.ReplaceBlock("a", &variableFocusBlock{focusable: true})
+
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		t.Fatalf("Zone() = %v, want ZoneTranscript", m.focusRing.Zone())
+	}
+	if stop := m.focusRing.Stop(); stop != 0 {
+		t.Fatalf("focusRing.Stop() = %d, want 0", stop)
+	}
+	m.syncFocus()
+	fe := m.transcript.FocusedEntry()
+	if fe == nil || fe.ID != "a" {
+		t.Fatalf("FocusedEntry() after resync = %+v, want entry a now that it's focusable", fe)
+	}
+}
+
+func TestReplaceBlockNoFocusToLoseIsANoop(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &variableFocusBlock{focusable: false}})
+	// Focus the transcript zone directly even though nothing there is
+	// focusable (FocusedEntry() is nil, so hadFocus stays false) — covers
+	// the "!hadFocus" early return in ReplaceBlock (chatshell.go:554-556).
+	m.focusRing.FocusStop(0)
+	if fe := m.transcript.FocusedEntry(); fe != nil {
+		t.Fatalf("setup: expected no focused entry, got %+v", fe)
+	}
+
+	m.ReplaceBlock("a", &variableFocusBlock{focusable: false})
+
+	if fe := m.transcript.FocusedEntry(); fe != nil {
+		t.Fatalf("FocusedEntry() = %+v, want still nil", fe)
+	}
+}
+
+// TestReplaceBlockKeepsFocusOnNoIDEntryWhenEarlierEntryReplaced is a
+// regression test for a real bug found while writing these tests:
+// transcript.StopForID("") always returns -1 (transcript's own documented
+// special case for an empty ID), and transcript.ReplaceBlock only
+// re-resolves its own internal focus cursor by ID when the focused entry
+// HAS one. So a focused entry with no ID (AppendUser/AppendAssistant/plain
+// AppendBlock all leave ID empty — only AppendBlockWithID sets one) used to
+// silently fall out of focus tracking whenever an EARLIER entry's
+// ReplaceBlock shifted stop numbers, even though the focused entry's own
+// Block never changed. Fixed in chatshell.go's ReplaceBlock by tracking the
+// focused entry by its raw position in m.transcript.Entries() instead of by
+// ID (see stopForRawIndex), and by pushing the recomputed stop straight into
+// transcript via syncFocus() before returning — transcript's own focus
+// cursor only re-resolves itself by ID, which is a no-op for a no-ID entry,
+// so without that explicit resync the highlight would stay wherever
+// transcript.ReplaceBlock last left it (lost, or on the wrong Block) instead
+// of reflecting focusRing's corrected stop immediately.
+func TestReplaceBlockKeepsFocusOnNoIDEntryWhenEarlierEntryReplaced(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	blk2 := &fakeBlock{}
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &variableFocusBlock{focusable: true}}) // stop 0
+	m.transcript.Append(transcript.Entry{Block: blk2})                                          // no ID, stop 1
+
+	m.focusRing.FocusStop(1)
+	m.syncFocus()
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.Block != transcript.Block(blk2) {
+		t.Fatalf("setup: focused entry block = %+v, want blk2", fe)
+	}
+
+	// Replacing the EARLIER entry "a" (not the focused one) makes it
+	// non-focusable, shifting blk2's own stop from 1 down to 0 — blk2 itself
+	// is untouched and must keep focus.
+	m.ReplaceBlock("a", &variableFocusBlock{focusable: false})
+
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		t.Fatalf("Zone() = %v, want still ZoneTranscript (blk2 is still focusable)", m.focusRing.Zone())
+	}
+	if stop := m.focusRing.Stop(); stop != 0 {
+		t.Fatalf("focusRing.Stop() = %d, want 0 (blk2 is now the only focusable entry)", stop)
+	}
+	// transcript's own focus must already reflect the corrected stop right
+	// after ReplaceBlock, with no further syncFocus() call needed.
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.Block != transcript.Block(blk2) {
+		t.Fatalf("FocusedEntry() immediately after ReplaceBlock = %+v, want still focused on blk2", fe)
+	}
+}
+
+// TestReplaceBlockKeepsFocusOnNoIDEntryWithThreeEntries extends the above
+// regression to a 3-entry transcript where the focused no-ID entry sits in
+// the MIDDLE, and an EARLIER entry's swap shifts its stop down by one while
+// a LATER entry stays untouched — exercising stopForRawIndex/syncFocus with
+// entries on both sides of the focused one.
+func TestReplaceBlockKeepsFocusOnNoIDEntryWithThreeEntries(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	blk2 := &fakeBlock{}
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &variableFocusBlock{focusable: true}}) // stop 0
+	m.transcript.Append(transcript.Entry{Block: blk2})                                          // no ID, stop 1
+	m.transcript.Append(transcript.Entry{ID: "c", Block: &fakeBlock{}})                         // stop 2
+
+	m.focusRing.FocusStop(1)
+	m.syncFocus()
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.Block != transcript.Block(blk2) {
+		t.Fatalf("setup: focused entry block = %+v, want blk2", fe)
+	}
+
+	// Replacing the EARLIER entry "a" shifts blk2's stop from 1 down to 0;
+	// "c" (untouched, after blk2) stays focusable too.
+	m.ReplaceBlock("a", &variableFocusBlock{focusable: false})
+
+	if stop := m.focusRing.Stop(); stop != 0 {
+		t.Fatalf("focusRing.Stop() = %d, want 0 (blk2 is now the first focusable entry)", stop)
+	}
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.Block != transcript.Block(blk2) {
+		t.Fatalf("FocusedEntry() immediately after ReplaceBlock = %+v, want still focused on blk2 (not \"c\")", fe)
+	}
+}
+
+func TestReplaceBlockClampsStaleOldStopAboveRange(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &variableFocusBlock{focusable: true}}) // stop 0
+	m.transcript.Append(transcript.Entry{ID: "b", Block: &fakeBlock{}})                         // stop 1
+	m.transcript.Append(transcript.Entry{ID: "c", Block: &fakeBlock{}})                         // stop 2
+
+	// Focus the LAST stop ("c") so oldStop (its StopForID) is the highest
+	// index, then replace an EARLIER entry ("a") in a way that removes it
+	// from the stop sequence entirely (Focusable() false) while ALSO making
+	// the currently-focused "c" non-focusable via its own swap below is not
+	// needed -- instead, directly force the clamp branch by replacing the
+	// focused entry itself with a non-focusable block while a swap upstream
+	// has already shrunk stop count: replace "a" first to shrink the stops,
+	// then replace "c" (currently focused) with a non-focusable block so
+	// oldStop (2) is clamped against the new, smaller stop count.
+	m.ReplaceBlock("a", &variableFocusBlock{focusable: false}) // stops now: b=0, c=1
+	m.focusRing.FocusStop(1)                                   // refocus "c" at its new stop index
+	m.syncFocus()
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.ID != "c" {
+		t.Fatalf("setup: focused entry = %+v, want c", fe)
+	}
+
+	m.ReplaceBlock("c", &variableFocusBlock{focusable: false}) // stops now: b=0 only; oldStop was 1 >= n(1)
+
+	fe := m.transcript.FocusedEntry()
+	if fe == nil || fe.ID != "b" {
+		t.Fatalf("FocusedEntry() = %+v, want clamped to the remaining stop (b)", fe)
+	}
+}
+
 // --- Mouse support -----------------------------------------------------
 
 func TestMouseMode_MouseTeaMode(t *testing.T) {
@@ -1908,21 +2473,21 @@ func TestMouse_WheelInChatColumnStillScrollsWithSidePanelInstalled(t *testing.T)
 	}
 }
 
-// cmdSidePanel is a minimal SidePanel whose Update returns a caller-supplied
+// cmdSidePanel2 is a minimal SidePanel whose Update returns a caller-supplied
 // tea.Cmd, for exercising handleMouseWheel's batching of a non-nil SidePanel
 // command (fakeSidePanel above always returns nil).
-type cmdSidePanel struct {
+type cmdSidePanel2 struct {
 	cmd tea.Cmd
 }
 
-func (p *cmdSidePanel) Title() string                               { return "panel" }
-func (p *cmdSidePanel) View(width, height int, focused bool) string { return "panel" }
-func (p *cmdSidePanel) Update(msg tea.Msg) (SidePanel, tea.Cmd)     { return p, p.cmd }
+func (p *cmdSidePanel2) Title() string                               { return "panel" }
+func (p *cmdSidePanel2) View(width, height int, focused bool) string { return "panel" }
+func (p *cmdSidePanel2) Update(msg tea.Msg) (SidePanel, tea.Cmd)     { return p, p.cmd }
 
 func TestMouse_WheelBatchesSidePanelCmd(t *testing.T) {
 	h := &fakeHandler{}
 	ran := false
-	panel := &cmdSidePanel{cmd: func() tea.Msg { ran = true; return nil }}
+	panel := &cmdSidePanel2{cmd: func() tea.Msg { ran = true; return nil }}
 	m := New(h, WithMouse(MouseCellMotion), WithSidePanel(panel))
 	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
 

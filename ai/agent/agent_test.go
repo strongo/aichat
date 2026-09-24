@@ -614,6 +614,240 @@ func TestLoop_InvalidJSONArgumentsBecomeIsErrorWithoutCallingHandler(t *testing.
 // TestLoop_ValueSafeCopyableAndReusable is M9's regression test: a Loop
 // value (no pointer) must be safely copyable and independently reusable —
 // it holds no run-scoped mutable state of its own.
+// plainErrorProvider yields a plain (non-*ai.Error) Go error, unlike
+// fakeProvider which always wraps ev.Error (*ai.Error). Covers run()'s
+// errors.As fallback: a non-*ai.Error from Provider.Stream must be wrapped as
+// ai.Error{Code: ai.ErrCodeUpstream} before becoming the fatal error.
+type plainErrorProvider struct{}
+
+func (plainErrorProvider) Name() string { return "plain" }
+
+func (plainErrorProvider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, error] {
+	return func(yield func(ai.Event, error) bool) {
+		if !yield(ai.Event{Type: ai.EventStarted}, nil) {
+			return
+		}
+		yield(ai.Event{Type: ai.EventError}, errors.New("boom: plain transport failure"))
+	}
+}
+
+func TestLoop_NonAIErrorFromProviderWrappedAsUpstream(t *testing.T) {
+	loop := &Loop{Provider: plainErrorProvider{}}
+	_, err := drain(t, loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) {
+		t.Fatalf("err = %v, want *ai.Error", err)
+	}
+	if aiErr.Code != ai.ErrCodeUpstream {
+		t.Errorf("Code = %q, want %q", aiErr.Code, ai.ErrCodeUpstream)
+	}
+	if !strings.Contains(aiErr.Message, "boom: plain transport failure") {
+		t.Errorf("Message = %q, want it to mention the underlying plain error", aiErr.Message)
+	}
+}
+
+// TestLoop_ConsumerStopsIterationAtEachEventType covers every "if !yield(ev,
+// nil) { return }" branch inside run()'s per-event switch: a consumer that
+// stops draining (via `break` in a range-over-func loop, which the Go
+// runtime turns into the iterator's yield returning false) must cause run()
+// to return immediately at that exact point, regardless of which event type
+// it was in the middle of yielding.
+func TestLoop_ConsumerStopsIterationAtEachEventType(t *testing.T) {
+	cases := []struct {
+		name     string
+		step     []ai.Event
+		stopType ai.EventType
+	}{
+		{"Started", []ai.Event{{Type: ai.EventStarted}}, ai.EventStarted},
+		{"TextDelta", []ai.Event{{Type: ai.EventStarted}, {Type: ai.EventTextDelta, Text: "x"}}, ai.EventTextDelta},
+		{"ToolCall", []ai.Event{{Type: ai.EventStarted}, {Type: ai.EventToolCall, ToolCall: &ai.ToolCall{ID: "call_1", Name: "noop"}}}, ai.EventToolCall},
+		{"Usage", []ai.Event{{Type: ai.EventStarted}, {Type: ai.EventUsage, Usage: &ai.Usage{InputTokens: 1}}}, ai.EventUsage},
+		// Error not in the last position -> fakeProvider treats it as
+		// non-fatal (yields it with a nil Go error), matching run()'s
+		// EventError case (fatal ones arrive via the iterator's err return
+		// instead, handled by a separate branch). Stop AT the Error event
+		// itself, not the trailing Completed, to hit its own "if !yield {
+		// return }" branch.
+		{"NonFatalError", []ai.Event{{Type: ai.EventStarted}, {Type: ai.EventError, Error: &ai.Error{Code: ai.ErrCodeUpstream, Message: "diag"}}, {Type: ai.EventCompleted}}, ai.EventError},
+		// EventStructured has no explicit case in run()'s switch -> default.
+		{"DefaultUnknownType", []ai.Event{{Type: ai.EventStarted}, {Type: ai.EventStructured, Structured: json.RawMessage(`{}`)}}, ai.EventStructured},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &fakeProvider{steps: [][]ai.Event{tc.step}}
+			loop := &Loop{Provider: provider}
+			var got []ai.Event
+			for ev, _ := range loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+				got = append(got, ev)
+				if ev.Type == tc.stopType {
+					break
+				}
+			}
+			if len(got) == 0 || got[len(got)-1].Type != tc.stopType {
+				t.Fatalf("got = %+v, want the last event to be %v", got, tc.stopType)
+			}
+		})
+	}
+}
+
+// TestLoop_ConsumerStopsAtFirstToolResultEvent covers the regular (non-abort)
+// "if !yield(ai.Event{Type: EventToolResult...}) { return }" branch: a
+// consumer stopping right at the first successful tool result must halt the
+// run before the loop ever takes a second step.
+func TestLoop_ConsumerStopsAtFirstToolResultEvent(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{
+		toolCallStep("", ai.ToolCall{ID: "call_1", Name: "noop"}),
+		toolCallStep("unreachable"),
+	}}
+	loop := &Loop{
+		Provider: provider,
+		Handlers: map[string]Handler{
+			"noop": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				return ai.ToolResult{CallID: call.ID}, nil
+			},
+		},
+	}
+	var sawToolResult bool
+	for ev := range loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}) {
+		if ev.Type == ai.EventToolResult {
+			sawToolResult = true
+			break
+		}
+	}
+	if !sawToolResult {
+		t.Fatal("expected to observe a ToolResult event before stopping")
+	}
+	if provider.calls != 1 {
+		t.Errorf("provider.calls = %d, want 1: stopping mid-step must not take a second step", provider.calls)
+	}
+}
+
+// TestLoop_YieldFalseDuringUnansweredSynthesisStopsRun covers the "for _,
+// unanswered := range stepCalls[i:] { ...; if !yield(...) { return } }"
+// branch specifically: a consumer that stops on the SECOND ToolResult event
+// (the first synthesized IsError result for a call that never ran, once
+// MaxToolCalls is exceeded) must halt mid-synthesis, before every remaining
+// call gets its own synthesized result.
+func TestLoop_YieldFalseDuringUnansweredSynthesisStopsRun(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{
+		toolCallStep("",
+			ai.ToolCall{ID: "call_1", Name: "noop"},
+			ai.ToolCall{ID: "call_2", Name: "noop"},
+			ai.ToolCall{ID: "call_3", Name: "noop"},
+		),
+	}}
+	loop := &Loop{
+		Provider:     provider,
+		MaxToolCalls: 1,
+		Handlers: map[string]Handler{
+			"noop": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				return ai.ToolResult{CallID: call.ID}, nil
+			},
+		},
+	}
+	var toolResults int
+	for ev := range loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}) {
+		if ev.Type == ai.EventToolResult {
+			toolResults++
+			if toolResults == 2 {
+				break
+			}
+		}
+	}
+	if toolResults != 2 {
+		t.Fatalf("toolResults = %d, want 2 (stopped mid-synthesis, after the 2nd)", toolResults)
+	}
+}
+
+// TestLoop_CtxCanceledMidParallelCallsAbortsLaterCallBeforeExecute covers the
+// "case ctx.Err() != nil: abortErr = ..." branch reached BEFORE calling
+// execute for a later call in the SAME step, when an earlier call in that
+// step canceled the context. Unlike
+// TestLoop_ContextCancelYieldsCanceledFatalPair (a single call), this needs
+// at least two calls in one step so the second call's abort check observes
+// the cancellation the first call's Handler already performed.
+func TestLoop_CtxCanceledMidParallelCallsAbortsLaterCallBeforeExecute(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{
+		toolCallStep("", ai.ToolCall{ID: "call_1", Name: "cancel_ctx"}, ai.ToolCall{ID: "call_2", Name: "noop"}),
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	var noopCalled bool
+	loop := &Loop{
+		Provider: provider,
+		Handlers: map[string]Handler{
+			"cancel_ctx": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				cancel()
+				return ai.ToolResult{CallID: call.ID}, nil
+			},
+			"noop": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				noopCalled = true
+				return ai.ToolResult{CallID: call.ID}, nil
+			},
+		},
+	}
+	_, err := drain(t, loop.Run(ctx, ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeCanceled {
+		t.Fatalf("err = %v, want ai.Error{Code: ErrCodeCanceled}", err)
+	}
+	if noopCalled {
+		t.Error("call_2's Handler must never run: ctx was already canceled before its abort check, ahead of execute()")
+	}
+}
+
+// TestLoop_ExecuteFillsEmptyResultCallID covers execute()'s "if res.CallID ==
+// \"\" { res.CallID = call.ID }" branch: a Handler that forgets to set
+// ToolResult.CallID must have it filled in from the call automatically.
+func TestLoop_ExecuteFillsEmptyResultCallID(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{
+		toolCallStep("", ai.ToolCall{ID: "call_1", Name: "noop"}),
+		toolCallStep("done"),
+	}}
+	loop := &Loop{
+		Provider: provider,
+		Handlers: map[string]Handler{
+			"noop": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				return ai.ToolResult{Content: "ok"}, nil // CallID deliberately left empty
+			},
+		},
+	}
+	events, err := drain(t, loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var found bool
+	for _, ev := range events {
+		if ev.Type == ai.EventToolResult && ev.ToolResult != nil {
+			found = true
+			if ev.ToolResult.CallID != "call_1" {
+				t.Errorf("CallID = %q, want call_1 filled in from the call", ev.ToolResult.CallID)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no tool result event observed")
+	}
+}
+
+// TestLoop_EmptyStopReasonDefaultsToEnd covers "if finalStop == \"\" {
+// finalStop = ai.StopReasonEnd }": a final step whose EventCompleted left
+// StopReason empty must still surface StopReasonEnd on the run's own final
+// EventCompleted.
+func TestLoop_EmptyStopReasonDefaultsToEnd(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{
+		{{Type: ai.EventStarted}, {Type: ai.EventCompleted}}, // StopReason left empty
+	}}
+	loop := &Loop{Provider: provider}
+	events, err := drain(t, loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	last := events[len(events)-1]
+	if last.Type != ai.EventCompleted || last.StopReason != ai.StopReasonEnd {
+		t.Errorf("last = %+v, want StopReason defaulted to ai.StopReasonEnd", last)
+	}
+}
+
 func TestLoop_ValueSafeCopyableAndReusable(t *testing.T) {
 	// Each copy gets its OWN fakeProvider (the fake itself is not
 	// concurrency-safe, unlike Loop) so this isolates Loop's own

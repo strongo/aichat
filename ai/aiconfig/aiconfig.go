@@ -250,6 +250,24 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 	if cloudBaseURL == "" {
 		cloudBaseURL = deps.CloudBaseURL
 	}
+	// buildCloudClient constructs (and caches) the cloud.Client
+	// unconditionally: it never fails, because its ONLY caller
+	// (newCloudClient, below) invokes it after already having validated
+	// haveCloudToken/cloudBaseURL itself. Keeping construction error-free
+	// lets a caller that has independently proven those preconditions true
+	// (the "auto" case below) call it directly instead of having to check
+	// (and discard) an error that can't occur on that path.
+	buildCloudClient := func() *cloud.Client {
+		if cloudClient == nil {
+			cloudClient = cloud.New(cloud.Config{
+				BaseURL:    cloudBaseURL,
+				Product:    deps.Product,
+				Token:      deps.CloudToken,
+				HTTPClient: deps.HTTPClient,
+			})
+		}
+		return cloudClient
+	}
 	newCloudClient := func() (*cloud.Client, error) {
 		if cloudClient != nil {
 			return cloudClient, nil
@@ -260,13 +278,7 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 		if cloudBaseURL == "" {
 			return nil, fmt.Errorf("aiconfig: cloud provider requested but no base URL (set Config.Cloud.BaseURL or Deps.CloudBaseURL)")
 		}
-		cloudClient = cloud.New(cloud.Config{
-			BaseURL:    cloudBaseURL,
-			Product:    deps.Product,
-			Token:      deps.CloudToken,
-			HTTPClient: deps.HTTPClient,
-		})
-		return cloudClient, nil
+		return buildCloudClient(), nil
 	}
 
 	switch cfg.LLM.Provider {
@@ -302,11 +314,10 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 	case haveCloudToken && cloudBaseURL != "":
 		// "auto" (or "", which fillDefaults already turned into "auto"):
 		// best-effort -- wire cloud decision in only when we plainly can.
-		c, err := newCloudClient()
-		if err != nil {
-			return Providers{}, err
-		}
-		out.Decision = append(out.Decision, c.Decider())
+		// Both of newCloudClient's failure preconditions are already false
+		// here, so call the never-fails constructor directly instead of
+		// checking (and discarding) an error that can't occur on this path.
+		out.Decision = append(out.Decision, buildCloudClient().Decider())
 	}
 
 	return out, nil

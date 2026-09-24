@@ -228,16 +228,20 @@ func thinkingModeAdaptive(model string) bool {
 	family := m[1]
 	major, _ := strconv.Atoi(m[2])
 	minor, _ := strconv.Atoi(m[3]) // "" -> 0, fine: no model has a bare "-4" version
-	switch family {
-	case "haiku":
+	// family is always exactly one of the regex's own alternation branches
+	// (opus|sonnet|haiku|fable) whenever m != nil, so an if/else chain here
+	// (rather than a switch with an unreachable "default") lets the final
+	// `return true` stand for "family == fable" by elimination, instead of
+	// being untestable dead code (simplified per coverage review) -- the
+	// "unrecognised model" default (true) is handled entirely by the m==nil
+	// check above.
+	if family == "haiku" {
 		return false
-	case "fable":
-		return true
-	case "opus", "sonnet":
-		return major > 4 || (major == 4 && minor >= 6)
-	default:
-		return true
 	}
+	if family == "opus" || family == "sonnet" {
+		return major > 4 || (major == 4 && minor >= 6)
+	}
+	return true // family == "fable"
 }
 
 // anthropicToolChoice maps ai.ChatRequest.ToolChoice to the Messages API
@@ -376,13 +380,17 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 				// own MaxTokens: disable thinking rather than raise it.
 			case req.MaxTokens > 0:
 				// Caller set MaxTokens: shrink the budget (never MaxTokens)
-				// to fit under it, floored at 1024.
+				// to fit under it. This case is only reached when the
+				// req.MaxTokens<2048 case above did NOT match, so
+				// req.MaxTokens is always >= 2048 here -- b's floor
+				// (req.MaxTokens-1024) is therefore always >= 1024 on its
+				// own; no separate runtime clamp is reachable or needed
+				// (coverage review: the old "if b < 1024 { b = 1024 }"
+				// could never fire given that invariant, so it was removed
+				// rather than left as untestable dead code).
 				b := budget
 				if b >= req.MaxTokens {
 					b = req.MaxTokens - 1024
-					if b < 1024 {
-						b = 1024
-					}
 				}
 				body.Thinking = &thinkingConfig{Type: "enabled", BudgetTokens: b}
 			default:

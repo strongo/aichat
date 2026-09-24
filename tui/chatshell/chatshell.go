@@ -614,6 +614,35 @@ func (m *Model) SidebarRefs() []session.EntityRef {
 // flight.
 func (m *Model) Busy() bool { return m.busy }
 
+// entryFocusable mirrors transcript.Entry's own (unexported) focusability
+// rule: a Block entry defers to its Block.Focusable(), a plain-text entry is
+// focusable only when it's a user message. ReplaceBlock needs this because
+// it tracks the focused entry by RAW POSITION rather than by ID (see
+// stopForRawIndex): transcript.StopForID/FocusedEntry alone cannot be
+// trusted for that purpose across a ReplaceBlock call — see below.
+func entryFocusable(e transcript.Entry) bool {
+	if e.Block != nil {
+		return e.Block.Focusable()
+	}
+	return e.Role == transcript.RoleUser
+}
+
+// stopForRawIndex returns the stop number entries[idx] occupies (a count of
+// focusable entries up to and including idx), or -1 when idx is out of range
+// or entries[idx] isn't itself focusable.
+func stopForRawIndex(entries []transcript.Entry, idx int) int {
+	if idx < 0 || idx >= len(entries) || !entryFocusable(entries[idx]) {
+		return -1
+	}
+	stop := -1
+	for i := 0; i <= idx; i++ {
+		if entryFocusable(entries[i]) {
+			stop++
+		}
+	}
+	return stop
+}
+
 // ReplaceBlock refreshes/re-runs a grid (or any other transcript.Block) in
 // place: the entry identified by entryID keeps its position and ID, but
 // renders b from now on. If that entry currently holds transcript focus, it
@@ -621,18 +650,38 @@ func (m *Model) Busy() bool { return m.busy }
 // pointing at whatever raw index it used to occupy — necessary because
 // replacing a Block can change its own Focusable() answer).
 //
+// The previously-focused entry is tracked by its RAW POSITION in
+// m.transcript.Entries(), not by transcript.StopForID(fe.ID): that ID-keyed
+// lookup always reports -1 for an entry with an empty ID (which
+// AppendUser/AppendAssistant/plain AppendBlock all leave empty — only
+// AppendBlockWithID sets one), and transcript.ReplaceBlock's own internal
+// focus cursor likewise only re-resolves itself by ID when the focused entry
+// has one. So a no-ID focused entry would otherwise silently look unfocused
+// (or land on the wrong stop) the moment an EARLIER entry's swap shifts stop
+// numbers — even though that entry's own Block never changed. Raw position
+// is safe to track across the call because transcript.ReplaceBlock only
+// mutates one entry's Block in place; it never reorders, inserts or removes
+// entries.
+//
 // m.focusRing (chatshell's own zone/stop tracker) is resynced to whatever
-// transcript.ReplaceBlock decided too: syncFocus later reapplies
-// focusRing.Stop() into the transcript on the next zone change or resize, so
-// leaving it stale would silently undo transcript's own recomputed focus the
-// next time that happens.
+// was decided too: syncFocus later reapplies focusRing.Stop() into the
+// transcript on the next zone change or resize, so leaving it stale would
+// silently undo the recomputed focus the next time that happens.
 func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
 	var hadFocus bool
 	var oldStop int
+	focusedRawIdx := -1
 	if m.focusRing.Zone() == focus.ZoneTranscript {
 		if fe := m.transcript.FocusedEntry(); fe != nil {
 			hadFocus = true
-			oldStop = m.transcript.StopForID(fe.ID)
+			entries := m.transcript.Entries()
+			for i := range entries {
+				if &entries[i] == fe {
+					focusedRawIdx = i
+					break
+				}
+			}
+			oldStop = stopForRawIndex(entries, focusedRawIdx)
 		}
 	}
 
@@ -641,9 +690,25 @@ func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
 	if m.focusRing.Zone() != focus.ZoneTranscript {
 		return
 	}
-	if fe := m.transcript.FocusedEntry(); fe != nil {
-		// Same entry (or a different one whose stop shifted) is still
-		// focusable: resync focusRing's own stop, per m5.
+	if hadFocus {
+		// Re-derive the stop directly from the tracked raw position, rather
+		// than trusting transcript.FocusedEntry()/StopForID after the swap
+		// (see the no-ID staleness note above).
+		if stop := stopForRawIndex(m.transcript.Entries(), focusedRawIdx); stop >= 0 {
+			m.focusRing.FocusStop(stop)
+			// transcript's own focus index only re-resolves itself by ID,
+			// which is a no-op for a no-ID entry (see above): push the
+			// recomputed stop into it explicitly, or the highlight stays
+			// wherever transcript.ReplaceBlock left it (lost, or on the
+			// wrong Block) until some unrelated zone change/resize incidentally
+			// calls syncFocus next.
+			m.syncFocus()
+			return
+		}
+	} else if fe := m.transcript.FocusedEntry(); fe != nil {
+		// No entry was focused before the swap, but one now resolves at
+		// chatshell's unchanged focusRing.Stop() (e.g. a stop that pointed
+		// past the end now lands on a newly-focusable entry): resync to it.
 		if stop := m.transcript.StopForID(fe.ID); stop >= 0 {
 			m.focusRing.FocusStop(stop)
 		}
@@ -657,14 +722,13 @@ func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
 	// from under it). Move to the NEAREST remaining focusable stop --
 	// oldStop clamped into range, since the entries around a removed stop
 	// slide down to fill it -- or hand off to the composer if the
-	// transcript has no focusable entry left at all.
+	// transcript has no focusable entry left at all. oldStop is never
+	// negative here: it's stopForRawIndex of the entry FocusedEntry() just
+	// reported focused, so only the upper clamp is reachable.
 	if n := m.transcript.Stops(); n > 0 {
 		newStop := oldStop
 		if newStop >= n {
 			newStop = n - 1
-		}
-		if newStop < 0 {
-			newStop = 0
 		}
 		m.focusRing.FocusStop(newStop)
 	} else {

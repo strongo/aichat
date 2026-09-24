@@ -304,6 +304,88 @@ func TestReadEvents_TransportErrorIsFatalPair(t *testing.T) {
 	}
 }
 
+// failWriter returns an error on every Write, simulating a broken
+// connection while writing an SSE frame.
+type failWriter struct{ err error }
+
+func (w failWriter) Write(p []byte) (int, error) { return 0, w.err }
+
+func TestWriteEvent_WriteError(t *testing.T) {
+	wantErr := errors.New("broken pipe")
+	err := WriteEvent(failWriter{err: wantErr}, ai.Event{Type: ai.EventStarted})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+}
+
+func TestWriteEvent_MarshalError(t *testing.T) {
+	// json.Marshal validates a json.RawMessage field's bytes as JSON; an
+	// invalid payload makes Marshal itself fail before any Write happens.
+	ev := ai.Event{Type: ai.EventStructured, Structured: json.RawMessage("not json")}
+	var buf bytes.Buffer
+	err := WriteEvent(&buf, ev)
+	if err == nil {
+		t.Fatal("expected a marshal error for an invalid Structured payload")
+	}
+}
+
+func TestReadEvents_ErrorEventWithNoDetail(t *testing.T) {
+	raw := "event: error\ndata: {\"type\":\"error\"}\n\n"
+	var got []ai.Event
+	var lastErr error
+	for ev, err := range ReadEvents(strings.NewReader(raw)) {
+		got = append(got, ev)
+		lastErr = err
+	}
+	if lastErr == nil {
+		t.Fatal("expected a fatal error")
+	}
+	last := got[len(got)-1]
+	if last.Error == nil || last.Error.Message != "cloudproto: error event with no detail" {
+		t.Fatalf("last = %+v, want a synthesized detail message", last)
+	}
+}
+
+func TestReadEvents_FinalFlushWithoutTrailingBlankLine(t *testing.T) {
+	// No trailing blank line after the last frame's data: line -- the
+	// scanner's loop ends with pending data still in the buffer, and
+	// ReadEvents must flush it (as the fatal "no response.completed"
+	// truncation here, since the frame is a text.delta, not completed).
+	raw := "event: text.delta\ndata: {\"type\":\"text.delta\",\"text\":\"hi\"}"
+	var got []ai.Event
+	var lastErr error
+	for ev, err := range ReadEvents(strings.NewReader(raw)) {
+		got = append(got, ev)
+		lastErr = err
+	}
+	if lastErr == nil {
+		t.Fatal("expected a fatal truncation error")
+	}
+	if len(got) != 2 || got[0].Type != ai.EventTextDelta || got[1].Type != ai.EventError {
+		t.Fatalf("got = %+v", got)
+	}
+}
+
+func TestReadEvents_FinalFlushYieldsErrorEventDirectly(t *testing.T) {
+	// The final flush() itself can be the fatal error-event case (no
+	// trailing blank line after an "event: error" frame): flush()'s own
+	// `return true` path at EOF, exercised via the outer `if flush() {
+	// return }` after the scan loop ends.
+	raw := "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"upstream\",\"message\":\"boom\"}}"
+	var got []ai.Event
+	var lastErr error
+	for ev, err := range ReadEvents(strings.NewReader(raw)) {
+		got = append(got, ev)
+		lastErr = err
+	}
+	if lastErr == nil {
+		t.Fatal("expected a fatal error")
+	}
+	if len(got) != 1 || got[0].Type != ai.EventError || got[0].Error.Message != "boom" {
+		t.Fatalf("got = %+v", got)
+	}
+}
+
 func TestErrorResponse_JSON(t *testing.T) {
 	er := ErrorResponse{Error: ai.Error{Code: ai.ErrCodeAuth, Message: "bad key"}}
 	b, err := json.Marshal(er)

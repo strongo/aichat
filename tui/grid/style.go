@@ -87,6 +87,13 @@ func padAnsiLine(line string, width int) string {
 	return line + strings.Repeat(" ", max(0, width-lipgloss.Width(line)))
 }
 
+// ansiTruncate is borderLine's seam over ansi.Truncate. ansi.Truncate's own
+// guarantee (the result never renders wider than the requested width) makes
+// the "still doesn't fit" defensive branch below unreachable through any
+// real text this package can construct — see TestBorderLineLabelStillTooWide,
+// which swaps this var out to drive that branch directly.
+var ansiTruncate = ansi.Truncate
+
 // borderLine draws a horizontal card border with a centered label. Ported
 // from DataTug's ui.go.
 func borderLine(left, text, right string, width int) string {
@@ -100,7 +107,7 @@ func borderLine(left, text, right string, width int) string {
 	if available < 3 {
 		return left + strings.Repeat("─", available) + right
 	}
-	label := " " + ansi.Truncate(text, available-2, "…") + " "
+	label := " " + ansiTruncate(text, available-2, "…") + " "
 	if lipgloss.Width(label) > available {
 		return left + strings.Repeat("─", available) + right
 	}

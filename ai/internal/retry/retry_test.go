@@ -3,6 +3,7 @@ package retry
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -125,5 +126,119 @@ func TestJittered_BoundedAndNonNegative(t *testing.T) {
 	}
 	if jittered(100*time.Millisecond, 0) != 100*time.Millisecond {
 		t.Fatal("zero jitter must return d unchanged")
+	}
+}
+
+func TestJittered_NegativeOffsetClampedToZero(t *testing.T) {
+	// With a base d tiny relative to the jitter fraction, roughly half of
+	// draws produce a negative raw offset; jittered must clamp those to 0
+	// rather than returning a negative duration. Loop until we observe the
+	// clamp (P(missing it 50 times running) is astronomically small) rather
+	// than relying on a single random draw.
+	sawZero := false
+	for i := 0; i < 200; i++ {
+		if jittered(time.Millisecond, 1000) == 0 {
+			sawZero = true
+			break
+		}
+	}
+	if !sawZero {
+		t.Fatal("expected at least one clamped-to-zero result across 200 draws")
+	}
+}
+
+// failIfSlept installs a waitOnRetryAfterSleep that fails the test if it is
+// ever called, and returns a func to restore the original -- used by the
+// Noop tests below to prove they take the early-return path without
+// touching the sleep seam at all (rather than merely not panicking, which a
+// real-but-fast sleep would also satisfy).
+func failIfSlept(t *testing.T) func() {
+	t.Helper()
+	orig := waitOnRetryAfterSleep
+	waitOnRetryAfterSleep = func(time.Duration) <-chan time.Time {
+		t.Fatal("waitOnRetryAfterSleep must not be called on the noop path")
+		return nil
+	}
+	return func() { waitOnRetryAfterSleep = orig }
+}
+
+func TestWaitOnRetryAfter_EmptyHeaderNoop(t *testing.T) {
+	defer failIfSlept(t)()
+	WaitOnRetryAfter(context.Background(), "") // must return immediately, no panic
+}
+
+func TestWaitOnRetryAfter_UnparseableHeaderNoop(t *testing.T) {
+	defer failIfSlept(t)()
+	WaitOnRetryAfter(context.Background(), "not-a-duration-or-date")
+}
+
+func TestWaitOnRetryAfter_NonPositiveSecondsNoop(t *testing.T) {
+	defer failIfSlept(t)()
+	WaitOnRetryAfter(context.Background(), "0")
+	WaitOnRetryAfter(context.Background(), "-5")
+}
+
+func TestWaitOnRetryAfter_PastHTTPDateNoop(t *testing.T) {
+	defer failIfSlept(t)()
+	past := time.Now().Add(-1 * time.Hour).UTC().Format(http.TimeFormat)
+	WaitOnRetryAfter(context.Background(), past)
+}
+
+func TestWaitOnRetryAfter_CtxAlreadyDoneReturnsImmediately(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	WaitOnRetryAfter(ctx, "30") // would sleep 30s if ctx.Done() weren't honoured
+	if time.Since(start) > time.Second {
+		t.Fatalf("took %v, want near-instant return via ctx.Done()", time.Since(start))
+	}
+}
+
+func TestWaitOnRetryAfter_SecondsHeaderSleepsViaSeam(t *testing.T) {
+	orig := waitOnRetryAfterSleep
+	defer func() { waitOnRetryAfterSleep = orig }()
+	ch := make(chan time.Time, 1)
+	ch <- time.Now()
+	var gotDelay time.Duration
+	waitOnRetryAfterSleep = func(d time.Duration) <-chan time.Time {
+		gotDelay = d
+		return ch
+	}
+	WaitOnRetryAfter(context.Background(), "5")
+	if gotDelay != 5*time.Second {
+		t.Errorf("delay = %v, want 5s", gotDelay)
+	}
+}
+
+func TestWaitOnRetryAfter_HTTPDateHeaderSleepsViaSeam(t *testing.T) {
+	orig := waitOnRetryAfterSleep
+	defer func() { waitOnRetryAfterSleep = orig }()
+	ch := make(chan time.Time, 1)
+	ch <- time.Now()
+	var gotDelay time.Duration
+	waitOnRetryAfterSleep = func(d time.Duration) <-chan time.Time {
+		gotDelay = d
+		return ch
+	}
+	future := time.Now().Add(3 * time.Second).UTC().Format(http.TimeFormat)
+	WaitOnRetryAfter(context.Background(), future)
+	if gotDelay <= 0 || gotDelay > 4*time.Second {
+		t.Errorf("delay = %v, want roughly 3s", gotDelay)
+	}
+}
+
+func TestWaitOnRetryAfter_CappedAtMaxWait(t *testing.T) {
+	orig := waitOnRetryAfterSleep
+	defer func() { waitOnRetryAfterSleep = orig }()
+	ch := make(chan time.Time, 1)
+	ch <- time.Now()
+	var gotDelay time.Duration
+	waitOnRetryAfterSleep = func(d time.Duration) <-chan time.Time {
+		gotDelay = d
+		return ch
+	}
+	WaitOnRetryAfter(context.Background(), "3600") // 1 hour, way over the 30s cap
+	if gotDelay != 30*time.Second {
+		t.Errorf("delay = %v, want capped at 30s", gotDelay)
 	}
 }

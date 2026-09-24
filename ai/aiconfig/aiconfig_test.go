@@ -66,6 +66,7 @@ func TestApplyEnv_NoPrefix(t *testing.T) {
 	cfg := defaults()
 	env := map[string]string{
 		EnvLLMProvider:   "byok",
+		EnvDecision:      "disabled",
 		EnvBYOKProtocol:  "openai-compatible",
 		EnvBYOKEndpoint:  "https://my-endpoint/v1",
 		EnvBYOKModel:     "gpt-5",
@@ -76,8 +77,64 @@ func TestApplyEnv_NoPrefix(t *testing.T) {
 	if cfg.LLM.Provider != "byok" || cfg.BYOK.Endpoint != "https://my-endpoint/v1" || cfg.BYOK.Model != "gpt-5" {
 		t.Errorf("cfg = %+v", cfg)
 	}
+	if cfg.Decision.Provider != "disabled" {
+		t.Errorf("cfg.Decision.Provider = %q, want disabled (EnvDecision override)", cfg.Decision.Provider)
+	}
 	if cfg.Cloud.BaseURL != "https://cloud.example.com/" {
 		t.Errorf("cfg.Cloud = %+v", cfg.Cloud)
+	}
+}
+
+func TestLoad_UnreadableFileReturnsError(t *testing.T) {
+	// A directory can't be read as a file: os.ReadFile fails with an error
+	// that is NOT os.IsNotExist, exercising Load's other read-error branch
+	// (distinct from the "missing file -> defaults, no error" path).
+	dir := t.TempDir()
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected an error reading a directory as a config file")
+	}
+	if !strings.Contains(err.Error(), "aiconfig: read") {
+		t.Errorf("err = %v, want it wrapped with the aiconfig: read %%s prefix", err)
+	}
+}
+
+func TestLoad_InvalidYAMLReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ai.yaml")
+	if err := os.WriteFile(p, []byte("llm: [this is not a mapping"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("expected a parse error for invalid YAML")
+	}
+	if !strings.Contains(err.Error(), "aiconfig: parse") {
+		t.Errorf("err = %v, want it wrapped with the aiconfig: parse %%s prefix", err)
+	}
+}
+
+// TestLoad_ExplicitEmptyProviderStringsFillDefaults covers fillDefaults'
+// branches specifically as Load exercises them: a config file that
+// EXPLICITLY sets llm.provider/decision.provider to "" (distinct from
+// omitting the keys entirely, which never overwrites Load's initial
+// defaults()) must still end up with the "cloud"/"auto" defaults.
+func TestLoad_ExplicitEmptyProviderStringsFillDefaults(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ai.yaml")
+	yamlDoc := "llm:\n  provider: \"\"\ndecision:\n  provider: \"\"\n"
+	if err := os.WriteFile(p, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LLM.Provider != "cloud" {
+		t.Errorf("LLM.Provider = %q, want cloud (fillDefaults must overwrite an explicit empty string)", cfg.LLM.Provider)
+	}
+	if cfg.Decision.Provider != "auto" {
+		t.Errorf("Decision.Provider = %q, want auto (fillDefaults must overwrite an explicit empty string)", cfg.Decision.Provider)
 	}
 }
 
@@ -351,6 +408,23 @@ func TestBuild_UnknownLLMProviderErrors(t *testing.T) {
 	}
 }
 
+func TestBuild_UnknownProtocolWithoutEndpointErrorsOnEndpointRequired(t *testing.T) {
+	// An unrecognised protocol has no default endpoint (only
+	// openai-compatible/anthropic do); leaving Endpoint empty too must
+	// surface the earlier "byok.endpoint is required" error, distinct from
+	// (and checked before) the later "unknown byok.protocol" error.
+	cfg := defaults()
+	cfg.LLM.Provider = "byok"
+	cfg.BYOK.Protocol = "nope"
+	_, err := Build(cfg, Deps{})
+	if err == nil {
+		t.Fatal("expected error for an unrecognised protocol with no endpoint")
+	}
+	if !strings.Contains(err.Error(), "byok.endpoint is required") {
+		t.Errorf("err = %v, want the byok.endpoint required error", err)
+	}
+}
+
 func TestBuild_UnknownBYOKProtocolErrors(t *testing.T) {
 	cfg := defaults()
 	cfg.LLM.Provider = "byok"
@@ -376,11 +450,41 @@ func TestBuild_UnknownDecisionProviderErrors(t *testing.T) {
 func TestBuild_DecisionProviderCloudWithoutTokenErrors(t *testing.T) {
 	cfg := defaults()
 	cfg.LLM.Provider = "byok"
-	cfg.BYOK.Endpoint = "https://x"
+	// Model is required so the BYOK build itself succeeds -- this test's
+	// error must come from the decision.provider=cloud branch specifically,
+	// not an unrelated earlier BYOK validation failure.
+	cfg.BYOK = BYOK{Endpoint: "https://x", Model: "m"}
 	cfg.Decision.Provider = "cloud" // explicit request, no CloudToken -> must error
 	_, err := Build(cfg, Deps{})
 	if err == nil {
 		t.Fatal("expected error: decision.provider=cloud explicitly requested but no token source")
+	}
+	if !strings.Contains(err.Error(), "decision.provider=cloud") {
+		t.Errorf("err = %v, want it to mention decision.provider=cloud", err)
+	}
+}
+
+// TestBuild_CloudLLMAndExplicitDecisionShareOneClient covers newCloudClient's
+// own cache-hit branch (cloudClient != nil), which TestBuild_CloudLLMAndDecision
+// does not: that test's Decision.Provider is left at "auto", which calls
+// buildCloudClient directly rather than going back through newCloudClient a
+// second time. Requesting cloud LLM AND an EXPLICIT cloud decision provider
+// calls newCloudClient twice in the same Build(): once from the LLM switch
+// (cloudClient is nil, builds it), once from the decision.provider=cloud
+// case (cloudClient is now set, must return the cached one without
+// rebuilding).
+func TestBuild_CloudLLMAndExplicitDecisionShareOneClient(t *testing.T) {
+	cfg := defaults()
+	cfg.Decision.Provider = "cloud"
+	providers, err := Build(cfg, Deps{Product: "sneat", CloudToken: tokenFunc("t"), CloudBaseURL: "https://api.example.com/v0/"})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if providers.LLM == nil || providers.LLM.Name() != "cloud" {
+		t.Fatalf("LLM = %+v, want the cloud LLM provider", providers.LLM)
+	}
+	if len(providers.Decision) != 1 || providers.Decision[0].Name() != "cloud-decision" {
+		t.Fatalf("Decision = %+v, want 1 cloud-decision provider", providers.Decision)
 	}
 }
 

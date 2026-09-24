@@ -30,6 +30,14 @@ type item struct {
 	err   error
 }
 
+// beforeSend, when non-nil, is invoked synchronously by Start's pump
+// goroutine right before each attempt to hand an item to the consumer (i.e.
+// immediately before the `select` guarding `ch <- item{...}`). It exists
+// purely as a test seam so a test can deterministically synchronize with
+// the goroutine at that exact point instead of relying on a sleep; it is
+// nil (a no-op) in production.
+var beforeSend func()
+
 // Start begins draining seq in a goroutine — never buffering the whole
 // response — and returns the tea.Cmd producing the first message. ctx
 // cancellation stops the goroutine promptly and the pump.
@@ -45,6 +53,13 @@ func Start(ctx context.Context, id string, seq iter.Seq2[ai.Event, error]) tea.C
 	go func() {
 		defer close(ch)
 		for ev, err := range seq {
+			if beforeSend != nil {
+				// Test-only seam: lets a test deterministically synchronize
+				// with the pump goroutine immediately before it attempts to
+				// hand an item to the consumer, instead of sleeping. See
+				// stream_test.go.
+				beforeSend()
+			}
 			select {
 			case ch <- item{event: ev, err: err}:
 			case <-ctx.Done():

@@ -125,6 +125,59 @@ func TestStartCancellationYieldsDoneWithCtxErr(t *testing.T) {
 	close(block)
 }
 
+func TestStartCancellationWhileProducerBlockedOnSendStopsProducer(t *testing.T) {
+	// Exercises the pump goroutine's own ctx.Done() case (the one guarding
+	// `ch <- item{...}`), as opposed to next()'s ctx.Done() case. This needs
+	// the goroutine to be caught AT that select, with ctx already cancelled
+	// underneath it, and nobody consuming — otherwise we can't tell whether
+	// it was that select or next()'s that produced the DoneMsg.
+	//
+	// We get that deterministically via the beforeSend test seam (stream.go)
+	// instead of a sleep: beforeSend runs synchronously in the pump
+	// goroutine right before it reaches the select, so blocking there until
+	// the test releases it guarantees the goroutine has not yet attempted
+	// the send when we cancel ctx. Cancelling before release means that by
+	// the time the goroutine's select finally evaluates, ctx.Done() is
+	// already the only ready case (nothing is receiving from ch), so it is
+	// the one deterministically chosen — no race, no timing dependency.
+	reachedSecondSend := make(chan struct{})
+	releaseSecondSend := make(chan struct{})
+	calls := 0
+	orig := beforeSend
+	t.Cleanup(func() { beforeSend = orig })
+	beforeSend = func() {
+		calls++
+		if calls == 2 {
+			close(reachedSecondSend)
+			<-releaseSecondSend
+		}
+	}
+
+	seq := seqOf(
+		ai.Event{Type: ai.EventStarted},
+		ai.Event{Type: ai.EventTextDelta, Text: "second"},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := Start(ctx, "turn-1", seq)
+	msg := cmd() // consumes the first event
+	ev, ok := msg.(EventMsg)
+	if !ok {
+		t.Fatalf("msg = %#v, want EventMsg", msg)
+	}
+
+	<-reachedSecondSend // goroutine is blocked in beforeSend, before its select
+	cancel()            // ctx.Done() closes while nobody can be mid-send
+	close(releaseSecondSend)
+
+	done, ok := ev.Next().(DoneMsg)
+	if !ok {
+		t.Fatalf("msg after cancel = %#v, want DoneMsg", msg)
+	}
+	if !errors.Is(done.Err, context.Canceled) {
+		t.Fatalf("done.Err = %v, want context.Canceled", done.Err)
+	}
+}
+
 func TestNextTimesOutWithoutLeakingWhenNoConsumer(t *testing.T) {
 	// Regression guard: Start must not block forever if nobody ever reads
 	// the returned tea.Cmd (e.g. a test that only cares about compilation).

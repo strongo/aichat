@@ -938,3 +938,394 @@ func TestBuildMessages_EmptyToolCallArgumentsBecomeEmptyObject(t *testing.T) {
 		t.Fatalf("assistant tool call = %+v, want arguments \"{}\"", asst.ToolCalls)
 	}
 }
+
+func TestBuildMessages_ToolResultErrorPrefixed(t *testing.T) {
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{
+				{CallID: "call_1", Content: "boom", IsError: true},
+				{CallID: "call_2", Content: "Error: already prefixed", IsError: true},
+				{CallID: "call_3", Content: "ok", IsError: false},
+			}},
+		},
+	}
+	msgs := buildMessages(req)
+	if len(msgs) != 3 {
+		t.Fatalf("msgs = %+v", msgs)
+	}
+	if msgs[0].Content != "Error: boom" {
+		t.Errorf("msgs[0].Content = %q, want an Error: prefix added", msgs[0].Content)
+	}
+	if msgs[1].Content != "Error: already prefixed" {
+		t.Errorf("msgs[1].Content = %q, want unchanged (already prefixed)", msgs[1].Content)
+	}
+	if msgs[2].Content != "ok" {
+		t.Errorf("msgs[2].Content = %q, want unchanged (not an error)", msgs[2].Content)
+	}
+}
+
+func TestRenderDynamic_NamedBlock(t *testing.T) {
+	got := renderDynamic([]ai.ContextBlock{
+		{Kind: ai.ContextDynamic, Name: "today", Text: "it is Tuesday"},
+	})
+	if !strings.Contains(got, "# today\n") {
+		t.Errorf("renderDynamic = %q, want a heading for the named block", got)
+	}
+}
+
+func TestRenderDynamic_MultipleBlocksSeparated(t *testing.T) {
+	// A second dynamic block must be joined with a blank-line separator
+	// (dyn.Len() > 0 on the second iteration).
+	got := renderDynamic([]ai.ContextBlock{
+		{Kind: ai.ContextDynamic, Text: "first"},
+		{Kind: ai.ContextDynamic, Text: "second"},
+	})
+	if !strings.Contains(got, "first\n\nsecond") {
+		t.Errorf("renderDynamic = %q, want first and second blocks separated by a blank line", got)
+	}
+}
+
+func TestRenderDynamic_Empty(t *testing.T) {
+	if got := renderDynamic(nil); got != "" {
+		t.Errorf("renderDynamic(nil) = %q, want empty", got)
+	}
+	if got := renderDynamic([]ai.ContextBlock{{Kind: ai.ContextStatic, Text: "static only"}}); got != "" {
+		t.Errorf("renderDynamic(static-only) = %q, want empty", got)
+	}
+}
+
+func TestExtractJSON_FencedAndPlain(t *testing.T) {
+	if got := extractJSON("```json\n{\"a\":1}\n```"); got != `{"a":1}` {
+		t.Errorf("extractJSON(fenced json) = %q", got)
+	}
+	if got := extractJSON("```\n{\"a\":1}\n```"); got != `{"a":1}` {
+		t.Errorf("extractJSON(fenced) = %q", got)
+	}
+	if got := extractJSON(`{"a":1}`); got != `{"a":1}` {
+		t.Errorf("extractJSON(plain) = %q", got)
+	}
+}
+
+func TestToolChoiceWire_AllCases(t *testing.T) {
+	if got := toolChoiceWire(""); got != "auto" {
+		t.Errorf("toolChoiceWire(\"\") = %v", got)
+	}
+	if got := toolChoiceWire(ai.ToolChoiceAuto); got != "auto" {
+		t.Errorf("toolChoiceWire(auto) = %v", got)
+	}
+	if got := toolChoiceWire(ai.ToolChoiceNone); got != "none" {
+		t.Errorf("toolChoiceWire(none) = %v", got)
+	}
+	if got := toolChoiceWire(ai.ToolChoiceRequired); got != "required" {
+		t.Errorf("toolChoiceWire(required) = %v", got)
+	}
+	got := toolChoiceWire("my_tool")
+	nt, ok := got.(namedToolChoice)
+	if !ok || nt.Type != "function" || nt.Function.Name != "my_tool" {
+		t.Errorf("toolChoiceWire(named) = %+v", got)
+	}
+}
+
+func TestToAIError_PassesThroughAIErrorWhenNotCanceled(t *testing.T) {
+	src := &ai.Error{Code: ai.ErrCodeUpstream, Message: "boom"}
+	got := toAIError(context.Background(), src)
+	if got != src {
+		t.Errorf("toAIError = %+v, want the original *ai.Error unchanged", got)
+	}
+}
+
+func TestToAIError_AIErrorWithCanceledCtxBecomesCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got := toAIError(ctx, &ai.Error{Code: ai.ErrCodeUpstream, Message: "boom"})
+	if got.Code != ai.ErrCodeCanceled {
+		t.Errorf("Code = %q, want canceled", got.Code)
+	}
+}
+
+func TestToAIError_PlainErrorBecomesRetryableUpstream(t *testing.T) {
+	got := toAIError(context.Background(), errors.New("dial tcp: connection refused"))
+	if got.Code != ai.ErrCodeUpstream || !got.Retryable {
+		t.Errorf("got = %+v, want retryable upstream", got)
+	}
+}
+
+func TestToAIError_ContextErrorsBecomeCanceled(t *testing.T) {
+	if got := toAIError(context.Background(), context.Canceled); got.Code != ai.ErrCodeCanceled {
+		t.Errorf("got = %+v", got)
+	}
+	if got := toAIError(context.Background(), context.DeadlineExceeded); got.Code != ai.ErrCodeCanceled {
+		t.Errorf("got = %+v", got)
+	}
+}
+
+func TestIsUnsupportedReasoningEffortError_FalseCases(t *testing.T) {
+	if isUnsupportedReasoningEffortError(errors.New("plain error")) {
+		t.Error("a plain (non-*ai.Error) error must never match")
+	}
+	if isUnsupportedReasoningEffortError(&ai.Error{Code: ai.ErrCodeUpstream, Message: "reasoning_effort is bad"}) {
+		t.Error("a non-Invalid code must never match, even if the message mentions reasoning_effort")
+	}
+	if isUnsupportedReasoningEffortError(&ai.Error{Code: ai.ErrCodeInvalid, Message: "unrelated field bad"}) {
+		t.Error("an Invalid error that doesn't name reasoning_effort must not match")
+	}
+}
+
+func TestHTTPStatusError_FallbackMessages(t *testing.T) {
+	// Non-JSON body: apiErr.Error.Message stays empty, so msg falls back to
+	// the trimmed raw body.
+	got := httpStatusError(http.StatusInternalServerError, []byte("  plain text error  "))
+	if got.Message != "plain text error" {
+		t.Errorf("Message = %q, want the trimmed raw body", got.Message)
+	}
+	// Empty body and unparseable/empty JSON: falls back to "HTTP <status>".
+	got2 := httpStatusError(http.StatusBadGateway, nil)
+	if got2.Message != "HTTP 502" {
+		t.Errorf("Message = %q, want \"HTTP 502\"", got2.Message)
+	}
+}
+
+func TestDoRequest_InvalidURLFails(t *testing.T) {
+	// A BaseURL containing a raw control character makes
+	// http.NewRequestWithContext's underlying url.Parse fail before any
+	// network I/O happens.
+	p := &Provider{cfg: Config{BaseURL: "http://example.com/\x7f", HTTPClient: http.DefaultClient}}
+	_, err := p.doRequest(context.Background(), []byte(`{}`), true)
+	if err == nil {
+		t.Fatal("expected an error building the request")
+	}
+}
+
+func TestDoRequest_ContextCanceledBeforeResponse(t *testing.T) {
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block // never respond until the test is done
+	}))
+	defer func() { close(block); srv.Close() }()
+	p := &Provider{cfg: Config{BaseURL: srv.URL, HTTPClient: srv.Client()}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := p.doRequest(ctx, []byte(`{}`), true)
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeCanceled {
+		t.Fatalf("err = %v, want ErrCodeCanceled", err)
+	}
+}
+
+func TestDoRequest_ConnectionErrorIsRetryableUpstream(t *testing.T) {
+	// Point at a closed local listener so the HTTP client's Do() fails with
+	// a plain connection error, not context cancellation.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close() // now nothing is listening
+	p := &Provider{cfg: Config{BaseURL: url, HTTPClient: http.DefaultClient}}
+	_, err := p.doRequest(context.Background(), []byte(`{}`), true)
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeUpstream || !aiErr.Retryable {
+		t.Fatalf("err = %v, want a retryable upstream error", err)
+	}
+}
+
+func TestStream_PayloadMarshalErrorIsFatal(t *testing.T) {
+	// json.Marshal validates a json.RawMessage field's bytes; an invalid
+	// ResponseSchema makes marshalling the request body itself fail before
+	// any HTTP call is attempted.
+	p := New(Config{BaseURL: "http://unused.example", Model: "m"})
+	req := ai.ChatRequest{ResponseSchema: json.RawMessage("not json")}
+	var lastEvent ai.Event
+	var lastErr error
+	n := 0
+	for ev, err := range p.Stream(context.Background(), req) {
+		n++
+		lastEvent, lastErr = ev, err
+	}
+	if lastErr == nil {
+		t.Fatal("expected a fatal marshal error")
+	}
+	if n != 1 || lastEvent.Type != ai.EventError {
+		t.Fatalf("n=%d lastEvent=%+v, want exactly one fatal EventError yield", n, lastEvent)
+	}
+	var aiErr *ai.Error
+	if !errors.As(lastErr, &aiErr) || aiErr.Code != ai.ErrCodeInvalid {
+		t.Fatalf("lastErr = %v, want ErrCodeInvalid", lastErr)
+	}
+}
+
+func TestStream_EarlyBreakAfterStartedEvent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[{"delta":{"content":"hi"}}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	n := 0
+	for range p.Stream(context.Background(), ai.ChatRequest{}) {
+		n++
+		if n == 1 {
+			break // stop right after EventStarted
+		}
+	}
+	if n != 1 {
+		t.Fatalf("n = %d, want 1 (consumer break must stop iteration promptly)", n)
+	}
+}
+
+func TestStream_EarlyBreakAfterUsageEvent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+		sseWrite(w, `{"choices":[{"delta":{"content":"should not appear"}}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	n := 0
+	var types []ai.EventType
+	for ev, _ := range p.Stream(context.Background(), ai.ChatRequest{}) {
+		n++
+		types = append(types, ev.Type)
+		if ev.Type == ai.EventUsage {
+			break
+		}
+	}
+	if len(types) != 2 || types[1] != ai.EventUsage {
+		t.Fatalf("types = %v, want [started, usage]", types)
+	}
+}
+
+func TestStream_EarlyBreakAfterStructuredEvent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[{"delta":{"content":"{\"a\":1}"}}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	req := ai.ChatRequest{ResponseSchema: json.RawMessage(`{"type":"object"}`)}
+	var types []ai.EventType
+	for ev, _ := range p.Stream(context.Background(), req) {
+		types = append(types, ev.Type)
+		if ev.Type == ai.EventStructured {
+			break
+		}
+	}
+	if len(types) == 0 || types[len(types)-1] != ai.EventStructured {
+		t.Fatalf("types = %v, want to end at EventStructured", types)
+	}
+}
+
+func TestStream_EarlyBreakAfterToolCallEvent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"noop","arguments":"{}"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"noop2","arguments":"{}"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	var calls []ai.ToolCall
+	for ev, _ := range p.Stream(context.Background(), ai.ChatRequest{}) {
+		if ev.Type == ai.EventToolCall {
+			calls = append(calls, *ev.ToolCall)
+			break // stop after the FIRST tool call, before the second is yielded
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls = %+v, want exactly 1 (consumer broke after the first)", calls)
+	}
+}
+
+func TestStream_EarlyBreakAfterTextDeltaEvent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[{"delta":{"content":"first"}}]}`)
+		sseWrite(w, `{"choices":[{"delta":{"content":"should not appear"}}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	var texts []string
+	for ev, _ := range p.Stream(context.Background(), ai.ChatRequest{}) {
+		if ev.Type == ai.EventTextDelta {
+			texts = append(texts, ev.Text)
+			break // stop right after the FIRST text.delta
+		}
+	}
+	if len(texts) != 1 || texts[0] != "first" {
+		t.Fatalf("texts = %v, want exactly [\"first\"]", texts)
+	}
+}
+
+// hijackAbortWriter is an http.Handler helper: it writes a partial SSE
+// response, then hijacks and abruptly closes the raw connection (no proper
+// TLS/HTTP close), so the client's body Read returns a transport error
+// (not a clean EOF) -- the only realistic way to drive bufio.Scanner's
+// sc.Err() path (as opposed to a well-formed truncation, which is the
+// "no [DONE] marker" case already covered elsewhere).
+func TestStream_ScannerTransportErrorIsFatal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[{"delta":{"content":"partial"}}]}`)
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("ResponseWriter does not support Hijack")
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("Hijack: %v", err)
+		}
+		_ = conn.Close() // abrupt close: the client sees a transport error, not EOF
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err == nil {
+		t.Fatal("expected a fatal transport error")
+	}
+}
+
+func TestStream_EmptyDataLineSkipped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: \n\n") // an empty data: line must be skipped, not error
+		w.(http.Flusher).Flush()
+		sseWrite(w, `{"choices":[{"delta":{"content":"hi"}}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	text, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if text != "hi" {
+		t.Errorf("text = %q", text)
+	}
+}
+
+func TestStream_ReasoningTokensFromUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":7}}}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	_, _, usage, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage == nil || usage.ReasoningTokens != 7 {
+		t.Fatalf("usage = %+v, want ReasoningTokens=7", usage)
+	}
+}
