@@ -121,6 +121,44 @@ func TestViewRendersEntriesAndEmptyState(t *testing.T) {
 	}
 }
 
+func TestCursorReturnsMinusOneWhenEmpty(t *testing.T) {
+	m := New(nil)
+	if got := m.Cursor(); got != -1 {
+		t.Fatalf("Cursor() on empty sidebar = %d, want -1", got)
+	}
+	m.Add(ref("1"))
+	if got := m.Cursor(); got != 0 {
+		t.Fatalf("Cursor() after Add = %d, want 0", got)
+	}
+}
+
+func TestSetVisible(t *testing.T) {
+	m := New(nil)
+	if !m.Visible() {
+		t.Fatal("should start visible")
+	}
+	m.SetVisible(false)
+	if m.Visible() {
+		t.Fatal("SetVisible(false) did not hide the sidebar")
+	}
+	m.SetVisible(true)
+	if !m.Visible() {
+		t.Fatal("SetVisible(true) did not show the sidebar")
+	}
+}
+
+func TestUpdateIgnoresNonKeyMsg(t *testing.T) {
+	m := New(nil)
+	m.Add(ref("1"))
+	cmd := m.Update(struct{}{})
+	if cmd != nil {
+		t.Fatal("Update on a non-key message should return nil")
+	}
+	if m.Cursor() != 0 {
+		t.Fatalf("cursor moved on a non-key message: %d", m.Cursor())
+	}
+}
+
 func TestCustomRenderer(t *testing.T) {
 	m := New(func(r session.EntityRef, width int) string { return "custom:" + r.Title })
 	m.Add(ref("1"))
