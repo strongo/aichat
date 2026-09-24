@@ -237,12 +237,19 @@ func (l Loop) run(ctx context.Context, req ai.ChatRequest, yield func(ai.Event, 
 			// this final turn's own text/ProviderState was previously
 			// dropped entirely -- Messages() ended at the last tool
 			// result, silently discarding the model's actual answer.
-			// Append it as an ordinary assistant message before saving.
-			messages = append(messages, ai.Message{
-				Role:          ai.RoleAssistant,
-				Text:          stepText.String(),
-				ProviderState: stepProviderState,
-			})
+			// Append it as an ordinary assistant message before saving --
+			// but N1 (r2 review): NOT when the turn is genuinely empty
+			// (e.g. a refusal, or an empty end_turn with no text and no
+			// provider-state payload) -- an empty assistant message is
+			// nothing but wire noise for the next adapter to reject or pad
+			// around, so it is simply not appended.
+			if stepText.Len() > 0 || len(stepProviderState) > 0 {
+				messages = append(messages, ai.Message{
+					Role:          ai.RoleAssistant,
+					Text:          stepText.String(),
+					ProviderState: stepProviderState,
+				})
+			}
 			saveTranscript()
 			var usagePtr *ai.Usage
 			if haveUsage {
@@ -328,14 +335,6 @@ func (l Loop) run(ctx context.Context, req ai.ChatRequest, yield func(ai.Event, 
 	}
 }
 
-// execute runs a single Handler, converting a missing handler, an
-// infrastructure error, or a recovered panic into an IsError ToolResult so
-// the run itself never aborts on a single tool's misbehaviour except via the
-// documented "error = infrastructure failure (aborts)" contract, which this
-// package honours by treating a returned error the same as a panic: both
-// become an IsError result rather than a fatal Run failure, keeping the loop
-// resilient to individual tool failures while still surfacing them to the
-// model.
 // execute runs call's Handler. Ruling (r1 review, M4 — the pinned brief's
 // own words: "error = infrastructure failure (aborts); tool-level failures
 // return IsError results"): a Handler returning a non-nil error is an

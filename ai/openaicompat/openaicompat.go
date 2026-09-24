@@ -15,7 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/internal/retry"
@@ -36,14 +36,20 @@ type Config struct {
 type Provider struct {
 	cfg Config
 
-	// noReasoningEffort is set (M1, r1 review) after this Provider learns,
-	// from a live 400 response, that its endpoint rejects the
-	// reasoning_effort field -- some OpenAI-compatible endpoints (proxies,
-	// older deployments, certain third-party providers) 400 on an unknown
-	// parameter instead of ignoring it. Once set, every later Stream call
-	// on THIS Provider instance omits reasoning_effort from the start,
-	// rather than paying the extra round trip on every request.
-	noReasoningEffort atomic.Bool
+	// noReasoningEffortMu guards noReasoningEffort.
+	noReasoningEffortMu sync.Mutex
+	// noReasoningEffort records, per MODEL (m3, r2 review — a Provider can
+	// be reused across requests naming different models, e.g. via
+	// ai.ChatRequest.Model, and whether reasoning_effort is accepted is a
+	// property of the model/deployment, not the Provider as a whole), that
+	// this Provider has learned, from a live 400 response, that endpoint
+	// rejects the reasoning_effort field for that model -- some
+	// OpenAI-compatible endpoints (proxies, older deployments, certain
+	// third-party providers) 400 on an unknown parameter instead of
+	// ignoring it. Once a model is recorded here, every later Stream call
+	// for that model omits reasoning_effort from the start, rather than
+	// paying the extra round trip on every request.
+	noReasoningEffort map[string]bool
 }
 
 // New builds a Provider. It panics if BaseURL is empty.
@@ -218,7 +224,7 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			}
 			body.ToolChoice = toolChoiceWire(req.ToolChoice)
 		}
-		sentReasoningEffort := req.Reasoning != "" && !p.noReasoningEffort.Load()
+		sentReasoningEffort := req.Reasoning != "" && !p.reasoningEffortUnsupported(model)
 		if sentReasoningEffort {
 			body.ReasoningEffort = req.Reasoning
 		}
@@ -246,7 +252,7 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			// unrecognised reasoning_effort instead of ignoring it. Retry
 			// ONCE, before any byte of a response was seen, without it --
 			// and remember not to send it again on this Provider instance.
-			p.noReasoningEffort.Store(true)
+			p.markReasoningEffortUnsupported(model)
 			body.ReasoningEffort = ""
 			if retryPayload, merr := json.Marshal(body); merr == nil {
 				resp, doErr = send(retryPayload)
@@ -480,18 +486,44 @@ func toAIError(ctx context.Context, err error) *ai.Error {
 }
 
 // isUnsupportedReasoningEffortError reports whether err is a 400
-// (ai.ErrCodeInvalid) whose message suggests the endpoint rejected the
-// reasoning_effort field itself, rather than some other request problem —
-// see M1 in Stream. This is necessarily a heuristic (providers don't
-// standardise error message text); it only widens the one-time retry, it
-// never blocks a normal request.
+// (ai.ErrCodeInvalid) whose message specifically NAMES the reasoning_effort
+// field — see M1 in Stream. m3 (r2 review): this used to also match the
+// generic phrase "unsupported parameter", which is far too broad — it would
+// trigger the retry-without-reasoning_effort path (and permanently disable
+// it for the model) on a 400 caused by a completely unrelated unsupported
+// field, discarding reasoning_effort for the wrong reason. Matching only on
+// the field's own name (snake_case or camelCase, case-insensitive) is still
+// a heuristic (providers don't standardise error message text), but it no
+// longer fires on unrelated 400s.
 func isUnsupportedReasoningEffortError(err error) bool {
 	var aiErr *ai.Error
 	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeInvalid {
 		return false
 	}
 	lower := strings.ToLower(aiErr.Message)
-	return strings.Contains(lower, "reasoning_effort") || strings.Contains(lower, "unsupported parameter")
+	return strings.Contains(lower, "reasoning_effort") || strings.Contains(lower, "reasoningeffort")
+}
+
+// reasoningEffortUnsupported reports whether this Provider has already
+// learned (markReasoningEffortUnsupported) that model rejects
+// reasoning_effort.
+func (p *Provider) reasoningEffortUnsupported(model string) bool {
+	p.noReasoningEffortMu.Lock()
+	defer p.noReasoningEffortMu.Unlock()
+	return p.noReasoningEffort[model]
+}
+
+// markReasoningEffortUnsupported records that model rejects
+// reasoning_effort, per m3 (r2 review): keyed by model, not the whole
+// Provider, since a Provider can be reused across requests naming different
+// models.
+func (p *Provider) markReasoningEffortUnsupported(model string) {
+	p.noReasoningEffortMu.Lock()
+	defer p.noReasoningEffortMu.Unlock()
+	if p.noReasoningEffort == nil {
+		p.noReasoningEffort = map[string]bool{}
+	}
+	p.noReasoningEffort[model] = true
 }
 
 // doRequest issues one attempt. lastAttempt tells it not to bother waiting

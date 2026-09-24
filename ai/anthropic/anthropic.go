@@ -210,6 +210,17 @@ var modelFamilyRe = regexp.MustCompile(`^claude-(opus|sonnet|haiku|fable)-(\d+)(
 // assumed to be a newer, adaptive-thinking model — the same default the
 // skill's own guidance uses for "unfamiliar model strings".
 func thinkingModeAdaptive(model string) bool {
+	// m4 (r2 review): Claude 3.x ids use the OLDER "claude-3[-<minor>]-
+	// <family>" naming (claude-3-7-sonnet, claude-3-5-haiku, claude-3-opus,
+	// claude-3-5-sonnet, claude-3-sonnet, ...) -- the family comes AFTER
+	// the version, not before it like modelFamilyRe expects -- so they
+	// never match that regex and would otherwise fall into the
+	// "unrecognised model" default below (adaptive). That default is wrong
+	// here: adaptive thinking did not exist for Claude 3.x at all, so
+	// every claude-3-* id is legacy budget_tokens only.
+	if model == "claude-3" || strings.HasPrefix(model, "claude-3-") {
+		return false
+	}
 	m := modelFamilyRe.FindStringSubmatch(model)
 	if m == nil {
 		return true
@@ -341,6 +352,14 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 				// depth is controlled by output_config.effort instead.
 				body.Thinking = &thinkingConfig{Type: "adaptive"}
 				body.OutputConfig = &outputConfigWire{Effort: req.Reasoning}
+				// N3 (r2 review): defaultMax (2048) leaves adaptive
+				// thinking almost no room to write an answer after
+				// reasoning. When the caller left MaxTokens unset (free to
+				// raise, same M8 guard as every other branch here), bump
+				// the default up to 16000.
+				if req.MaxTokens == 0 && body.MaxTokens < 16000 {
+					body.MaxTokens = 16000
+				}
 			case req.MaxTokens > 0 && req.MaxTokens < 2048:
 				// Not enough room for a useful thinking budget (min 1024)
 				// alongside any real output without exceeding the caller's
@@ -359,9 +378,21 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			default:
 				// Caller left MaxTokens unset (0): free to pick a larger
 				// default so the budget has room -- this is OUR default,
-				// not a ceiling the caller gave us.
-				if body.MaxTokens <= budget {
-					body.MaxTokens = budget + defaultMax
+				// not a ceiling the caller gave us. N3 (r2 review): budget
+				// + 4096 (room for a real answer beyond the thinking
+				// spend), capped at 16000 -- except the cap can never drop
+				// AT or below budget itself (Anthropic requires
+				// budget_tokens < max_tokens), so a "high" budget (16000)
+				// still gets budget+1024 even though that's over the cap.
+				mt := budget + 4096
+				if mt > 16000 {
+					mt = 16000
+				}
+				if mt <= budget {
+					mt = budget + 1024
+				}
+				if mt > body.MaxTokens {
+					body.MaxTokens = mt
 				}
 				body.Thinking = &thinkingConfig{Type: "enabled", BudgetTokens: budget}
 			}
@@ -571,7 +602,19 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			for _, idx := range blockOrder {
 				blk := *blocks[idx]
 				if call, ok := toolCalls[idx]; ok {
-					blk.Input = call.Arguments
+					// X1 (r2 review): a no-argument tool call streams zero
+					// input_json_delta chunks, leaving call.Arguments empty.
+					// A tool_use content block always carries "input" on
+					// the wire (Anthropic requires the key even for an
+					// empty object) -- capture it as "{}" here, not "",
+					// so providerStateBlock's omitempty on Input doesn't
+					// drop the key entirely and the replay below doesn't
+					// need to special-case it either.
+					input := call.Arguments
+					if len(input) == 0 {
+						input = json.RawMessage("{}")
+					}
+					blk.Input = input
 				}
 				ordered = append(ordered, blk)
 			}
@@ -788,8 +831,24 @@ func buildSystemBlocks(req ai.ChatRequest, wantStructured bool) []contentBlock {
 // anthropic-history-cache), so the conversation history itself -- not just
 // the system prompt -- is cached across turns.
 func buildMessages(req ai.ChatRequest) []wireMessage {
+	// N2 ruling (r2 review): ProviderState (thinking/redacted_thinking
+	// blocks) is replayed ONLY for assistant turns AFTER the last genuine
+	// user text message -- i.e. within the current tool-calling loop.
+	// Earlier assistant turns (from a prior loop, or a prior conversation
+	// turn) are rebuilt from Text/ToolCalls WITHOUT their thinking blocks
+	// instead. This keeps a dynamic-context edit on a later user message
+	// from ever landing ahead of (or "inside") an earlier turn's replayed
+	// thinking block, and matches Anthropic's actual requirement, which is
+	// scoped to the turn that led to the tool_use, not the whole history.
+	lastUserIdx := -1
+	for i, m := range req.Messages {
+		if m.Role == ai.RoleUser {
+			lastUserIdx = i
+		}
+	}
+
 	msgs := make([]wireMessage, 0, len(req.Messages))
-	for _, m := range req.Messages {
+	for i, m := range req.Messages {
 		if m.Role == ai.RoleTool {
 			blocks := make([]contentBlock, 0, len(m.ToolResults))
 			for _, r := range m.ToolResults {
@@ -807,31 +866,54 @@ func buildMessages(req ai.ChatRequest) []wireMessage {
 		}
 
 		var blocks []contentBlock
-		// B2 (r1 review): when ProviderState is present, it IS the entire
-		// assistant content array (thinking/redacted_thinking/text/tool_use,
-		// interleaved exactly as the API returned them) — replay it
-		// VERBATIM rather than rebuilding from Text/ToolCalls, which would
-		// drop interleaved thinking and reorder blocks. thinking/
-		// redacted_thinking blocks in particular MUST precede the tool_use
-		// they led to and MUST be replayed byte-faithful (REQ: anthropic-
-		// thinking-block-replay) — the API 400s a tool-use continuation
-		// whose thinking blocks were dropped or edited. m3: only known
-		// block types are accepted, so a ProviderState relayed through an
-		// untrusted/foreign origin (e.g. via ai/cloud) can't smuggle an
-		// unrecognised block onto the wire. A ProviderState that fails to
-		// unmarshal, or unmarshals to zero known blocks, falls back to the
-		// legacy Text/ToolCalls reconstruction below rather than sending an
-		// empty assistant turn.
+		// B2 (r1 review): when ProviderState is present AND this turn is
+		// within the CURRENT tool-calling loop (N2 ruling: i > lastUserIdx,
+		// see above), it IS the entire assistant content array (thinking/
+		// redacted_thinking/text/tool_use, interleaved exactly as the API
+		// returned them) — replay it VERBATIM rather than rebuilding from
+		// Text/ToolCalls, which would drop interleaved thinking and reorder
+		// blocks. thinking/redacted_thinking blocks in particular MUST
+		// precede the tool_use they led to and MUST be replayed
+		// byte-faithful (REQ: anthropic-thinking-block-replay) — the API
+		// 400s a tool-use continuation whose thinking blocks were dropped
+		// or edited. An assistant turn from an EARLIER loop (before the
+		// last genuine user text message) falls to the legacy
+		// Text/ToolCalls reconstruction below instead, even if it also
+		// carries a ProviderState — Anthropic's replay requirement is
+		// scoped to the turn that led to the CURRENT tool_use, not the
+		// entire history, and rebuilding drops that older turn's thinking
+		// blocks on purpose. m3: only known block types are accepted, so a
+		// ProviderState relayed through an untrusted/foreign origin (e.g.
+		// via ai/cloud) can't smuggle an unrecognised block onto the wire.
+		// A ProviderState that fails to unmarshal, or unmarshals to zero
+		// known blocks, also falls back to the legacy reconstruction
+		// rather than sending an empty assistant turn.
 		replayed := false
-		if len(m.ProviderState) > 0 {
+		if len(m.ProviderState) > 0 && i > lastUserIdx {
 			var replay []providerStateBlock
 			if err := json.Unmarshal(m.ProviderState, &replay); err == nil {
 				for _, b := range replay {
 					if !knownProviderStateBlockTypes[b.Type] {
 						continue
 					}
+					// N1: never replay an empty text block onto the wire --
+					// Anthropic rejects a "text" content block with no
+					// text, so a captured-but-empty one (e.g. a step that
+					// opened a text block and immediately stopped it) is
+					// dropped rather than replayed.
+					if b.Type == "text" && b.Text == "" {
+						continue
+					}
+					// X1: defensive default for ProviderState captured
+					// before this fix (or relayed from a foreign origin
+					// via ai/cloud) that may still carry an empty/missing
+					// input for a no-argument tool_use block.
+					input := b.Input
+					if b.Type == "tool_use" && len(input) == 0 {
+						input = json.RawMessage("{}")
+					}
 					blocks = append(blocks, contentBlock{
-						Type: b.Type, Text: b.Text, ID: b.ID, Name: b.Name, Input: b.Input,
+						Type: b.Type, Text: b.Text, ID: b.ID, Name: b.Name, Input: input,
 						Thinking: b.Thinking, Signature: b.Signature, Data: b.Data,
 					})
 				}
@@ -839,7 +921,14 @@ func buildMessages(req ai.ChatRequest) []wireMessage {
 			}
 		}
 		if !replayed {
-			if m.Text != "" || len(m.ToolCalls) == 0 {
+			// N1: only emit a text block when there is actual text --
+			// Anthropic rejects {"type":"text","text":""}. Previously this
+			// also fired when m.Text=="" AND there were no ToolCalls
+			// either, specifically to avoid sending a wire message with a
+			// fully empty content array; that case is now handled by
+			// skipping the message entirely below instead of padding it
+			// with an empty text block.
+			if m.Text != "" {
 				blocks = append(blocks, contentBlock{Type: "text", Text: m.Text})
 			}
 			for _, tc := range m.ToolCalls {
@@ -849,6 +938,16 @@ func buildMessages(req ai.ChatRequest) []wireMessage {
 				}
 				blocks = append(blocks, contentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: input})
 			}
+		}
+		if len(blocks) == 0 {
+			// N1: an assistant turn with no text, no tool calls, and no
+			// (surviving) replayed content -- e.g. a refusal or an empty
+			// end_turn that ai/agent.Loop still appended to a caller-built
+			// transcript -- has nothing to say on the wire. Anthropic
+			// rejects a message with an empty content array, and there is
+			// nothing useful to pad it with, so the turn is dropped
+			// entirely rather than sent.
+			continue
 		}
 		msgs = append(msgs, wireMessage{Role: string(m.Role), Content: blocks})
 	}

@@ -772,6 +772,19 @@ func TestThinkingModeAdaptive_PerModelFamily(t *testing.T) {
 		{"claude-haiku-4-5-20251001", false},
 		{"claude-opus-6-1", true},             // unrecognised future id: default adaptive
 		{"some-custom-anthropic-model", true}, // unrecognised: default adaptive
+		// m4 (r2 review): Claude 3.x ids put the family AFTER the version
+		// ("claude-3[-<minor>]-<family>"), never matching modelFamilyRe --
+		// every one of them is legacy budget_tokens, none are adaptive.
+		{"claude-3-7-sonnet-20250219", false},
+		{"claude-3-7-sonnet", false},
+		{"claude-3-5-haiku-20241022", false},
+		{"claude-3-5-haiku", false},
+		{"claude-3-opus-20240229", false},
+		{"claude-3-opus", false},
+		{"claude-3-5-sonnet-20241022", false},
+		{"claude-3-5-sonnet-20240620", false},
+		{"claude-3-sonnet-20240229", false},
+		{"claude-3-haiku-20240307", false},
 	}
 	for _, c := range cases {
 		if got := thinkingModeAdaptive(c.model); got != c.want {
@@ -810,6 +823,97 @@ func TestStream_AdaptiveThinkingUsesOutputConfigEffortNotBudgetTokens(t *testing
 	}
 	if gotBody.OutputConfig == nil || gotBody.OutputConfig.Effort != "high" {
 		t.Errorf("OutputConfig = %+v, want {Effort: high}", gotBody.OutputConfig)
+	}
+	// N3 (r2 review): defaultMax (2048) leaves adaptive thinking almost no
+	// room to answer after reasoning; the caller left MaxTokens unset, so
+	// the adapter must raise its default to 16000.
+	if gotBody.MaxTokens != 16000 {
+		t.Errorf("MaxTokens = %d, want 16000 (N3 default for adaptive thinking with MaxTokens unset)", gotBody.MaxTokens)
+	}
+}
+
+// TestStream_AdaptiveThinkingKeepsCallerMaxTokensWhenSet covers N3's M8
+// interaction: the 16000 default only applies when the caller left
+// MaxTokens unset; an explicit (even smaller) caller MaxTokens is still
+// never raised.
+func TestStream_AdaptiveThinkingKeepsCallerMaxTokensWhenSet(t *testing.T) {
+	var gotBody messagesRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-opus-5"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{
+		Reasoning: ai.ReasoningHigh,
+		MaxTokens: 5000,
+		Messages:  []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+	}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if gotBody.MaxTokens != 5000 {
+		t.Errorf("MaxTokens = %d, want unchanged at the caller's 5000, not raised to 16000", gotBody.MaxTokens)
+	}
+}
+
+// TestStream_LegacyThinkingDefaultMaxTokensIsBudgetPlus4096CappedAt16000 is
+// N3's regression test for the legacy budget_tokens form: with MaxTokens
+// left unset, the default is budget+4096, capped at 16000.
+func TestStream_LegacyThinkingDefaultMaxTokensIsBudgetPlus4096CappedAt16000(t *testing.T) {
+	cases := []struct {
+		name       string
+		reasoning  string
+		wantBudget int
+		wantMax    int
+	}{
+		{"low", ai.ReasoningLow, 1024, 1024 + 4096},
+		{"medium", ai.ReasoningMedium, 4096, 4096 + 4096},
+		// high's budget (16000) + 4096 = 20096, over the 16000 cap; the cap
+		// can never drop AT or below the budget itself (Anthropic requires
+		// budget_tokens < max_tokens), so this falls back to budget+1024.
+		{"high", ai.ReasoningHigh, 16000, 16000 + 1024},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody messagesRequestBody
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				if err := json.Unmarshal(b, &gotBody); err != nil {
+					t.Fatal(err)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`)
+				sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+			}))
+			defer srv.Close()
+
+			p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-haiku-4-5-20251001"})
+			_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{
+				Reasoning: tc.reasoning,
+				Messages:  []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+			}))
+			if err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+			if gotBody.Thinking == nil || gotBody.Thinking.BudgetTokens != tc.wantBudget {
+				t.Fatalf("BudgetTokens = %+v, want %d", gotBody.Thinking, tc.wantBudget)
+			}
+			if gotBody.MaxTokens != tc.wantMax {
+				t.Errorf("MaxTokens = %d, want %d", gotBody.MaxTokens, tc.wantMax)
+			}
+			if gotBody.MaxTokens <= gotBody.Thinking.BudgetTokens {
+				t.Errorf("MaxTokens (%d) must be greater than BudgetTokens (%d)", gotBody.MaxTokens, gotBody.Thinking.BudgetTokens)
+			}
+		})
 	}
 }
 
@@ -1021,6 +1125,153 @@ func TestBuildMessages_UnknownProviderStateBlockTypeFiltered(t *testing.T) {
 	}
 	if assistant == nil || len(assistant.Content) != 1 || assistant.Content[0].Type != "thinking" {
 		t.Fatalf("assistant content = %+v, want only the known thinking block", assistant)
+	}
+}
+
+// TestBuildMessages_EmptyAssistantTurnDroppedNotSentAsEmptyTextBlock covers
+// r2's N1: an assistant message with no Text, no ToolCalls and no
+// (surviving) ProviderState -- e.g. one ai/agent.Loop appended before its
+// own N1 fix, or one built by a caller that doesn't go through ai/agent --
+// must never become an empty {"type":"text","text":""} content block (which
+// Anthropic rejects); the whole turn is dropped from the wire instead of
+// padding it with an empty block.
+func TestBuildMessages_EmptyAssistantTurnDroppedNotSentAsEmptyTextBlock(t *testing.T) {
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, Text: ""},
+			{Role: ai.RoleUser, Text: "still there?"},
+		},
+	}
+	msgs := buildMessages(req)
+	for _, m := range msgs {
+		if m.Role != "assistant" {
+			continue
+		}
+		t.Fatalf("assistant message %+v present on the wire, want the empty turn dropped entirely", m)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("msgs = %+v, want exactly the 2 user messages (empty assistant turn dropped)", msgs)
+	}
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if b.Type == "text" && b.Text == "" {
+				t.Errorf("empty text block on the wire: %+v", b)
+			}
+		}
+	}
+}
+
+// TestBuildMessages_ReplayedEmptyTextBlockDropped covers N1's ProviderState
+// replay path: a captured content array containing a "text" block with no
+// text (e.g. a text block opened and immediately stopped with zero deltas)
+// must be filtered out of the replay, never sent as an empty text block.
+func TestBuildMessages_ReplayedEmptyTextBlockDropped(t *testing.T) {
+	ps, _ := json.Marshal([]map[string]any{
+		{"type": "text", "text": ""},
+		{"type": "tool_use", "id": "call_1", "name": "run_dtql", "input": map[string]any{}},
+	})
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ProviderState: ps},
+		},
+	}
+	msgs := buildMessages(req)
+	var assistant *wireMessage
+	for i := range msgs {
+		if msgs[i].Role == "assistant" {
+			assistant = &msgs[i]
+		}
+	}
+	if assistant == nil {
+		t.Fatal("no assistant message on the wire")
+	}
+	for _, b := range assistant.Content {
+		if b.Type == "text" && b.Text == "" {
+			t.Errorf("empty text block replayed onto the wire: %+v", b)
+		}
+	}
+	if len(assistant.Content) != 1 || assistant.Content[0].Type != "tool_use" {
+		t.Fatalf("assistant content = %+v, want only the tool_use block (empty text block dropped)", assistant.Content)
+	}
+}
+
+// TestBuildMessages_ProviderStateReplayScopedToCurrentLoopOnly is the r2
+// review's N2 ruling regression test: ProviderState replay applies ONLY to
+// assistant turns AFTER the last genuine user text message (the current
+// tool-calling loop) -- an assistant turn from an EARLIER loop, even one
+// that still carries a ProviderState with thinking blocks, must be rebuilt
+// from Text/ToolCalls (no thinking blocks) instead, so a dynamic-context
+// edit on the later user message never lands ahead of an earlier turn's
+// replayed thinking block.
+func TestBuildMessages_ProviderStateReplayScopedToCurrentLoopOnly(t *testing.T) {
+	earlierPS, _ := json.Marshal([]map[string]any{
+		{"type": "thinking", "thinking": "earlier reasoning", "signature": "sig-old"},
+		{"type": "tool_use", "id": "call_old", "name": "run_dtql", "input": map[string]any{"sql": "select 0"}},
+	})
+	currentPS, _ := json.Marshal([]map[string]any{
+		{"type": "thinking", "thinking": "current reasoning", "signature": "sig-new"},
+		{"type": "tool_use", "id": "call_new", "name": "run_dtql", "input": map[string]any{"sql": "select 1"}},
+	})
+	req := ai.ChatRequest{
+		Context: []ai.ContextBlock{{Kind: ai.ContextDynamic, Text: "it is Tuesday"}},
+		Messages: []ai.Message{
+			// Earlier loop, already resolved.
+			{Role: ai.RoleUser, Text: "first question"},
+			{Role: ai.RoleAssistant, Text: "let me check", ToolCalls: []ai.ToolCall{{ID: "call_old", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 0"}`)}}, ProviderState: earlierPS},
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_old", Content: "0 rows"}}},
+			{Role: ai.RoleAssistant, Text: "no rows found"},
+			// Current loop: the last genuine user text message, then an
+			// in-progress tool call carrying a ProviderState.
+			{Role: ai.RoleUser, Text: "second question"},
+			{Role: ai.RoleAssistant, Text: "checking again", ToolCalls: []ai.ToolCall{{ID: "call_new", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 1"}`)}}, ProviderState: currentPS},
+		},
+	}
+	msgs := buildMessages(req)
+
+	var assistants []wireMessage
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			assistants = append(assistants, m)
+		}
+	}
+	if len(assistants) != 3 {
+		t.Fatalf("assistants = %+v, want 3 assistant turns", assistants)
+	}
+
+	// The EARLIER loop's assistant turn (index 0: "let me check" / call_old)
+	// must NOT carry a thinking block, despite having a ProviderState.
+	earlier := assistants[0]
+	for _, b := range earlier.Content {
+		if b.Type == "thinking" {
+			t.Errorf("earlier-loop assistant turn replayed a thinking block: %+v", earlier.Content)
+		}
+	}
+	var earlierHasToolUse bool
+	for _, b := range earlier.Content {
+		if b.Type == "tool_use" && b.ID == "call_old" {
+			earlierHasToolUse = true
+		}
+	}
+	if !earlierHasToolUse {
+		t.Errorf("earlier-loop assistant turn = %+v, want a rebuilt tool_use for call_old", earlier.Content)
+	}
+
+	// The CURRENT loop's assistant turn (the last one, call_new) MUST
+	// replay its thinking block verbatim, signature intact.
+	current := assistants[len(assistants)-1]
+	var sawCurrentThinking bool
+	for _, b := range current.Content {
+		if b.Type == "thinking" {
+			sawCurrentThinking = true
+			if b.Signature != "sig-new" || b.Thinking != "current reasoning" {
+				t.Errorf("current-loop thinking block = %+v, want verbatim replay", b)
+			}
+		}
+	}
+	if !sawCurrentThinking {
+		t.Errorf("current-loop assistant turn = %+v, want its thinking block replayed", current.Content)
 	}
 }
 

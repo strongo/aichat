@@ -785,6 +785,84 @@ func TestStream_ReasoningEffortRetriedOnceWithoutItOn400(t *testing.T) {
 	}
 }
 
+// TestStream_UnrelatedUnsupportedParameterDoesNotTriggerReasoningEffortRetry
+// is r2's m3 regression test: a 400 naming some OTHER unsupported parameter
+// must NOT be treated as a reasoning_effort rejection -- the old, broader
+// "unsupported parameter" substring match would have retried (and
+// permanently disabled reasoning_effort) for the wrong reason.
+func TestStream_UnrelatedUnsupportedParameterDoesNotTriggerReasoningEffortRetry(t *testing.T) {
+	var bodies []chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body chatRequestBody
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		bodies = append(bodies, body)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'frequency_penalty'","type":"invalid_request_error"}}`))
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	req := ai.ChatRequest{Reasoning: ai.ReasoningHigh, Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}
+
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err == nil {
+		t.Fatal("Collect: want an error (the 400 is unrelated to reasoning_effort and must not be retried into success)")
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("got %d requests, want 1 (no retry for an unrelated unsupported parameter)", len(bodies))
+	}
+	if bodies[0].ReasoningEffort != "high" {
+		t.Errorf("request ReasoningEffort = %q, want high (never sent, so no reason to have dropped it)", bodies[0].ReasoningEffort)
+	}
+}
+
+// TestStream_ReasoningEffortUnsupportedRememberedPerModel is r2's m3
+// regression test: the Provider remembers a reasoning_effort rejection per
+// MODEL, not for the whole Provider instance -- a later Stream call naming a
+// DIFFERENT model must still try reasoning_effort.
+func TestStream_ReasoningEffortUnsupportedRememberedPerModel(t *testing.T) {
+	var bodies []chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body chatRequestBody
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		bodies = append(bodies, body)
+		if body.ReasoningEffort != "" && body.Model == "model-a" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'reasoning_effort'","type":"invalid_request_error"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL})
+	reqA := ai.ChatRequest{Model: "model-a", Reasoning: ai.ReasoningHigh, Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}
+	reqB := ai.ChatRequest{Model: "model-b", Reasoning: ai.ReasoningHigh, Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}
+
+	if _, _, _, err := ai.Collect(p.Stream(context.Background(), reqA)); err != nil {
+		t.Fatalf("Collect (model-a): %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("got %d requests for model-a, want 2 (400 + retry)", len(bodies))
+	}
+
+	bodies = nil
+	if _, _, _, err := ai.Collect(p.Stream(context.Background(), reqB)); err != nil {
+		t.Fatalf("Collect (model-b): %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("got %d requests for model-b, want 1", len(bodies))
+	}
+	if bodies[0].ReasoningEffort != "high" {
+		t.Errorf("model-b ReasoningEffort = %q, want high (model-a's rejection must not carry over to a different model)", bodies[0].ReasoningEffort)
+	}
+}
+
 func TestStream_ToolCallMissingIDGetsSynthesized(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

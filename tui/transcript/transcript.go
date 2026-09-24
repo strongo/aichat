@@ -176,9 +176,6 @@ func (m *Model) ReplaceBlock(id string, b Block) {
 	}
 }
 
-// stopForEntryIndex is entryIndexForStop's inverse: the stop index entries
-// index entryIdx occupies, or -1 if that entry isn't focusable (or the
-// index is out of range).
 // Clear removes every entry and clears focus.
 func (m *Model) Clear() {
 	m.entries = nil

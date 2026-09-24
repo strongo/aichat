@@ -381,6 +381,30 @@ func TestLoop_NoToolCallsCompletesImmediately(t *testing.T) {
 	}
 }
 
+// TestLoop_EmptyFinalTurnNotAppendedToTranscript covers r2's N1: a final
+// step with no text, no tool calls and no ProviderState (e.g. a refusal, or
+// an empty end_turn) must not be appended to the transcript at all -- an
+// empty assistant message is wire noise the next adapter would otherwise
+// have to reject or pad around.
+func TestLoop_EmptyFinalTurnNotAppendedToTranscript(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{toolCallStep("")}}
+	loop := &Loop{Provider: provider}
+	seq, transcriptFn := loop.RunWithTranscript(context.Background(), ai.ChatRequest{
+		Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+	})
+	_, err := drain(t, seq)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	transcript := transcriptFn()
+	if len(transcript) != 1 {
+		t.Fatalf("transcript = %+v, want just the original user message (no empty assistant turn appended)", transcript)
+	}
+	if transcript[0].Role != ai.RoleUser {
+		t.Errorf("transcript[0].Role = %v, want RoleUser", transcript[0].Role)
+	}
+}
+
 // TestLoop_ParallelCallsExecutedSequentiallyInOrder verifies the pinned
 // contract that parallel tool calls in one step run one after another, in
 // the order the model returned them (not concurrently).
