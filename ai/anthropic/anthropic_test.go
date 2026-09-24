@@ -1369,3 +1369,654 @@ func TestStream_ToolCallMissingIDGetsSynthesized(t *testing.T) {
 		t.Fatalf("call = %+v, want a synthesized non-empty ID", call)
 	}
 }
+
+// roundTripFunc lets a test build an *http.Response directly, without a real
+// network round trip -- used below to force errors New()/httptest can't
+// reliably reproduce (an already-canceled request, a mid-body read failure).
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestContentBlock_MarshalJSON_ThinkingKeepsFieldsNonOmitted(t *testing.T) {
+	b := contentBlock{Type: "thinking", Thinking: "", Signature: "sig-1"}
+	got, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	s := string(got)
+	if !strings.Contains(s, `"thinking":""`) {
+		t.Errorf("got = %s, want an explicit \"thinking\":\"\" (never omitted for type=thinking)", s)
+	}
+	if !strings.Contains(s, `"signature":"sig-1"`) {
+		t.Errorf("got = %s, want signature present", s)
+	}
+	// Non-thinking blocks use the plain alias path: an empty Text IS omitted.
+	b2 := contentBlock{Type: "text", Text: ""}
+	got2, err := json.Marshal(b2)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(got2), `"text":`) {
+		t.Errorf("got2 = %s, want an empty Text field omitted for a non-thinking block", got2)
+	}
+}
+
+func TestAnthropicToolChoice_AllCases(t *testing.T) {
+	cases := []struct {
+		in   string
+		want *toolChoiceWire
+	}{
+		{"", nil},
+		{ai.ToolChoiceAuto, &toolChoiceWire{Type: "auto"}},
+		{ai.ToolChoiceNone, &toolChoiceWire{Type: "none"}},
+		{ai.ToolChoiceRequired, &toolChoiceWire{Type: "any"}},
+		{"specific_tool", &toolChoiceWire{Type: "tool", Name: "specific_tool"}},
+	}
+	for _, c := range cases {
+		got := anthropicToolChoice(c.in)
+		if c.want == nil {
+			if got != nil {
+				t.Errorf("anthropicToolChoice(%q) = %+v, want nil", c.in, got)
+			}
+			continue
+		}
+		if got == nil || *got != *c.want {
+			t.Errorf("anthropicToolChoice(%q) = %+v, want %+v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestStream_MarshalErrorFromInvalidReplayedToolCallArguments(t *testing.T) {
+	// An invalid-JSON ToolCall.Arguments (e.g. corrupted before reaching
+	// this adapter) makes buildMessages' contentBlock.Input an invalid
+	// json.RawMessage; json.Marshal(body) then fails, before any HTTP
+	// request is even attempted.
+	p := New(Config{BaseURL: "https://unused.example", APIKey: "k"})
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{
+				{ID: "call_1", Name: "noop", Arguments: json.RawMessage(`{not valid`)},
+			}},
+		},
+	}
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeInvalid {
+		t.Fatalf("err = %v, want ai.Error{Code: ErrCodeInvalid} from the failed json.Marshal", err)
+	}
+}
+
+func TestStream_ConsumerStopsAtEachEventType(t *testing.T) {
+	cases := []struct {
+		name     string
+		lines    []string // raw SSE frames, in order
+		stopType ai.EventType
+	}{
+		{"Started", nil, ai.EventStarted}, // no body needed; Started fires right after the request succeeds
+		{"TextDelta", []string{
+			`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}`,
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		}, ai.EventTextDelta},
+		{"ToolCall", []string{
+			`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"noop"}}`,
+			`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+			`event: message_stop` + "\n" + `data: {"type":"message_stop"}`,
+		}, ai.EventToolCall},
+		{"Usage", []string{
+			`event: message_delta` + "\n" + `data: {"type":"message_delta","usage":{"output_tokens":3}}`,
+		}, ai.EventUsage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				for _, l := range tc.lines {
+					_, _ = io.WriteString(w, l+"\n\n")
+				}
+				w.(http.Flusher).Flush()
+			}))
+			defer srv.Close()
+			p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+			var got []ai.Event
+			for ev, err := range p.Stream(context.Background(), ai.ChatRequest{}) {
+				got = append(got, ev)
+				if err != nil {
+					t.Fatalf("unexpected fatal event: %+v", ev)
+				}
+				if ev.Type == tc.stopType {
+					break // yield must return false here, stopping Stream mid-frame
+				}
+			}
+			if len(got) == 0 || got[len(got)-1].Type != tc.stopType {
+				t.Fatalf("got = %+v, want the last event to be %v", got, tc.stopType)
+			}
+		})
+	}
+}
+
+func TestStream_ToolCallStartsWithRedactedThinkingBlock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-blob"}}`)
+		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	var providerState json.RawMessage
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventCompleted {
+			providerState = ev.ProviderState
+		}
+	}
+	if !strings.Contains(string(providerState), `"data":"opaque-blob"`) {
+		t.Errorf("providerState = %s, want the redacted_thinking block's opaque Data captured", providerState)
+	}
+}
+
+func TestStream_ContentBlockDeltaWithNoDeltaFieldIgnored(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// content_block_delta with no "delta" key at all.
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	text, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if text != "ok" {
+		t.Errorf("text = %q", text)
+	}
+}
+
+func TestStream_EmptyTextDeltaSkipsYieldButTracksBlock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text"}}`)
+		// An empty text_delta must not surface as an EventTextDelta.
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"real"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	var deltas []string
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventTextDelta {
+			deltas = append(deltas, ev.Text)
+		}
+	}
+	if len(deltas) != 1 || deltas[0] != "real" {
+		t.Errorf("deltas = %v, want only [\"real\"] (the empty delta must not surface)", deltas)
+	}
+}
+
+func TestStream_EmptyDataLineIgnored(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// A blank "data:" line (no payload) must be skipped, not treated as
+		// a frame boundary or parsed as JSON.
+		_, _ = io.WriteString(w, "data:\n\n")
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+		w.(http.Flusher).Flush()
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+}
+
+func TestStream_BadEventJSONIsFatal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: content_block_delta\ndata: {not valid json\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeUpstream {
+		t.Fatalf("err = %v, want ErrCodeUpstream for malformed event JSON", err)
+	}
+	if !strings.Contains(aiErr.Message, "bad event") {
+		t.Errorf("Message = %q, want it to mention the bad event", aiErr.Message)
+	}
+}
+
+func TestStream_EventTypeFallsBackToSSEEventNameWhenDataOmitsType(t *testing.T) {
+	// The "type" field inside data is normally redundant with the SSE
+	// "event:" name; when the payload omits it, typ must fall back to the
+	// frame's own event name.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "message_stop", `{}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatalf("Collect: %v, want message_stop recognised via the event: name fallback", err)
+	}
+}
+
+func TestStream_RefusalAndPauseTurnStopReasons(t *testing.T) {
+	cases := []struct {
+		wire string
+		want string
+	}{
+		{"refusal", ai.StopReasonRefusal},
+		{"pause_turn", ai.StopReasonPauseTurn},
+	}
+	for _, c := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			sseWrite(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"`+c.wire+`"}}`)
+			sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+		}))
+		var stopReason string
+		p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+		for ev, err := range p.Stream(context.Background(), ai.ChatRequest{}) {
+			if err != nil {
+				t.Fatalf("Stream: %v", err)
+			}
+			if ev.Type == ai.EventCompleted {
+				stopReason = ev.StopReason
+			}
+		}
+		srv.Close()
+		if stopReason != c.want {
+			t.Errorf("wire stop_reason %q: got StopReason %q, want %q", c.wire, stopReason, c.want)
+		}
+	}
+}
+
+// TestStream_ProviderStateNoArgToolCallCapturesEmptyObjectInput covers the
+// providerState-assembly path's own X1 empty-input guard directly (distinct
+// from TestStream_ToolCallMissingIDGetsSynthesized, whose tool_use call DOES
+// stream an explicit "{}" via input_json_delta): a tool_use block with ZERO
+// input_json_delta chunks at all must still capture "input":{} in
+// ProviderState.
+func TestStream_ProviderStateNoArgToolCallCapturesEmptyObjectInput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"noop"}}`)
+		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+		sseWrite(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	var providerState json.RawMessage
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventCompleted {
+			providerState = ev.ProviderState
+		}
+	}
+	if !strings.Contains(string(providerState), `"input":{}`) {
+		t.Errorf("providerState = %s, want an explicit empty-object input", providerState)
+	}
+}
+
+func TestToAIError_AllBranches(t *testing.T) {
+	t.Run("ai.Error with canceled ctx is remapped", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		in := &ai.Error{Code: ai.ErrCodeUpstream, Message: "orig", Retryable: true}
+		got := toAIError(ctx, in)
+		if got.Code != ai.ErrCodeCanceled {
+			t.Errorf("Code = %q, want %q", got.Code, ai.ErrCodeCanceled)
+		}
+	})
+	t.Run("ai.Error with live ctx passes through unchanged", func(t *testing.T) {
+		in := &ai.Error{Code: ai.ErrCodeQuota, Message: "orig"}
+		got := toAIError(context.Background(), in)
+		if got != in {
+			t.Errorf("got = %+v, want the exact same *ai.Error returned unchanged", got)
+		}
+	})
+	t.Run("bare context.Canceled becomes ErrCodeCanceled", func(t *testing.T) {
+		got := toAIError(context.Background(), context.Canceled)
+		if got.Code != ai.ErrCodeCanceled || got.Retryable {
+			t.Errorf("got = %+v, want ErrCodeCanceled/not retryable", got)
+		}
+	})
+	t.Run("bare context.DeadlineExceeded becomes ErrCodeCanceled", func(t *testing.T) {
+		got := toAIError(context.Background(), context.DeadlineExceeded)
+		if got.Code != ai.ErrCodeCanceled {
+			t.Errorf("got = %+v, want ErrCodeCanceled", got)
+		}
+	})
+	t.Run("unrelated error falls back to retryable upstream", func(t *testing.T) {
+		got := toAIError(context.Background(), errors.New("boom"))
+		if got.Code != ai.ErrCodeUpstream || !got.Retryable {
+			t.Errorf("got = %+v, want ErrCodeUpstream/retryable", got)
+		}
+	})
+}
+
+func TestMergeUsage_HonoursNonZeroCacheFields(t *testing.T) {
+	prev := &ai.Usage{}
+	next := &ai.Usage{CacheReadTokens: 9, CacheWriteTokens: 3}
+	got := mergeUsage(prev, next)
+	if got.CacheReadTokens != 9 || got.CacheWriteTokens != 3 {
+		t.Errorf("got = %+v, want the newer non-zero cache fields taken", got)
+	}
+}
+
+func TestMergeUsage_NilNextReturnsPrevUnchanged(t *testing.T) {
+	prev := &ai.Usage{InputTokens: 5}
+	got := mergeUsage(prev, nil)
+	if got != prev {
+		t.Errorf("got = %+v, want the exact same prev pointer returned", got)
+	}
+}
+
+func TestMergeUsage_HonoursNonZeroInputTokens(t *testing.T) {
+	prev := &ai.Usage{InputTokens: 1, OutputTokens: 2}
+	next := &ai.Usage{InputTokens: 99}
+	got := mergeUsage(prev, next)
+	if got.InputTokens != 99 {
+		t.Errorf("InputTokens = %d, want 99 (newer non-zero value taken)", got.InputTokens)
+	}
+	if got.OutputTokens != 2 {
+		t.Errorf("OutputTokens = %d, want 2 (unchanged: next left it zero)", got.OutputTokens)
+	}
+}
+
+// TestStream_MidBodyReadFailureIsFatalUpstream deterministically forces a
+// non-cancellation read error mid-SSE-stream (via a canned Response.Body
+// that errors after its first chunk), covering sc.Err() != nil unrelated to
+// context cancellation -- unlike TestStream_CtxCancelMidBodyIsCanceled,
+// which is inherently racy about exactly when the read fails relative to
+// ctx.Done().
+type errAfterReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	return 0, r.err
+}
+
+func TestStream_MidBodyReadFailureIsFatalUpstream(t *testing.T) {
+	p := New(Config{
+		BaseURL: "https://unused.example",
+		APIKey:  "k",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			body := &errAfterReader{
+				data: []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"),
+				err:  errors.New("boom: connection reset"),
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(body),
+			}, nil
+		})},
+	})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeUpstream {
+		t.Fatalf("err = %v, want ErrCodeUpstream from the mid-body read failure", err)
+	}
+	if !aiErr.Retryable {
+		t.Error("a generic transport read failure must be retryable")
+	}
+}
+
+func TestStream_StructuredEventYieldFalseStopsIteration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"{\"a\":1}"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	req := ai.ChatRequest{ResponseSchema: json.RawMessage(`{}`)}
+	var n int
+	for ev, err := range p.Stream(context.Background(), req) {
+		n++
+		if err != nil {
+			t.Fatalf("unexpected error event: %+v", ev)
+		}
+		if ev.Type == ai.EventStructured {
+			break
+		}
+	}
+	if n == 0 {
+		t.Fatal("expected at least one event")
+	}
+}
+
+func TestStream_ToolCallEventYieldFalseStopsIteration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"noop"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}`)
+		sseWrite(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	var sawToolCall bool
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventToolCall {
+			sawToolCall = true
+			break
+		}
+	}
+	if !sawToolCall {
+		t.Fatal("expected a tool call event")
+	}
+}
+
+func TestStream_CustomHeadersSent(t *testing.T) {
+	var gotHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Custom")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k", Headers: map[string]string{"X-Custom": "hello"}})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotHeader != "hello" {
+		t.Errorf("X-Custom header = %q, want hello", gotHeader)
+	}
+}
+
+func TestDoRequest_TransportErrorNotCanceledIsRetryableUpstream(t *testing.T) {
+	p := New(Config{
+		BaseURL: "https://unused.example",
+		APIKey:  "k",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, errors.New("boom: dial failed")
+		})},
+	})
+	_, err := p.doRequest(context.Background(), []byte(`{}`), true)
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeUpstream || !aiErr.Retryable {
+		t.Fatalf("err = %v, want ai.Error{Code: ErrCodeUpstream, Retryable: true}", err)
+	}
+}
+
+func TestDoRequest_InvalidURLFromBaseURL(t *testing.T) {
+	// A control character in BaseURL makes http.NewRequestWithContext itself
+	// fail (invalid URL), before any network I/O.
+	p := New(Config{BaseURL: "http://example.com/\x7f", APIKey: "k"})
+	_, err := p.doRequest(context.Background(), []byte(`{}`), true)
+	if err == nil {
+		t.Fatal("expected an error building the request from an invalid BaseURL")
+	}
+}
+
+func TestStream_AlreadyCanceledContextYieldsCanceledBeforeRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, _, err := ai.Collect(p.Stream(ctx, ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeCanceled {
+		t.Fatalf("err = %v, want ErrCodeCanceled for an already-canceled context", err)
+	}
+}
+
+func TestHTTPStatusError_EmptyBodyFallsBackToHTTPStatusMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		// deliberately empty body: neither a JSON error nor plain text.
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) {
+		t.Fatalf("err = %v, want *ai.Error", err)
+	}
+	if aiErr.Message != "HTTP 502" {
+		t.Errorf("Message = %q, want the HTTP-status fallback \"HTTP 502\"", aiErr.Message)
+	}
+}
+
+func TestStream_SystemOnlyNoStaticContextStillCached(t *testing.T) {
+	var gotBody messagesRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "k"})
+	req := ai.ChatRequest{System: "You are helpful.", Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotBody.System) != 1 {
+		t.Fatalf("System = %+v", gotBody.System)
+	}
+	if gotBody.System[0].CacheControl == nil || gotBody.System[0].CacheControl.Type != "ephemeral" {
+		t.Errorf("System[0].CacheControl = %+v, want ephemeral even with no static context blocks", gotBody.System[0].CacheControl)
+	}
+}
+
+// TestBuildMessages_ReplayedToolUseWithMissingInputKeyGetsEmptyObject covers
+// the replay path's X1 guard: a ProviderState tool_use block whose "input"
+// key is entirely ABSENT (not merely {}) must still replay with an explicit
+// empty-object input.
+func TestBuildMessages_ReplayedToolUseWithMissingInputKeyGetsEmptyObject(t *testing.T) {
+	ps := json.RawMessage(`[{"type":"tool_use","id":"call_1","name":"noop"}]`) // no "input" key at all
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ProviderState: ps},
+		},
+	}
+	msgs := buildMessages(req)
+	var assistant *wireMessage
+	for i := range msgs {
+		if msgs[i].Role == "assistant" {
+			assistant = &msgs[i]
+		}
+	}
+	if assistant == nil || len(assistant.Content) != 1 {
+		t.Fatalf("assistant content = %+v, want the single replayed tool_use block", assistant)
+	}
+	if string(assistant.Content[0].Input) != "{}" {
+		t.Errorf("Input = %s, want an explicit empty object", assistant.Content[0].Input)
+	}
+}
+
+// TestBuildMessages_ToolCallWithNilArgumentsGetsEmptyObjectInput covers the
+// NON-replay reconstruction path's equivalent guard: an assistant ToolCall
+// with nil/empty Arguments (no ProviderState at all) must still render an
+// explicit empty-object "input" on the wire.
+func TestBuildMessages_ToolCallWithNilArgumentsGetsEmptyObjectInput(t *testing.T) {
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "noop"}}}, // Arguments left nil
+		},
+	}
+	msgs := buildMessages(req)
+	var assistant *wireMessage
+	for i := range msgs {
+		if msgs[i].Role == "assistant" {
+			assistant = &msgs[i]
+		}
+	}
+	if assistant == nil || len(assistant.Content) != 1 || assistant.Content[0].Type != "tool_use" {
+		t.Fatalf("assistant content = %+v, want a single tool_use block", assistant)
+	}
+	if string(assistant.Content[0].Input) != "{}" {
+		t.Errorf("Input = %s, want an explicit empty object for nil Arguments", assistant.Content[0].Input)
+	}
+}
+
+func TestIsToolResultMessage_EmptyContentIsFalse(t *testing.T) {
+	if isToolResultMessage(wireMessage{Role: "user"}) {
+		t.Error("isToolResultMessage(empty content) = true, want false")
+	}
+}
+
+// TestRenderDynamic_MultipleBlocksSeparatedByBlankLine covers the
+// dyn.Len()>0 separator branch: two or more dynamic blocks must be joined by
+// a blank line, not just concatenated.
+func TestRenderDynamic_MultipleBlocksSeparatedByBlankLine(t *testing.T) {
+	got := renderDynamic([]ai.ContextBlock{
+		{Kind: ai.ContextDynamic, Name: "first", Text: "block one"},
+		{Kind: ai.ContextDynamic, Name: "second", Text: "block two"},
+	})
+	if !strings.Contains(got, "block one\n\n# second") {
+		t.Errorf("got = %q, want a blank-line separator between dynamic blocks", got)
+	}
+}
