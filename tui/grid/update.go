@@ -59,16 +59,23 @@ func (m *Model) Update(msg tea.Msg) (transcript.Block, tea.Cmd) {
 		// layout's primary (table) pane keeps its own row cursor reachable
 		// even while a non-table view occupies the secondary pane, as long
 		// as secondary focus hasn't been Tab'd onto that view.
+		//
+		// This moves by POSITION within the table's own visible/filtered
+		// row set (GetHighlightedRowIndex/WithHighlightedRow), not by
+		// CurrentIndex()'s source-row arithmetic: under an active filter,
+		// adjacent visible rows are not adjacent source rows, so "current
+		// source index minus one" can land on a filtered-out row (or the
+		// wrong visible one) instead of the previous visible row.
 		if !m.secondaryFocus {
-			if i := m.CurrentIndex(); i > 0 {
-				m.SelectRow(i - 1)
+			if pos := m.table.GetHighlightedRowIndex(); pos > 0 {
+				m.table = m.table.WithHighlightedRow(pos - 1)
 			}
 			return m, nil
 		}
-	case "down":
+	case "down", "j":
 		if !m.secondaryFocus {
-			if i := m.CurrentIndex(); i >= 0 && i+1 < len(m.rows) {
-				m.SelectRow(i + 1)
+			if pos, n := m.table.GetHighlightedRowIndex(), len(m.table.GetVisibleRows()); pos >= 0 && pos+1 < n {
+				m.table = m.table.WithHighlightedRow(pos + 1)
 			}
 			return m, nil
 		}

@@ -10,8 +10,9 @@
 //
 // # Keybindings
 //
-// ↑↓/k move the row (down has no "j" binding — that key is reserved for a
-// product's own use, e.g. DataTug's join-candidate navigation); ←→/h/l
+// ↑↓/k/j move the row (a product's own WithKeyHandler is checked first and
+// can still claim "j"/"down" for its own use, e.g. DataTug's join-candidate
+// navigation, by handling it before the grid's default runs); ←→/h/l
 // select a column, auto-scrolling it into view (SelectedColumn); digit keys
 // switch views ("1" is always the table, "2".. select a registered
 // ExtraView in order); Tab toggles focus between the table and a split

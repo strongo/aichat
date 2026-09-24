@@ -1,6 +1,7 @@
 package grid
 
 import (
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -689,5 +690,134 @@ func TestWithInitialSortSeedsToggleDirection(t *testing.T) {
 	}
 	if !strings.Contains(ansi.Strip(m.View(60, true)), "sort id ↑") {
 		t.Fatalf("footer missing seeded ascending sort indicator: %q", ansi.Strip(m.View(60, true)))
+	}
+}
+
+// typeFilter opens the built-in filter (if not already open) and types text
+// into it, mirroring how a user reaches a filtered state interactively.
+func typeFilter(t *testing.T, m *Model, text string) {
+	t.Helper()
+	m.table = m.table.Focused(true)
+	if !m.table.GetIsFilterInputFocused() {
+		var cmd tea.Cmd
+		m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: "/", Code: '/'})
+		_ = cmd
+	}
+	for _, r := range text {
+		var cmd tea.Cmd
+		m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: string(r), Code: r})
+		_ = cmd
+	}
+	// Blur the filter input (Escape) so Down/Up reach the grid's own
+	// row-navigation handling instead of being consumed as filter text.
+	m.table, _ = m.table.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+}
+
+// TestRowNavigationUnderFilterMovesByVisiblePosition is the regression test
+// for the S1 bug (introduced by 65dfdfd, the up/down non-wrap fix): Update's
+// up/k/down cases computed "CurrentIndex() ± 1" — a SOURCE row index — and
+// passed it to SelectRow, which (before this fix) forwarded it straight to
+// bubble-table's WithHighlightedRow, a POSITION within the filtered/visible
+// row set. With rows 0/2/4 visible (1/3 filtered out), adjacent visible
+// positions are NOT adjacent source indices, so navigation skipped rows,
+// got stuck, or landed on a filtered-out row. Down must move by one visible
+// position (clamped, no wrap) and so must Up.
+func TestRowNavigationUnderFilterMovesByVisiblePosition(t *testing.T) {
+	cols := []Column{{Name: "name"}}
+	rows := []Row{
+		{Key: "0", Values: []any{"Alpha0"}},
+		{Key: "1", Values: []any{"Beta1"}},
+		{Key: "2", Values: []any{"Alpha2"}},
+		{Key: "3", Values: []any{"Beta3"}},
+		{Key: "4", Values: []any{"Alpha4"}},
+	}
+	m := New(cols, rows)
+	m.SetWidth(40)
+	typeFilter(t, m, "Alpha")
+	if n := len(m.table.GetVisibleRows()); n != 3 {
+		t.Fatalf("visible rows after filter = %d, want 3", n)
+	}
+
+	var got []int
+	got = append(got, m.CurrentIndex())
+	for range 3 {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		got = append(got, m.CurrentIndex())
+	}
+	for range 3 {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+		got = append(got, m.CurrentIndex())
+	}
+	want := []int{0, 2, 4, 4, 2, 0, 0}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CurrentIndex() sequence = %v, want %v", got, want)
+	}
+}
+
+// TestRebuildTablePreservesFilterAndHighlightedSource is the regression test
+// for the other half of the S1 bug: rebuildTable (called by SelectColumn/
+// SetWidth/SetFocused/Sort and anything else that reconstructs the inner
+// bubble-table) built a brand new table.Model with no filter text at all —
+// silently clearing an active filter — and then reused the OLD table's raw
+// cursor POSITION as if it were valid in the new (now unfiltered, larger)
+// visible set, landing the highlight on an arbitrary, usually wrong, row.
+func TestRebuildTablePreservesFilterAndHighlightedSource(t *testing.T) {
+	cols := []Column{{Name: "name"}}
+	rows := []Row{
+		{Key: "0", Values: []any{"Alpha0"}},
+		{Key: "1", Values: []any{"Beta1"}},
+		{Key: "2", Values: []any{"Alpha2"}},
+		{Key: "3", Values: []any{"Beta3"}},
+		{Key: "4", Values: []any{"Alpha4"}},
+	}
+	m := New(cols, rows)
+	m.SetWidth(40)
+	typeFilter(t, m, "Alpha")
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // source 0 -> source 2
+
+	for _, step := range []struct {
+		name string
+		do   func()
+	}{
+		{"SetWidth", func() { m.SetWidth(50) }},
+		{"SelectColumn (h/l)", func() { m.SelectColumn(0) }},
+		{"SetFocused", func() { m.SetFocused(!m.Focused()) }},
+		{"Sort", func() { m.Sort(0); m.Sort(0) }}, // sort then re-sort back to original order
+	} {
+		if n := len(m.table.GetVisibleRows()); n != 3 {
+			t.Fatalf("%s: visible rows before = %d, want 3", step.name, n)
+		}
+		step.do()
+		if got := m.table.GetCurrentFilter(); got != "Alpha" {
+			t.Fatalf("%s: filter text = %q, want %q (rebuild dropped it)", step.name, got, "Alpha")
+		}
+		if n := len(m.table.GetVisibleRows()); n != 3 {
+			t.Fatalf("%s: visible rows after = %d, want 3 (filter should still apply)", step.name, n)
+		}
+		if i := m.CurrentIndex(); i != 2 {
+			t.Fatalf("%s: CurrentIndex() after rebuild = %d, want 2 (highlighted source row must survive)", step.name, i)
+		}
+	}
+}
+
+// TestJKeyDefaultsToRowDownUnlessKeyHandlerClaimsIt is the regression test
+// for n8: "j" is now a default RowDown binding (see gridKeyMap), but a
+// product's WithKeyHandler is checked first and can still claim it for its
+// own purpose (e.g. DataTug's join-candidate navigation) by reporting
+// handled=true.
+func TestJKeyDefaultsToRowDownUnlessKeyHandlerClaimsIt(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.Update(tea.KeyPressMsg{Text: "j", Code: 'j'})
+	if i := m.CurrentIndex(); i != 1 {
+		t.Fatalf("CurrentIndex() after j with no KeyHandler = %d, want 1 (row moved down)", i)
+	}
+
+	m2 := New(cols, rows, WithKeyHandler(func(*Model, tea.KeyPressMsg) (tea.Cmd, bool) {
+		return nil, true // claims every key, including "j"
+	}))
+	m2.Update(tea.KeyPressMsg{Text: "j", Code: 'j'})
+	if i := m2.CurrentIndex(); i != 0 {
+		t.Fatalf("CurrentIndex() after j with a claiming KeyHandler = %d, want 0 (KeyHandler owned it)", i)
 	}
 }

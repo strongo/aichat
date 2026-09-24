@@ -305,15 +305,18 @@ func New(columns []Column, rows []Row, opts ...Option) *Model {
 func gridKeyMap() table.KeyMap {
 	km := table.DefaultKeyMap()
 	// DataTug owns column navigation (h/l select a column; the grid
-	// auto-scrolls it into view) and row navigation is up/down/k only — "j"
-	// is reserved for a product's own use (DataTug's join-candidate
-	// navigation). Paging is a real page jump (pgup/pgdown), sized by
-	// WithMaxVisibleRows; PageFirst/PageLast, h/l's own scroll bindings and
-	// row-select all have grid-owned replacements, and Enter is reserved for
-	// the grid/product (RowActivatedMsg or a KeyHandler). The filter's own
-	// bindings are unlabelled internals.
+	// auto-scrolls it into view). Row navigation defaults to up/k/down/j —
+	// "j" included, since a product's own KeyHandler is checked BEFORE this
+	// default (see Update) and can still claim it for its own purpose (e.g.
+	// DataTug's join-candidate navigation) by returning handled=true; the
+	// grid only falls back to moving the row when no KeyHandler is
+	// registered, or it declines. Paging is a real page jump (pgup/pgdown),
+	// sized by WithMaxVisibleRows; PageFirst/PageLast, h/l's own scroll
+	// bindings and row-select all have grid-owned replacements, and Enter is
+	// reserved for the grid/product (RowActivatedMsg or a KeyHandler). The
+	// filter's own bindings are unlabelled internals.
 	km.RowUp = key.NewBinding(key.WithKeys("up", "k"))
-	km.RowDown = key.NewBinding(key.WithKeys("down"))
+	km.RowDown = key.NewBinding(key.WithKeys("down", "j"))
 	km.PageUp = key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "previous page"))
 	km.PageDown = key.NewBinding(key.WithKeys("pgdown"), key.WithHelp("pgdn", "next page"))
 	km.PageFirst = key.Binding{}
@@ -326,9 +329,15 @@ func gridKeyMap() table.KeyMap {
 
 // rebuildTable reconstructs the inner bubble-table from the current
 // columns/rows/cells/selectedColumn/style, preserving horizontal scroll
-// offset. Ported from DataTug's gridState.rebuild.
+// offset, the active filter text, and the highlighted row (by its SOURCE
+// index, resolved via CurrentIndex before the old table is replaced — not
+// bubble-table's raw cursor position, which indexes the filtered/visible
+// subset and would land on the wrong row once the new table's visible set
+// differs). Ported from DataTug's gridState.rebuild.
 func (m *Model) rebuildTable() {
 	previousOffset := m.table.GetHorizontalScrollColumnOffset()
+	filterText := m.table.GetCurrentFilter()
+	highlightedSource := m.CurrentIndex()
 	columns := make([]table.Column, len(m.columns))
 	for i := range m.columns {
 		style := columnStyle(m.columns[i], i == m.selectedColumn)
@@ -349,7 +358,6 @@ func (m *Model) rebuildTable() {
 		rows[i] = table.NewRow(data)
 	}
 	focused := m.focused
-	highlighted := m.table.GetHighlightedRowIndex()
 	newTable := table.New(columns).
 		WithRows(rows).
 		WithBaseStyle(m.style.dividerStyle()).
@@ -383,15 +391,40 @@ func (m *Model) rebuildTable() {
 	if m.maxVisibleRows > 0 {
 		newTable = newTable.WithPageSize(m.maxVisibleRows)
 	}
+	if filterText != "" {
+		newTable = newTable.WithFilterInputValue(filterText)
+	}
 	if len(rows) > 0 {
-		highlighted = max(0, min(highlighted, len(rows)-1))
-		newTable = newTable.WithHighlightedRow(highlighted)
+		pos := visiblePositionForSource(newTable.GetVisibleRows(), highlightedSource)
+		if pos < 0 {
+			// The previously-highlighted row is filtered out of the new
+			// visible set (or there was none highlighted yet): fall back to
+			// the first visible row rather than an arbitrary position.
+			pos = 0
+		}
+		newTable = newTable.WithHighlightedRow(pos)
 	}
 	m.table = newTable
 	for i := 0; i < previousOffset; i++ {
 		m.table = m.table.ScrollRight()
 	}
 	m.ensureSelectedColumnVisible()
+}
+
+// visiblePositionForSource returns the bubble-table cursor position (an
+// index into rows, meant to be a GetVisibleRows() result) of the row whose
+// hidden sourceKey equals sourceIndex, or -1 if no visible row carries it
+// (e.g. it's filtered out, or sourceIndex itself is -1/out of range).
+func visiblePositionForSource(rows []table.Row, sourceIndex int) int {
+	if sourceIndex < 0 {
+		return -1
+	}
+	for i, row := range rows {
+		if src, ok := row.Data[sourceKey].(int); ok && src == sourceIndex {
+			return i
+		}
+	}
+	return -1
 }
 
 func columnKey(i int) string { return "c" + strconv.Itoa(i) }
@@ -480,14 +513,19 @@ func (m *Model) IndexForKey(key string) int {
 	return -1
 }
 
-// SelectRow highlights the row at the given display index, clamped to
-// bounds. It does not change SelectedColumn.
+// SelectRow highlights the row at the given display index (a position in
+// Model.rows/Rows(), the same index space as IndexForKey — NOT bubble-
+// table's own cursor position, which indexes the filtered/visible subset).
+// It does not change SelectedColumn. A no-op when that row is currently
+// filtered out of view.
 func (m *Model) SelectRow(index int) {
 	if len(m.rows) == 0 {
 		return
 	}
 	index = max(0, min(index, len(m.rows)-1))
-	m.table = m.table.WithHighlightedRow(index)
+	if pos := visiblePositionForSource(m.table.GetVisibleRows(), index); pos >= 0 {
+		m.table = m.table.WithHighlightedRow(pos)
+	}
 }
 
 // SelectColumn selects a column directly (as h/l do interactively),
