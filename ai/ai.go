@@ -20,6 +20,11 @@ type Role string
 const (
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
+	// RoleTool carries ToolResults answering a prior assistant ToolCalls
+	// message. Adapters translate it to whatever the provider needs (e.g.
+	// Anthropic user messages with tool_result blocks, OpenAI-compatible
+	// role:"tool" messages).
+	RoleTool Role = "tool"
 )
 
 // Message is one conversation turn. The system prompt and context travel
@@ -28,6 +33,46 @@ const (
 type Message struct {
 	Role Role   `json:"role"`
 	Text string `json:"text"`
+	// ToolCalls is set on an assistant message that invoked tools.
+	ToolCalls []ToolCall `json:"toolCalls,omitempty"`
+	// ToolResults is set on a RoleTool message answering prior ToolCalls.
+	ToolResults []ToolResult `json:"toolResults,omitempty"`
+	// ProviderState is opaque, provider-specific extra content an adapter
+	// attached to an assistant message it produced (e.g. ai/anthropic's
+	// extended-thinking/redacted-thinking blocks, signature included) and
+	// that same adapter MUST replay unmodified on a later request that
+	// includes this message — some providers 400 a tool-use continuation
+	// that drops or edits the thinking blocks from the turn that requested
+	// the tool call. Populated from Event.ProviderState (see EventCompleted)
+	// by whoever appends the assistant message (e.g. ai/agent.Loop). An
+	// adapter that doesn't understand another adapter's ProviderState MUST
+	// ignore it rather than error.
+	ProviderState json.RawMessage `json:"providerState,omitempty"`
+}
+
+// Tool is a function the model may call. Schema is the JSON Schema of the
+// arguments object (not the whole tool envelope).
+type Tool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Schema      json.RawMessage `json:"schema"`
+}
+
+// ToolCall is one invocation the model asked for, with its arguments already
+// assembled from any streamed deltas.
+type ToolCall struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+// ToolResult answers a ToolCall by CallID. Content is provider-facing text
+// (JSON-encode structured results yourself); IsError marks a tool-level
+// failure (as opposed to an infrastructure failure, which aborts the run).
+type ToolResult struct {
+	CallID  string `json:"callId"`
+	Content string `json:"content"`
+	IsError bool   `json:"isError,omitempty"`
 }
 
 // ContextKind separates stable context (instructions, schemas, skills,
@@ -85,7 +130,31 @@ type ChatRequest struct {
 	// Metadata is opaque key/value data forwarded to the cloud for diagnostics
 	// (e.g. "path": "llm-fallback"). Never put secrets or user content here.
 	Metadata map[string]string `json:"metadata,omitempty"`
+	// Tools the model may call this turn.
+	Tools []Tool `json:"tools,omitempty"`
+	// ToolChoice: "" (adapter default) | "auto" | "none" | "required" | a
+	// specific tool name.
+	ToolChoice string `json:"toolChoice,omitempty"`
+	// Reasoning requests extended/deliberate reasoning where the provider
+	// supports it: "" | "low" | "medium" | "high". Adapters map it to their
+	// own knob (OpenAI-compatible reasoning_effort, Anthropic extended
+	// thinking budget) and ignore it where unsupported.
+	Reasoning string `json:"reasoning,omitempty"`
 }
+
+// ToolChoice values for ChatRequest.ToolChoice.
+const (
+	ToolChoiceAuto     = "auto"
+	ToolChoiceNone     = "none"
+	ToolChoiceRequired = "required"
+)
+
+// Reasoning effort levels for ChatRequest.Reasoning.
+const (
+	ReasoningLow    = "low"
+	ReasoningMedium = "medium"
+	ReasoningHigh   = "high"
+)
 
 // EventType names a normalised stream event. The string values are also the
 // SSE event names of the cloud protocol (see package cloudproto).
@@ -98,6 +167,30 @@ const (
 	EventUsage      EventType = "usage"
 	EventError      EventType = "error"
 	EventCompleted  EventType = "response.completed"
+	// EventToolCall is emitted once per call, fully assembled (adapters buffer
+	// streamed argument deltas), before the terminal EventCompleted of that
+	// response.
+	EventToolCall EventType = "tool.call"
+	// EventToolResult is emitted only by ai/agent as it feeds tool results
+	// back into the loop; adapters never emit it.
+	EventToolResult EventType = "tool.result"
+)
+
+// StopReason values for Event.StopReason on EventCompleted.
+const (
+	StopReasonToolCalls = "tool_calls"
+	StopReasonEnd       = "end"
+	StopReasonLength    = "length"
+	// StopReasonRefusal: the provider's own safety layer declined to
+	// answer (e.g. Anthropic stop_reason "refusal"). Not an ai.Error --
+	// the response completed normally, just with no usable content.
+	StopReasonRefusal = "refusal"
+	// StopReasonPauseTurn: the provider paused mid-turn expecting the
+	// caller to continue the SAME turn with another request (e.g.
+	// Anthropic stop_reason "pause_turn", used with long-running
+	// server-side tools). Not a stopping point a caller should treat as
+	// "done" the way StopReasonEnd is.
+	StopReasonPauseTurn = "pause_turn"
 )
 
 // Event is one normalised stream event. Exactly the fields relevant to Type
@@ -116,16 +209,94 @@ type Event struct {
 	Usage *Usage `json:"usage,omitempty"`
 	// Error: a terminal or non-terminal provider error.
 	Error *Error `json:"error,omitempty"`
+	// ToolCall: set on EventToolCall, one fully-assembled call.
+	ToolCall *ToolCall `json:"toolCall,omitempty"`
+	// ToolResult: set on EventToolResult (ai/agent only).
+	ToolResult *ToolResult `json:"toolResult,omitempty"`
+	// StopReason: set on EventCompleted; "tool_calls" | "end" | "length".
+	StopReason string `json:"stopReason,omitempty"`
+	// ProviderState: set on EventCompleted when the adapter captured
+	// provider-specific state (e.g. ai/anthropic's thinking/
+	// redacted_thinking blocks with signatures) that MUST be attached to the
+	// assistant message this turn produces — see Message.ProviderState.
+	ProviderState json.RawMessage `json:"providerState,omitempty"`
 }
 
 // Usage is token and allowance accounting for one response.
+//
+// The fields below are populated from each adapter's native usage object,
+// and their SUBSET-VS-ADDITIVE relationship to InputTokens/OutputTokens is
+// NOT the same across adapters — summing them naively double-counts on one
+// adapter and undercounts on the other. See CacheReadTokens/
+// CacheWriteTokens/ReasoningTokens doc below for the per-adapter semantics,
+// and BillableTokens for a helper that sums correctly for a named adapter.
 type Usage struct {
-	InputTokens      int64 `json:"inputTokens,omitempty"`
-	OutputTokens     int64 `json:"outputTokens,omitempty"`
-	CacheReadTokens  int64 `json:"cacheReadTokens,omitempty"`
+	InputTokens  int64 `json:"inputTokens,omitempty"`
+	OutputTokens int64 `json:"outputTokens,omitempty"`
+	// CacheReadTokens counts tokens served from a prompt cache.
+	// ai/openaicompat populates it from
+	// usage.prompt_tokens_details.cached_tokens: this is an INFORMATIONAL
+	// SUBSET already counted inside InputTokens (OpenAI's prompt_tokens
+	// includes cached tokens; the details object only breaks out how many
+	// of them were cache hits) — do NOT add it to InputTokens. ai/anthropic
+	// populates it from usage.cache_read_input_tokens: on the Messages API
+	// this is the OPPOSITE relationship — Anthropic's input_tokens counts
+	// ONLY the tokens actually processed fresh, and cache_read_input_tokens
+	// (billed at its own, cheaper per-token rate) is NOT included in it —
+	// so for ai/anthropic, CacheReadTokens IS additive to InputTokens.
+	CacheReadTokens int64 `json:"cacheReadTokens,omitempty"`
+	// CacheWriteTokens counts tokens written to a prompt cache. Only
+	// ai/anthropic populates it, from usage.cache_creation_input_tokens —
+	// same additive relationship to InputTokens as CacheReadTokens above
+	// (billed separately, at its own higher per-token rate, and not
+	// included in input_tokens). ai/openaicompat never populates this
+	// field: OpenAI's API has no separate cache-write concept to report.
 	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
+	// ReasoningTokens counts provider-side reasoning/thinking tokens, ONLY
+	// on adapters that report them SEPARATELY from OutputTokens.
+	// ai/openaicompat populates it from
+	// usage.completion_tokens_details.reasoning_tokens when the API returns
+	// that field: this is an INFORMATIONAL SUBSET already counted inside
+	// OutputTokens (OpenAI's completion_tokens includes reasoning tokens;
+	// the details object only breaks out how many of them were spent on
+	// reasoning) — do NOT add it to OutputTokens. ai/anthropic leaves it
+	// zero: the Messages API's usage object has no separate thinking-token
+	// count — thinking tokens are already included in OutputTokens
+	// (usage.output_tokens), not broken out on top of it, so there is
+	// nothing distinct to report here without double-counting.
+	ReasoningTokens int64 `json:"reasoningTokens,omitempty"`
 	// Allowance is set by the cloud provider (ai/cloud); nil for BYOK.
 	Allowance *Allowance `json:"allowance,omitempty"`
+}
+
+// BillableTokens sums u into the total tokens the named provider actually
+// bills for this response, without double-counting a subset field (see the
+// per-field doc on Usage) against the total it is already included in.
+// provider should be the ai.LLMProvider.Name() that produced this Usage:
+//
+//   - "openai-compatible": CacheReadTokens/ReasoningTokens are
+//     informational subsets already counted inside InputTokens/
+//     OutputTokens — Total = InputTokens + OutputTokens.
+//   - "anthropic" (and any other/unrecognised provider name — see below):
+//     CacheReadTokens/CacheWriteTokens are billed separately from
+//     InputTokens/OutputTokens — Total = InputTokens + OutputTokens +
+//     CacheReadTokens + CacheWriteTokens. ReasoningTokens is not added:
+//     no current adapter populates it additively.
+//
+// An unrecognised provider name falls back to the additive (Anthropic-
+// style) formula: silently ignoring a populated Cache*Tokens field would
+// undercount real spend, which is the worse failure mode for a billing
+// total than adding a field a future adapter turns out to already include
+// (there is currently no adapter where that would happen). Prefer passing
+// the adapter's own Name() over relying on this default for a provider
+// this function doesn't know the convention of.
+func (u Usage) BillableTokens(provider string) int64 {
+	switch provider {
+	case "openai-compatible":
+		return u.InputTokens + u.OutputTokens
+	default:
+		return u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens
+	}
 }
 
 // Allowance is the caller's cloud quota after this response.

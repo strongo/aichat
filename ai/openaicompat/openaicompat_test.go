@@ -562,3 +562,379 @@ func TestStream_NoRetryAfterWaitOnLastAttempt(t *testing.T) {
 		t.Errorf("elapsed = %v, want >= ~4s (Retry-After honoured on the two non-final attempts)", elapsed)
 	}
 }
+
+// mustChunk builds one streamed chat-completion chunk carrying a single
+// argument-fragment delta.tool_calls entry at index, JSON-marshalled so
+// argument text needing escaping (quotes, braces) is never hand-escaped in a
+// test fixture.
+func mustChunk(t *testing.T, index int, argsFragment string) string {
+	t.Helper()
+	type fn struct {
+		Arguments string `json:"arguments"`
+	}
+	type tc struct {
+		Index    int `json:"index"`
+		Function fn  `json:"function"`
+	}
+	type delta struct {
+		ToolCalls []tc `json:"tool_calls"`
+	}
+	type choice struct {
+		Delta delta `json:"delta"`
+	}
+	type chunk struct {
+		Model   string   `json:"model"`
+		Choices []choice `json:"choices"`
+	}
+	b, err := json.Marshal(chunk{Model: "gpt-5", Choices: []choice{{Delta: delta{ToolCalls: []tc{{Index: index, Function: fn{Arguments: argsFragment}}}}}}})
+	if err != nil {
+		t.Fatalf("mustChunk: %v", err)
+	}
+	return string(b)
+}
+
+func TestStream_ToolCallsAssembledFromMultiChunkParallelDeltas(t *testing.T) {
+	var gotBody chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// Two parallel calls (index 0 and 1); id/name arrive on the first
+		// chunk for each index, arguments arrive concatenated across chunks.
+		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"run_dtql","arguments":""}}]}}]}`)
+		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"find_bookmarks","arguments":""}}]}}]}`)
+		sseWrite(w, mustChunk(t, 0, `{"sql":`))
+		sseWrite(w, mustChunk(t, 0, `"select 1"}`))
+		sseWrite(w, mustChunk(t, 1, `{"q":"x"}`))
+		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, Model: "gpt-5"})
+	req := ai.ChatRequest{
+		Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+		Tools: []ai.Tool{
+			{Name: "run_dtql", Description: "run a query", Schema: json.RawMessage(`{"type":"object"}`)},
+			{Name: "find_bookmarks", Schema: json.RawMessage(`{"type":"object"}`)},
+		},
+		ToolChoice: ai.ToolChoiceAuto,
+	}
+
+	var calls []ai.ToolCall
+	var stopReason string
+	for ev, err := range p.Stream(context.Background(), req) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		switch ev.Type {
+		case ai.EventToolCall:
+			calls = append(calls, *ev.ToolCall)
+		case ai.EventCompleted:
+			stopReason = ev.StopReason
+		}
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("got %d tool calls, want 2: %+v", len(calls), calls)
+	}
+	if calls[0].ID != "call_a" || calls[0].Name != "run_dtql" || string(calls[0].Arguments) != `{"sql":"select 1"}` {
+		t.Errorf("call[0] = %+v", calls[0])
+	}
+	if calls[1].ID != "call_b" || calls[1].Name != "find_bookmarks" || string(calls[1].Arguments) != `{"q":"x"}` {
+		t.Errorf("call[1] = %+v", calls[1])
+	}
+	if stopReason != ai.StopReasonToolCalls {
+		t.Errorf("StopReason = %q, want %q", stopReason, ai.StopReasonToolCalls)
+	}
+	if gotBody.ToolChoice != "auto" {
+		t.Errorf("tool_choice = %v, want auto", gotBody.ToolChoice)
+	}
+	if len(gotBody.Tools) != 2 || gotBody.Tools[0].Function.Name != "run_dtql" {
+		t.Errorf("tools = %+v", gotBody.Tools)
+	}
+}
+
+func TestStream_ToolMessagesRoundTripInRequestBody(t *testing.T) {
+	var gotBody chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, Model: "gpt-5"})
+	req := ai.ChatRequest{
+		Reasoning: ai.ReasoningHigh,
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_a", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 1"}`)}}},
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_a", Content: "1 row"}}},
+		},
+	}
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	if len(gotBody.Messages) != 3 {
+		t.Fatalf("got %d messages, want 3: %+v", len(gotBody.Messages), gotBody.Messages)
+	}
+	asst := gotBody.Messages[1]
+	if asst.Role != "assistant" || len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "call_a" || asst.ToolCalls[0].Function.Name != "run_dtql" {
+		t.Errorf("assistant message = %+v", asst)
+	}
+	toolMsg := gotBody.Messages[2]
+	if toolMsg.Role != "tool" || toolMsg.ToolCallID != "call_a" || toolMsg.Content != "1 row" {
+		t.Errorf("tool message = %+v", toolMsg)
+	}
+	if gotBody.ReasoningEffort != "high" {
+		t.Errorf("reasoning_effort = %q, want high", gotBody.ReasoningEffort)
+	}
+}
+
+// TestBuildMessages_DynamicContextStaysOnUserMessageAcrossToolTurns is the
+// r1 review's M5 regression test: dynamic context must land on the LAST
+// "user" message, never a "tool" role message, across a multi-step
+// tool-calling turn.
+func TestBuildMessages_DynamicContextStaysOnUserMessageAcrossToolTurns(t *testing.T) {
+	req := ai.ChatRequest{
+		Context: []ai.ContextBlock{{Kind: ai.ContextDynamic, Text: "it is Tuesday"}},
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "how many rows?"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "run_dtql", Arguments: json.RawMessage(`{}`)}}},
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_1", Content: "3 rows"}}},
+		},
+	}
+	msgs := buildMessages(req)
+
+	last := msgs[len(msgs)-1]
+	if last.Role != "tool" || strings.Contains(last.Content, "it is Tuesday") {
+		t.Fatalf("last message = %+v, want the untouched tool result", last)
+	}
+	first := msgs[0]
+	if first.Role != "user" || !strings.Contains(first.Content, "it is Tuesday") {
+		t.Fatalf("first message = %+v, want the dynamic context prefix", first)
+	}
+}
+
+// TestStream_ReasoningEffortRetriedOnceWithoutItOn400 is the r1 review's M1
+// regression test: on a 400 whose error mentions reasoning_effort, the
+// Provider retries once WITHOUT it, and remembers not to send it again on
+// later Stream calls against the SAME Provider instance.
+func TestStream_ReasoningEffortRetriedOnceWithoutItOn400(t *testing.T) {
+	var bodies []chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body chatRequestBody
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		bodies = append(bodies, body)
+		if body.ReasoningEffort != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'reasoning_effort'","type":"invalid_request_error"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	req := ai.ChatRequest{Reasoning: ai.ReasoningHigh, Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}
+
+	text, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if text != "ok" {
+		t.Fatalf("text = %q, want ok (the retry-without-reasoning_effort request must succeed)", text)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("got %d requests, want 2 (the 400 attempt + one retry)", len(bodies))
+	}
+	if bodies[0].ReasoningEffort != "high" {
+		t.Errorf("first request ReasoningEffort = %q, want high", bodies[0].ReasoningEffort)
+	}
+	if bodies[1].ReasoningEffort != "" {
+		t.Errorf("retry request ReasoningEffort = %q, want empty", bodies[1].ReasoningEffort)
+	}
+
+	// A SECOND Stream call on the SAME Provider must not send
+	// reasoning_effort at all -- no wasted 400 round trip.
+	bodies = nil
+	_, _, _, err = ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Collect (2nd call): %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("got %d requests on the 2nd Stream call, want 1 (remembered not to send reasoning_effort)", len(bodies))
+	}
+	if bodies[0].ReasoningEffort != "" {
+		t.Errorf("2nd call ReasoningEffort = %q, want empty (remembered from the 1st call's 400)", bodies[0].ReasoningEffort)
+	}
+}
+
+// TestStream_UnrelatedUnsupportedParameterDoesNotTriggerReasoningEffortRetry
+// is r2's m3 regression test: a 400 naming some OTHER unsupported parameter
+// must NOT be treated as a reasoning_effort rejection -- the old, broader
+// "unsupported parameter" substring match would have retried (and
+// permanently disabled reasoning_effort) for the wrong reason.
+func TestStream_UnrelatedUnsupportedParameterDoesNotTriggerReasoningEffortRetry(t *testing.T) {
+	var bodies []chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body chatRequestBody
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		bodies = append(bodies, body)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'frequency_penalty'","type":"invalid_request_error"}}`))
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	req := ai.ChatRequest{Reasoning: ai.ReasoningHigh, Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}
+
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err == nil {
+		t.Fatal("Collect: want an error (the 400 is unrelated to reasoning_effort and must not be retried into success)")
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("got %d requests, want 1 (no retry for an unrelated unsupported parameter)", len(bodies))
+	}
+	if bodies[0].ReasoningEffort != "high" {
+		t.Errorf("request ReasoningEffort = %q, want high (never sent, so no reason to have dropped it)", bodies[0].ReasoningEffort)
+	}
+}
+
+// TestStream_ReasoningEffortUnsupportedRememberedPerModel is r2's m3
+// regression test: the Provider remembers a reasoning_effort rejection per
+// MODEL, not for the whole Provider instance -- a later Stream call naming a
+// DIFFERENT model must still try reasoning_effort.
+func TestStream_ReasoningEffortUnsupportedRememberedPerModel(t *testing.T) {
+	var bodies []chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body chatRequestBody
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		bodies = append(bodies, body)
+		if body.ReasoningEffort != "" && body.Model == "model-a" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'reasoning_effort'","type":"invalid_request_error"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL})
+	reqA := ai.ChatRequest{Model: "model-a", Reasoning: ai.ReasoningHigh, Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}
+	reqB := ai.ChatRequest{Model: "model-b", Reasoning: ai.ReasoningHigh, Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}
+
+	if _, _, _, err := ai.Collect(p.Stream(context.Background(), reqA)); err != nil {
+		t.Fatalf("Collect (model-a): %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("got %d requests for model-a, want 2 (400 + retry)", len(bodies))
+	}
+
+	bodies = nil
+	if _, _, _, err := ai.Collect(p.Stream(context.Background(), reqB)); err != nil {
+		t.Fatalf("Collect (model-b): %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("got %d requests for model-b, want 1", len(bodies))
+	}
+	if bodies[0].ReasoningEffort != "high" {
+		t.Errorf("model-b ReasoningEffort = %q, want high (model-a's rejection must not carry over to a different model)", bodies[0].ReasoningEffort)
+	}
+}
+
+func TestStream_ToolCallMissingIDGetsSynthesized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"noop","arguments":"{}"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	var call *ai.ToolCall
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventToolCall {
+			call = ev.ToolCall
+		}
+	}
+	if call == nil || call.ID == "" {
+		t.Fatalf("call = %+v, want a synthesized non-empty ID", call)
+	}
+}
+
+// TestStream_ToolCallsWithoutIndexKeyedByIDAssembleAsSeparateCalls covers r1's
+// M9: a provider that omits `index` on delta.tool_calls chunks must not have
+// two parallel calls collapse into one just because they share the default
+// index. A new non-empty id distinct from the call being assembled starts a
+// new call; a chunk with no id (or the same id) keeps appending to it.
+func TestStream_ToolCallsWithoutIndexKeyedByIDAssembleAsSeparateCalls(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"nyc\"}"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"get_time","arguments":"{\"city\":"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"nyc\"}"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	var calls []ai.ToolCall
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventToolCall {
+			calls = append(calls, *ev.ToolCall)
+		}
+	}
+	if len(calls) != 2 {
+		t.Fatalf("calls = %+v, want 2 separate calls, not merged into one", calls)
+	}
+	if calls[0].ID != "call_a" || calls[0].Name != "get_weather" || string(calls[0].Arguments) != `{"city":"nyc"}` {
+		t.Errorf("calls[0] = %+v", calls[0])
+	}
+	if calls[1].ID != "call_b" || calls[1].Name != "get_time" || string(calls[1].Arguments) != `{"city":"nyc"}` {
+		t.Errorf("calls[1] = %+v", calls[1])
+	}
+}
+
+func TestBuildMessages_EmptyToolCallArgumentsBecomeEmptyObject(t *testing.T) {
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "noop"}}},
+		},
+	}
+	msgs := buildMessages(req)
+	asst := msgs[1]
+	if len(asst.ToolCalls) != 1 || asst.ToolCalls[0].Function.Arguments != "{}" {
+		t.Fatalf("assistant tool call = %+v, want arguments \"{}\"", asst.ToolCalls)
+	}
+}

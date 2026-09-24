@@ -98,6 +98,12 @@ func WithMarkdownRenderer(r MarkdownRenderer) Option {
 	return func(m *Model) { m.markdownRenderer = r }
 }
 
+// SetMarkdownRenderer sets the renderer used for entries with Markdown set,
+// after construction (New's caller may not own the Model's own construction
+// call, e.g. tui/chatshell, which builds a *Model itself and exposes this
+// via its own WithMarkdownRenderer Option).
+func (m *Model) SetMarkdownRenderer(r MarkdownRenderer) { m.markdownRenderer = r }
+
 // Model is the transcript viewport: an ordered list of Entry plus a
 // bubbles/viewport rendering them, a focus index over focusable entries
 // ("stops"), and the DataTug ensureBlockVisible scrolling behaviour.
@@ -141,6 +147,42 @@ func (m *Model) Append(e Entry) {
 	m.Rebuild(m.shouldAutoFollow())
 }
 
+// ReplaceBlock replaces the Block of the entry identified by id in place
+// (same position, same ID), e.g. to refresh or re-run a grid without
+// disturbing surrounding transcript order or focus. It is a no-op if no
+// entry has that ID.
+func (m *Model) ReplaceBlock(id string, b Block) {
+	for i := range m.entries {
+		if m.entries[i].ID != "" && m.entries[i].ID == id {
+			// A Block swap can change Focusable()'s answer for this entry,
+			// which shifts what every stop index AFTER it maps to (Stops()/
+			// entryIndexForStop count only focusable entries) -- and that
+			// shift can move the CURRENTLY focused entry's stop even when
+			// it isn't the one being replaced. So: remember which entry (by
+			// ID, not raw index) holds focus before the swap, and re-resolve
+			// its stop afterward, whether or not it was id itself.
+			var focusedID string
+			if fe := m.FocusedEntry(); fe != nil {
+				focusedID = fe.ID
+			}
+			m.entries[i].Block = b
+			m.entries[i].renderValid = false
+			if focusedID != "" {
+				m.focusIndex = m.StopForID(focusedID)
+			}
+			m.Rebuild(m.shouldAutoFollow())
+			return
+		}
+	}
+}
+
+// Clear removes every entry and clears focus.
+func (m *Model) Clear() {
+	m.entries = nil
+	m.focusIndex = -1
+	m.Rebuild(false)
+}
+
 // AppendDelta appends text to the streaming entry identified by id, creating
 // it (as an assistant entry) on first use. It is the transcript half of
 // tui/stream's channel re-arm pattern: each EventMsg's text delta lands here.
@@ -157,6 +199,39 @@ func (m *Model) AppendDelta(id, text string) {
 	}
 	m.entries = append(m.entries, Entry{ID: id, Role: RoleAssistant, Text: text})
 	m.Rebuild(m.shouldAutoFollow())
+}
+
+// AppendDeltaNoRender is AppendDelta's text-only half: it appends text to
+// the entry identified by id (creating it, as an assistant entry, on first
+// use, same as AppendDelta) but leaves its cached render untouched and does
+// NOT Rebuild the viewport. It exists for a caller (chatshell's
+// StartStreamMarkdown) that wants to throttle an expensive re-render (e.g.
+// re-running a markdown renderer) to less than once per delta while still
+// accumulating every delta's text immediately; pair it with
+// InvalidateAndRebuild once per throttle window, and always at least once
+// more when the stream completes.
+func (m *Model) AppendDeltaNoRender(id, text string) {
+	for i := range m.entries {
+		if m.entries[i].ID != "" && m.entries[i].ID == id {
+			m.entries[i].Text += text
+			return
+		}
+	}
+	m.entries = append(m.entries, Entry{ID: id, Role: RoleAssistant, Text: text})
+}
+
+// InvalidateAndRebuild forces the entry identified by id to re-render on the
+// next Rebuild (which this also triggers), picking up whatever text
+// AppendDeltaNoRender has accumulated since the last render. A no-op if no
+// entry has that id.
+func (m *Model) InvalidateAndRebuild(id string) {
+	for i := range m.entries {
+		if m.entries[i].ID != "" && m.entries[i].ID == id {
+			m.entries[i].renderValid = false
+			m.Rebuild(m.shouldAutoFollow())
+			return
+		}
+	}
 }
 
 // shouldAutoFollow reports whether new content should scroll the viewport to
@@ -189,6 +264,26 @@ func (m *Model) entryIndexForStop(stop int) int {
 			if n == stop {
 				return i
 			}
+		}
+	}
+	return -1
+}
+
+// StopForID returns the focus-ring stop index of the focusable entry
+// identified by id, or -1 if there is no such entry, or it isn't focusable
+// (e.g. DataTug's Ctrl+G "jump to latest grid").
+func (m *Model) StopForID(id string) int {
+	if id == "" {
+		return -1
+	}
+	stop := -1
+	for _, e := range m.entries {
+		if !e.focusable() {
+			continue
+		}
+		stop++
+		if e.ID == id {
+			return stop
 		}
 	}
 	return -1

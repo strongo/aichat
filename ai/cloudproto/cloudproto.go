@@ -168,7 +168,8 @@ func ReadEvents(r io.Reader) iter.Seq2[ai.Event, error] {
 
 func known(t ai.EventType) bool {
 	switch t {
-	case ai.EventStarted, ai.EventTextDelta, ai.EventStructured, ai.EventUsage, ai.EventError, ai.EventCompleted:
+	case ai.EventStarted, ai.EventTextDelta, ai.EventStructured, ai.EventUsage, ai.EventError, ai.EventCompleted,
+		ai.EventToolCall, ai.EventToolResult:
 		return true
 	}
 	return false

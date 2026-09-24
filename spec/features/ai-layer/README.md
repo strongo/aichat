@@ -11,7 +11,7 @@ status: Draft
 
 ## Summary
 
-The shared, product-neutral AI provider layer under `github.com/strongo/aichat`: the streaming event model and `LLMProvider` contract (`ai`), a decision chain of pluggable `decision.Provider`s including a deterministic rule engine (`ai/decision/rules`) and a single-inference LLM decider (`ai/decision/llmdecider`), three concrete providers (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`), a context manager that keeps a provider-cacheable prompt prefix stable (`ai/ctxmgr`), product-facing config that wires cloud vs. BYOK independently for chat and decision (`ai/aiconfig`), and diagnostics (`ai/diag`). It is consumed first by Sneat's chat MVP and by DataTug.
+The shared, product-neutral AI provider layer under `github.com/strongo/aichat`: the streaming event model and `LLMProvider` contract (`ai`), tool calling and extended-reasoning support across the adapters plus a tool-calling agent loop (`ai/agent`), a decision chain of pluggable `decision.Provider`s including a deterministic rule engine (`ai/decision/rules`) and a single-inference LLM decider (`ai/decision/llmdecider`), three concrete providers (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`), a context manager that keeps a provider-cacheable prompt prefix stable (`ai/ctxmgr`), product-facing config that wires cloud vs. BYOK independently for chat and decision (`ai/aiconfig`), and diagnostics (`ai/diag`). It is consumed first by Sneat's chat MVP and by DataTug (whose chat agent and tool-calling migrated onto `ai/agent` and the adapters' tool support).
 
 ## Problem
 
@@ -68,6 +68,48 @@ Adapters (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`) MUST bound retries with
 #### REQ: http-error-mapping
 
 Every HTTP-backed adapter (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`) MUST map HTTP 401/403 to `ai.ErrCodeAuth`, 429 to `ai.ErrCodeRateLimited` (retryable), 5xx to `ai.ErrCodeUpstream` (retryable), and other non-2xx to `ai.ErrCodeInvalid`. `ai/cloud` additionally treats 429/5xx as retryable from the STATUS CODE even when a decoded `cloudproto.ErrorResponse` body left its own `retryable` field false/absent.
+
+### Tool calling, reasoning and the agent loop
+
+#### REQ: tool-calling-additive-contract
+
+`ai.Tool`/`ai.ToolCall`/`ai.ToolResult`, `ai.RoleTool`, `Message.ToolCalls`/`Message.ToolResults`/`Message.ProviderState`, `ChatRequest.Tools`/`ChatRequest.ToolChoice`/`ChatRequest.Reasoning`, `EventToolCall`/`EventToolResult`, `Event.StopReason`/`Event.ProviderState`, and `Usage.ReasoningTokens` MUST be additive to the existing `ai` contract: every field is new or `omitempty`, so a caller that never sets `Tools` sees byte-identical request/event shapes to before this feature. `EventToolCall` MUST carry one FULLY ASSEMBLED `ai.ToolCall` with a NON-EMPTY `ID` -- an adapter that streamed no id (or an empty one) for a call MUST synthesize a stable, unique one rather than pass `""` through (Handler dispatch and `ToolResult.CallID` pairing both key off it). A response that ends with tool calls MUST still end with a single `EventCompleted`, additionally carrying `StopReason: "tool_calls"`; `StopReason` also carries `"refusal"`/`"pause_turn"` when a provider reports them (`ai/anthropic`'s `stop_reason`) rather than folding them into `"end"`.
+
+#### REQ: tool-call-streaming-assembly
+
+`ai/openaicompat` MUST assemble `delta.tool_calls` chunks by array `index` (id/name arrive on the first chunk for that index, `arguments` arrive concatenated across subsequent chunks) into one `EventToolCall` per call, emitted after the last content chunk and before the terminal `EventCompleted`. Some OpenAI-compatible providers omit `index` entirely on `delta.tool_calls` chunks; for those, `ai/openaicompat`'s assembler MUST key on a synthetic per-call slot instead, starting a NEW call whenever a chunk carries a non-empty `id` that differs from the call currently being assembled in that no-index slot, and otherwise (empty `id`, or the same `id` repeated) continuing to append `arguments` to it -- so two parallel no-index calls never collapse into one just because both default to index 0. `ai/anthropic` MUST assemble `content_block_start` (`type: tool_use`, carrying `id`/`name`) plus `input_json_delta` chunks on `content_block_delta` the same way, by block `index` (the Messages API always sends an explicit index, so no no-index fallback is needed there). A response that stops with reason `"length"` (truncated) while at least one tool call is still open MUST be reported as a FATAL error instead of emitting that call's (possibly incomplete/invalid-JSON) `EventToolCall` -- a truncated argument fragment is not safe to hand to any consumer.
+
+#### REQ: tool-messages-on-the-wire
+
+`ai/openaicompat` MUST render an assistant `Message.ToolCalls` as `tool_calls` on an `assistant` wire message and a `RoleTool` message's `ToolResults` as one `role:"tool"` wire message PER result (`tool_call_id` set, content prefixed `"Error: "` when `IsError`). `ai/anthropic` MUST render `Message.ToolCalls` as `tool_use` content blocks on an `assistant` wire message and `ToolResults` as `tool_result` content blocks on a `user` wire message, MERGING every consecutive `RoleTool` source message into ONE wire `user` message (Anthropic requires all `tool_result` blocks answering one assistant turn to arrive together). Either adapter, rendering a `ToolCall` whose `Arguments` is empty, MUST send `"{}"` (an empty JSON object), never an empty string. Dynamic context (`ai.ContextDynamic` blocks) MUST be spliced onto the LAST genuine "user" TEXT message specifically -- NEVER a `role:"tool"` (`ai/openaicompat`) or a tool_result-carrying `role:"user"` (`ai/anthropic`) message, which would both corrupt that message and make the splice point drift with every step of a multi-step tool-calling turn (breaking prompt-cache stability); with no such message, dynamic context is dropped rather than corrupting whatever IS last.
+
+#### REQ: reasoning-maps-to-provider-knob
+
+`ai/anthropic` MUST derive the request's thinking mode from the MODEL ID: Claude 4.6+ family models (Opus 4.6/4.7/4.8/5/5.5, Sonnet 4.6/5, Fable 5/5.1; an unrecognised/future id defaults the same way) use ADAPTIVE thinking (`thinking: {type: "adaptive"}` plus `output_config: {effort: <ChatRequest.Reasoning>}`, no `budget_tokens`); Haiku 4.5, any pre-4.6 Sonnet/Opus, and every Claude 3.x id (m4, r2 review: `claude-3-7-sonnet`, `claude-3-5-haiku`, `claude-3-opus`, `claude-3-5-sonnet`, `claude-3-sonnet`, `claude-3-haiku`, and any other `claude-3[-<minor>]-<family>`-shaped id -- these put the family AFTER the version, so they never match the "claude-<family>-<major>[-<minor>]" id shape the 4.6+ detection uses, and MUST NOT fall through to that detection's "unrecognised id" adaptive default, since adaptive thinking never existed for Claude 3.x) use the LEGACY form (`thinking: {type: "enabled", budget_tokens: 1024/4096/16000}` for low/medium/high). `ai/openaicompat` maps `ChatRequest.Reasoning` to `reasoning_effort` (set only when non-empty). Neither form may ever raise `MaxTokens` above what the CALLER explicitly set (`ChatRequest.MaxTokens != 0`) -- only when the caller left it unset may the adapter pick a larger default. When the caller leaves `MaxTokens` unset, `ai/anthropic`'s default MUST be raised in two cases: (1) thinking is REQUESTED (`ChatRequest.Reasoning` names a budget level) -- 16000 for adaptive thinking, and for the legacy form, the requested budget + 4096 capped at 16000 (except the cap MUST NOT drop the default AT or below the budget itself, since Anthropic requires `budget_tokens < max_tokens` -- a "high" budget of 16000 therefore gets `budget + 1024` even though that exceeds the nominal cap); and (2) the model is in the ADAPTIVE-THINKING family (N3 remainder, r3 review: `thinkingModeAdaptive(model)` true) REGARDLESS of `Reasoning` -- these models (Opus 5/5.5, Sonnet 5, Fable 5/5.1, and any other id this adapter classifies as adaptive) think BY DEFAULT even when `Reasoning` is `""`; omitting `thinking` does not disable it on them, it only leaves depth at the API's own default. This second case is NOT gated on `Reasoning` naming a budget level -- `reasoningBudgets` has no `""` entry, so a naive "only when thinking is requested" reading would leave `Reasoning: ""` on an adaptive model at `defaultMax` (2048), almost no room to answer after the model's default-on reasoning. On the legacy form, when the caller's `MaxTokens` would not clear the requested budget, `ai/anthropic` MUST shrink the budget to fit (floored at 1024) rather than raise `MaxTokens`; when the caller's `MaxTokens` is set below 2048 (too little room for a useful budget under that ceiling), thinking is DISABLED entirely instead. Thinking/signature deltas from `ai/anthropic` MUST NOT be emitted as `EventTextDelta` -- they are dropped from the text stream (they are still captured -- see REQ: anthropic-thinking-block-replay). `ai/openaicompat`, on a 400 whose error message specifically NAMES the `reasoning_effort` field (snake_case or camelCase, case-insensitive -- m3, r2 review: NOT the generic phrase "unsupported parameter", which is too broad and would misattribute an unrelated 400 to `reasoning_effort`), MUST retry the SAME request once, before any byte of a response was seen, WITHOUT that field, and remember (per MODEL, not per `*Provider` instance -- m3: a `Provider` can be reused across requests naming different models, and support for the field is a property of the model/deployment) not to send it again for that model on later `Stream` calls.
+
+#### REQ: anthropic-thinking-block-replay
+
+Anthropic requires the ENTIRE content array of the LAST assistant turn that contains `tool_use` -- every block, in the order the API returned them (thinking/redacted_thinking/text/tool_use, however they were interleaved) -- to be replayed BYTE-FAITHFUL on the next request that includes that turn; this applies to plain extended thinking, not only the interleaved-thinking beta, and omitting or reordering it 400s the following request. `ai.Message` gains an ADDITIVE, opaque `ProviderState json.RawMessage` field for this: `ai/anthropic.Provider.Stream` MUST capture EVERY content block it streams (not only thinking/redacted_thinking -- text and tool_use too), including a `thinking` block's `thinking` text with NO `omitempty` (a `display:"omitted"` block's empty `""` text MUST round-trip as an explicit empty string, never be dropped from the captured or replayed JSON), and surface them, JSON-encoded in stream order, as `ai.Event.ProviderState` on the terminal `EventCompleted`. A captured `tool_use` block's `input` MUST default to `{}` (X1, r2 review) both when captured (a no-argument tool call streams zero `input_json_delta` chunks, leaving the accumulated arguments empty) AND when replayed (defensively, for a `ProviderState` captured before this fix or relayed from a foreign origin) -- omitting `input` from the wire entirely 400s, since Anthropic requires the key even for an empty object. A captured/replayed `text` block with empty text is dropped rather than replayed (N1, r2 review): Anthropic rejects `{"type":"text","text":""}`.
+
+`ai/anthropic.buildMessages`, when an assistant `ai.Message.ProviderState` is set, unmarshals to at least one block of a KNOWN type (`thinking`, `redacted_thinking`, `text`, `tool_use` -- anything else is filtered out, e.g. a foreign block relayed through `ai/cloud` from an origin this adapter doesn't fully trust), AND the message is WITHIN THE CURRENT TOOL-CALLING LOOP (N2 ruling, r2 review: strictly AFTER the last `ai.RoleUser` message in `ChatRequest.Messages` -- an assistant turn from an EARLIER loop, even one still carrying a `ProviderState`, is rebuilt from `Text`/`ToolCalls` instead, WITHOUT its thinking blocks), MUST use that `ProviderState` AS the ENTIRE wire content for that message VERBATIM, replacing (not merging with) whatever would otherwise have been rebuilt from `Text`/`ToolCalls`; a `ProviderState` that fails to unmarshal, unmarshals to zero known blocks, or belongs to an earlier loop, falls back to that legacy reconstruction instead. Anthropic's replay requirement is scoped to the turn that led to the CURRENT `tool_use`, not the entire conversation history, so this scoping also keeps a later turn's dynamic-context edit from ever landing ahead of (or "inside") an earlier turn's replayed thinking block. `ai/openaicompat` MUST ignore `Message.ProviderState`/`Event.ProviderState` entirely (it never reads or writes the field, so the current-loop-only scoping does not apply to it). Whoever appends an assistant tool-call message to a transcript across steps (`ai/agent.Loop`) MUST carry `Event.ProviderState` from that step's terminal `EventCompleted` onto the `ai.Message.ProviderState` it appends -- EXCEPT for a genuinely empty final turn (N1, r2 review: no text, no tool calls, and no `ProviderState` payload -- e.g. a refusal, or an empty `end_turn`), which MUST NOT be appended to the transcript at all, and a message with no surviving content after these rules (N1) MUST be dropped from the wire entirely rather than sent with an empty content array.
+
+#### REQ: usage-billable-tokens-per-adapter
+
+`ai.Usage`'s `CacheReadTokens`/`CacheWriteTokens`/`ReasoningTokens` fields have a DIFFERENT relationship to `InputTokens`/`OutputTokens` on each adapter, and naively summing all of them double-counts on one adapter and undercounts on the other -- this MUST be documented precisely on `Usage` itself, per field, not left to be discovered from adapter source. On `ai/openaicompat`: `usage.prompt_tokens_details.cached_tokens` (-> `CacheReadTokens`) and `usage.completion_tokens_details.reasoning_tokens` (-> `ReasoningTokens`) are INFORMATIONAL SUBSETS already counted inside `usage.prompt_tokens`/`usage.completion_tokens` (-> `InputTokens`/`OutputTokens`) -- OpenAI's totals include cached and reasoning tokens, the `*_details` objects only break out how many of the total were which; ai/openaicompat MUST NOT add them to `InputTokens`/`OutputTokens`. On `ai/anthropic`: `usage.cache_read_input_tokens`/`usage.cache_creation_input_tokens` (-> `CacheReadTokens`/`CacheWriteTokens`) are billed SEPARATELY, at their own per-token rates, and are NOT included in `usage.input_tokens` (-> `InputTokens`) -- they ARE additive. `ai.Usage.BillableTokens(provider string) int64` MUST sum correctly for a named adapter (`provider` matching that adapter's `ai.LLMProvider.Name()`): `InputTokens + OutputTokens` for `"openai-compatible"` (no addition of the subset fields); `InputTokens + OutputTokens + CacheReadTokens + CacheWriteTokens` for `"anthropic"` and any unrecognised provider name (the additive formula is the fallback, since silently dropping a populated `Cache*Tokens` field undercounts real spend more than the (currently nonexistent) case of a future adapter where adding it would double-count).
+
+#### REQ: cloudproto-and-cloud-pass-tools-through
+
+`ai/cloud` MUST pass `ChatRequest.Tools`/`ToolChoice`/`Reasoning` and `Message.ToolCalls`/`ToolResults`/`ProviderState` through unchanged (it marshals the whole `ai.ChatRequest`/`ai.Event`). `cloudproto.ReadEvents` MUST treat `tool.call` and `tool.result` as known event types (not silently dropped as unknown).
+
+#### REQ: agent-loop-contract
+
+`ai/agent.Loop` (`Provider ai.LLMProvider`, `Handlers map[string]Handler`, `MaxSteps` default 8, `MaxToolCalls` default 16) MUST hold NO mutable run state of its own -- a `Loop` VALUE (not just a pointer) MUST be safely copyable and independently reusable across concurrent `Run`/`RunWithTranscript` calls (no embedded `sync.Mutex`, no shared transcript field). It MUST itself implement `ai.LLMProvider` (`Name() "agent"`). `Loop.Run` MUST stream every step's events in order (text deltas, `tool.call`, `tool.result`, usage), append the assistant's tool-call message (its own accumulated `Text` alongside `ToolCalls`, plus `ProviderState`) and a `RoleTool` result message to its OWN copy of `req.Messages` between steps, and end with EXACTLY ONE final `EventCompleted` carrying the SUMMED usage across every step -- never a `EventCompleted` per step. A step with no tool calls ends the run, and its OWN text/`ProviderState` MUST be appended as a final assistant message too (not silently dropped from the transcript). A forced `ChatRequest.ToolChoice` (`"required"`, or a specific tool name) MUST apply ONLY to the first step; every later step resets it to `"auto"` so the model can naturally stop calling tools. Multiple tool calls returned in one step (parallel calls) MUST be executed SEQUENTIALLY, in the order the model returned them. `Loop.RunWithTranscript(ctx, req)` returns `(iter.Seq2[ai.Event, error], func() []ai.Message)`: the accessor returns the full transcript (including tool-call/tool-result messages, and the final assistant message) accumulated by THAT run so far, safe to call concurrently with draining the iterator; `Loop.Run` is `RunWithTranscript` with the accessor discarded, for callers that only need the events.
+
+#### REQ: agent-loop-error-handling
+
+A `Handler` returning a non-nil error is an infrastructure failure and MUST abort the `Run`: it is reported as a FATAL `ai.Error` pair (`ai.ErrCodeUpstream`, wrapping the handler's error), exactly like exceeding `MaxSteps`/`MaxToolCalls` (`ai.Error{Code: "limit"}`) or a cancelled `ctx` (checked before each step and before/after each tool call, yielding the fatal `ai.ErrCodeCanceled` pair) -- see the fatal-pair contract, REQ: fatal-error-contract. In all three abort cases, every tool call already issued in that step -- the one that failed/was cut off, and every call after it that never ran -- MUST still be synthesized as an `ai.ToolResult{IsError: true}` and appended as one `RoleTool` message before the fatal pair is yielded, so the persisted transcript stays a valid, replayable conversation even though the `Run` itself does not continue.
+
+By contrast, a TOOL-level failure -- no handler registered for the call's tool name, or a `Handler` panicking (recovered) -- is NOT an infrastructure failure and MUST NOT abort the `Run`: it becomes an `ai.ToolResult{IsError: true}` fed back to the model, and the loop continues to the next step. Invalid JSON in a tool call's `Arguments` is likewise non-fatal: it becomes an `IsError` result without ever invoking the handler.
 
 ### Decision chain
 
@@ -303,11 +345,117 @@ A BYOK adapter (`ai/openaicompat` or `ai/anthropic`, selected by `BYOK.Protocol`
 **When** it is JSON-marshalled and logged via `diag.Log`
 **Then** the sentinel appears in neither the marshalled JSON nor the log output, no field name matches `text`, `message`, or a raw key/secret pattern, and `diag.Log` emits at `slog.LevelDebug`
 
+### AC: tool-calls-assembled-from-multi-chunk-parallel-deltas
+**Requirements:** ai-layer#req:tool-call-streaming-assembly
+
+**Given** a fixture streaming two parallel tool calls, each with its arguments split across multiple delta chunks (by index)
+**When** `ai/openaicompat.Provider.Stream` or `ai/anthropic.Provider.Stream` is ranged to completion
+**Then** exactly two `EventToolCall` events are yielded, each carrying a complete `ai.ToolCall` with concatenated `Arguments`, before the terminal `EventCompleted` carrying `StopReason: "tool_calls"`
+
+### AC: tool-calls-without-index-keyed-by-id-assemble-separately
+**Requirements:** ai-layer#req:tool-call-streaming-assembly
+
+**Given** a fixture streaming two parallel tool calls' `delta.tool_calls` chunks with NO `index` field at all, distinguished only by each call's first chunk carrying a distinct non-empty `id`
+**When** `ai/openaicompat.Provider.Stream` is ranged to completion
+**Then** exactly two `EventToolCall` events are yielded, each with the correct `Name` and concatenated `Arguments` for its own call -- they are never merged into one
+
+### AC: tool-messages-round-trip-in-request-body
+**Requirements:** ai-layer#req:tool-messages-on-the-wire
+
+**Given** an `ai.ChatRequest` whose `Messages` include an assistant message with `ToolCalls` and a `RoleTool` message with `ToolResults`
+**When** `ai/openaicompat` or `ai/anthropic` builds the outbound request body
+**Then** the wire body carries the tool call(s) and result(s) in that adapter's native shape (openaicompat: `tool_calls` + one `role:"tool"` message per result; anthropic: `tool_use` + `tool_result` content blocks, with consecutive `RoleTool` source messages merged into one wire message)
+
+### AC: reasoning-sets-thinking-budget-above-max-tokens
+**Requirements:** ai-layer#req:reasoning-maps-to-provider-knob
+
+**Given** `ChatRequest.Reasoning: "medium"` and `MaxTokens` left UNSET (the caller gave no explicit ceiling)
+**When** `ai/anthropic` builds the request
+**Then** `thinking` is `{type: "enabled", budget_tokens: 4096}` and the request's `MaxTokens` is raised strictly above 4096 (per N3, to `4096 + 4096 = 8192`); separately, `ai/openaicompat` sets `reasoning_effort: "medium"` and omits the field entirely when `Reasoning` is unset. (When the caller DOES set an explicit `MaxTokens`, see legacy-thinking-never-raises-caller-max-tokens-shrinks-budget-instead -- it is never raised, only the budget shrinks to fit.)
+
+### AC: billable-tokens-sums-correctly-per-adapter
+**Requirements:** ai-layer#req:usage-billable-tokens-per-adapter
+
+**Given** an `ai.Usage{InputTokens: 100, OutputTokens: 50, CacheReadTokens: 20, CacheWriteTokens: 5, ReasoningTokens: 10}`
+**When** `BillableTokens("openai-compatible")`, `BillableTokens("anthropic")`, and `BillableTokens("some-unrecognised-provider")` are each called
+**Then** `"openai-compatible"` returns 150 (`InputTokens + OutputTokens` only -- the subset fields are not added); `"anthropic"` and the unrecognised provider both return 175 (`InputTokens + OutputTokens + CacheReadTokens + CacheWriteTokens`); separately, with `CacheReadTokens`/`CacheWriteTokens` both zero, both provider names agree exactly
+
+### AC: legacy-thinking-default-max-tokens-is-budget-plus-4096-capped-16000
+**Requirements:** ai-layer#req:reasoning-maps-to-provider-knob
+
+**Given** `ai/anthropic` targeting a legacy (Haiku 4.5 / pre-4.6 / Claude 3.x) model with `Reasoning` set and `MaxTokens` left unset
+**When** the request is built for low/medium/high `Reasoning`
+**Then** `MaxTokens` is the budget (1024/4096/16000) plus 4096, capped at 16000, EXCEPT that the cap never drops `MaxTokens` at or below the budget itself (so "high" gets `budget + 1024` = 17024, not the nominal 16000 cap); separately, adaptive thinking with `MaxTokens` left unset defaults `MaxTokens` to 16000
+
+### AC: adaptive-model-defaults-max-tokens-even-with-reasoning-unset
+**Requirements:** ai-layer#req:reasoning-maps-to-provider-knob
+
+**Given** `ai/anthropic` targeting `claude-opus-5` (adaptive-thinking family) with `Reasoning` left `""` and `MaxTokens` left unset
+**When** the request is built
+**Then** `MaxTokens` is 16000 (not `defaultMax`'s 2048) and no explicit `thinking`/`output_config` is sent, since `Reasoning` was never requested -- only the `MaxTokens` default changes
+
+### AC: reasoning-effort-retry-matches-field-name-only-remembered-per-model
+**Requirements:** ai-layer#req:reasoning-maps-to-provider-knob
+
+**Given** an `ai/openaicompat.Provider`, and separately a 400 whose message names `reasoning_effort`/`reasoningEffort` and one whose message names an unrelated field (e.g. "unsupported parameter: 'frequency_penalty'")
+**When** each `Stream` call is made, and separately two `Stream` calls on the same `Provider` name different models
+**Then** only the `reasoning_effort`-naming 400 triggers the one-time retry-without-it (the unrelated 400 does not, and is not retried); the "don't send it again" memory is keyed per model, so a rejection learned for one model does not suppress `reasoning_effort` on a different model
+
+### AC: claude-3x-ids-use-legacy-thinking-not-the-unrecognised-id-default
+**Requirements:** ai-layer#req:reasoning-maps-to-provider-knob
+
+**Given** a Claude 3.x model id in the older "claude-3[-<minor>]-<family>" shape (`claude-3-7-sonnet`, `claude-3-5-haiku`, `claude-3-opus`, `claude-3-5-sonnet`, `claude-3-sonnet`, `claude-3-haiku`, with or without a dated snapshot suffix)
+**When** `thinkingModeAdaptive` classifies it
+**Then** every one of them reports `false` (legacy budget_tokens form) -- none fall through to the "unrecognised id" adaptive default, which only applies to ids that don't match EITHER the 4.6+ shape or the Claude 3.x shape
+
+### AC: thinking-block-replayed-before-tool-use-with-signature-intact
+**Requirements:** ai-layer#req:anthropic-thinking-block-replay
+
+**Given** `ai/agent.Loop` over the REAL `ai/anthropic.Provider` against an httptest server that, with `Reasoning: "medium"` requested, streams a `thinking` block (with a `signature_delta`) followed by a `tool_use` call on step 1, then a plain text completion on step 2
+**When** the Loop's registered `Handler` answers the tool call and the Loop issues its second request
+**Then** the second request's assistant message content is `[thinking, tool_use, ...]` in that order, the `thinking` block's `signature` and `thinking` text are byte-identical to what step 1 streamed, and `thinking: {type: "enabled", budget_tokens: 4096}` is still set on that request
+
+### AC: no-arg-tool-call-replays-non-empty-input
+**Requirements:** ai-layer#req:anthropic-thinking-block-replay
+
+**Given** `ai/agent.Loop` over the REAL `ai/anthropic.Provider` against an httptest server that streams a `tool_use` call with NO `input_json_delta` chunks at all (a no-argument call) on step 1, then a plain text completion on step 2
+**When** the Loop issues its second request
+**Then** the second request's replayed `tool_use` block carries `"input": {}` -- never a missing or empty `input` key
+
+### AC: empty-final-turn-and-empty-text-blocks-dropped
+**Requirements:** ai-layer#req:anthropic-thinking-block-replay
+
+**Given** separately: (a) an `ai/agent.Loop` final step with no text, no tool calls and no `ProviderState`, and (b) an `ai.ChatRequest` whose `Messages` include an assistant message with empty `Text` and no `ToolCalls`, and (c) a `ProviderState` whose captured content array includes a `"text"` block with empty text
+**When** (a) the Loop completes and its transcript is read, and (b)/(c) `ai/anthropic.buildMessages` builds the wire body
+**Then** (a) the empty final turn is not appended to the transcript at all; (b) the empty assistant turn is dropped from the wire entirely rather than sent as `{"type":"text","text":""}`; (c) the empty text block is filtered out of the replay
+
+### AC: provider-state-replay-scoped-to-current-loop-only
+**Requirements:** ai-layer#req:anthropic-thinking-block-replay
+
+**Given** an `ai.ChatRequest` with an earlier, already-resolved tool-calling loop (assistant turn carrying a `ProviderState` with a thinking block, then a tool result, then a plain assistant reply) followed by a new user message and a current in-progress tool call that ALSO carries a `ProviderState` with a thinking block
+**When** `ai/anthropic.buildMessages` builds the wire body
+**Then** the EARLIER loop's assistant turn is rebuilt from `Text`/`ToolCalls` with NO thinking block, while the CURRENT loop's assistant turn replays its `ProviderState` verbatim, thinking block and signature intact
+
+### AC: agent-loop-two-step-tool-use-sums-usage
+**Requirements:** ai-layer#req:agent-loop-contract
+
+**Given** an `ai/agent.Loop` over a fake provider that first returns a tool call and then a final text-only completion, with a registered `Handler`
+**When** `Loop.Run` is drained
+**Then** the handler is called once, exactly one `EventToolResult` and exactly one final `EventCompleted` are seen (never a `EventCompleted` per step), its `Usage` is the sum of both steps', and `Loop.Messages()` returns the user/assistant-tool-call/tool-result transcript
+
+### AC: agent-loop-limits-and-error-resilience
+**Requirements:** ai-layer#req:agent-loop-error-handling
+
+**Given** a `Loop` with `MaxSteps: 2` over a provider that always returns another tool call (never stops), and separately a `Loop` whose `Handler` returns an error, and separately a `Loop` whose `Handler` panics
+**When** each is run
+**Then** the first yields a fatal `ai.Error{Code: "limit"}`; the second (Handler error) also aborts with a fatal `ai.Error` (`ai.ErrCodeUpstream`) after synthesizing `IsError` results for the failed call and any unanswered calls in the same step; the third (panic, recovered) does NOT abort -- it reports an `IsError` `ai.ToolResult` for the panicking call and the run continues
+
 ## Open Questions
 
 - `ai/ctxmgr`'s token estimate is `len/4`; if a product finds this consistently over/under-shoots its real tokenizer badly enough to mis-budget, a provider-supplied estimator hook may be worth adding.
 - `ai/decision/llmdecider`'s `MaxRecent` trims `Request.Recent` client-side; whether that trimming should instead be the product's responsibility (so it can prioritise which turns matter) is open.
 - Whether `ai/anthropic` should adopt native structured-output support instead of the system-prompt-instruction approach is open pending live-API verification of current support/stability for the target models; the instruction approach is kept for now since it is already tested and working.
+- N2's current-loop-only `ProviderState` replay scoping (REQ: anthropic-thinking-block-replay) is a deliberate trade-off, not a free fix, and it is worth naming explicitly (m3, r3 review): (1) it discards cross-turn reasoning continuity -- on the models with Anthropic's "preserved thinking" mechanism (Claude Opus 5.5, Claude Fable 5.1), an EARLIER loop's thinking blocks are intentionally rebuilt away once a new user turn starts a new loop, even though those models are specifically designed to carry reasoning forward across edited/continued history; this adapter does not attempt to distinguish "preserved thinking"-capable models from the rest and always rebuilds earlier loops the same way. (2) it causes CACHED-PREFIX CHURN: the moment a loop's turns become "earlier" (a new user message arrives), `buildMessages`' wire bytes for those turns change shape -- from a byte-identical replay of what Anthropic's prompt cache saw on the previous request, to a rebuilt Text/ToolCalls rendering with the thinking blocks stripped -- so the NEXT request's history prefix no longer matches the cached one and that cache entry is paid for again, uncached, even though the CONTENT (ignoring thinking) is unchanged. The root cause both problems share is that dynamic context (REQ: tool-messages-on-the-wire) is spliced INTO the last user message's existing text, which is what makes it unsafe to keep replaying an earlier turn's `ProviderState` past the loop boundary in the first place (an edit landing ahead of a byte-pinned replayed thinking block is exactly what 400s). The long-term fix under consideration is to stop splicing dynamic context into an existing message's text at all, and instead carry it as its own distinct, clearly-delimited slot (e.g. a dedicated per-turn message, or a `mid-conversation system message` per the claude-api skill) that changes turn to turn WITHOUT mutating any earlier message's bytes -- which would let every earlier loop's `ProviderState` replay byte-identically indefinitely, eliminating both the reasoning-continuity loss and the cache churn. Not implemented yet: it changes the wire shape of every adapter that renders dynamic context, not just `ai/anthropic`, and needs its own design pass.
 
 ---
 *This document follows the https://specscore.md/feature-specification*

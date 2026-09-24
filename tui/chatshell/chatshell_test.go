@@ -5,8 +5,10 @@ import (
 	"iter"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
@@ -831,4 +833,906 @@ func firstFromBatch(t *testing.T, cmd tea.Cmd) tea.Msg {
 	}
 	t.Fatal("no stream message found in batch")
 	return nil
+}
+
+// fakeSidePanel is a minimal SidePanel used to test that it fully replaces
+// the default sidebar in the focus ring, split layout and key routing.
+type fakeSidePanel struct {
+	title     string
+	updates   int
+	lastFocus bool
+	lastMsg   tea.Msg
+}
+
+func (p *fakeSidePanel) Title() string { return p.title }
+
+func (p *fakeSidePanel) View(width, height int, focused bool) string {
+	p.lastFocus = focused
+	return "sidepanel"
+}
+
+func (p *fakeSidePanel) Update(msg tea.Msg) (SidePanel, tea.Cmd) {
+	p.updates++
+	p.lastMsg = msg
+	return p, nil
+}
+
+func TestSidePanelReplacesSidebarInFocusRingAndSplit(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{title: "workspace"}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	if !m.splitEnabled() {
+		t.Fatal("expected split enabled with a SidePanel set and starting visible")
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift})
+	if m.focusRing.Zone() != focus.ZoneSidebar {
+		t.Fatalf("Zone() = %v, want ZoneSidebar after Shift+Right", m.focusRing.Zone())
+	}
+	m.Update(tea.KeyPressMsg{Text: "x"})
+	if panel.updates == 0 {
+		t.Error("expected the SidePanel to receive key updates while focused")
+	}
+
+	view := m.View()
+	_ = view // View() must not panic when a SidePanel is active.
+
+	// F6 hides it; splitEnabled must follow the SidePanel's own visibility,
+	// not the (unused, but still constructed) default sidebar's.
+	m.focusRing.FocusInput()
+	m.syncFocus()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	if m.splitEnabled() {
+		t.Error("expected splitEnabled() false after F6 hides the SidePanel")
+	}
+}
+
+func TestSidePanelCtrlLeftRightResizesSplit(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	before := m.panelChatPercent()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModCtrl})
+	if m.panelChatPercent() <= before {
+		t.Errorf("panelChatPercent() = %d, want > %d after Ctrl+Right", m.panelChatPercent(), before)
+	}
+}
+
+// fakeOverlay is a minimal Overlay that closes itself the first time it sees
+// a KeyPressMsg with text "q", and otherwise just records what it saw.
+type fakeOverlay struct {
+	name     string
+	seen     []tea.Msg
+	closeKey string
+}
+
+func (o *fakeOverlay) View(width, height int) string { return "overlay:" + o.name }
+
+func (o *fakeOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd, bool) {
+	o.seen = append(o.seen, msg)
+	if k, ok := msg.(tea.KeyPressMsg); ok && k.Text == o.closeKey {
+		return o, nil, true
+	}
+	return o, nil, false
+}
+
+func TestOverlayCapturesKeysUntilDone(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ov := &fakeOverlay{name: "dialog", closeKey: "q"}
+	m.PushOverlay(ov)
+
+	// While the overlay is up, a key that would normally submit the composer
+	// must be captured by the overlay instead.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(h.submitted) != 0 {
+		t.Fatalf("submitted = %v, want none (overlay should have captured Enter)", h.submitted)
+	}
+	if len(ov.seen) != 1 {
+		t.Fatalf("overlay saw %d messages, want 1", len(ov.seen))
+	}
+
+	m.Update(tea.KeyPressMsg{Text: "q"})
+	if len(m.overlays) != 0 {
+		t.Fatalf("overlays = %v, want empty after done", m.overlays)
+	}
+
+	// Now Enter reaches the composer again.
+	m.input.SetValue("hi")
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(h.submitted) != 1 {
+		t.Fatalf("submitted = %v, want 1 after overlay closed", h.submitted)
+	}
+}
+
+func TestOverlayStacking(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	first := &fakeOverlay{name: "first", closeKey: "1"}
+	second := &fakeOverlay{name: "second", closeKey: "2"}
+	m.PushOverlay(first)
+	m.PushOverlay(second)
+
+	// The TOP overlay (second) gets keys first.
+	m.Update(tea.KeyPressMsg{Text: "x"})
+	if len(second.seen) != 1 || len(first.seen) != 0 {
+		t.Fatalf("second.seen=%d first.seen=%d, want top overlay only", len(second.seen), len(first.seen))
+	}
+
+	m.Update(tea.KeyPressMsg{Text: "2"})
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays = %d, want 1 after popping the top", len(m.overlays))
+	}
+	m.Update(tea.KeyPressMsg{Text: "1"})
+	if len(m.overlays) != 0 {
+		t.Fatalf("overlays = %d, want 0 after popping the last", len(m.overlays))
+	}
+}
+
+func TestGlobalKeysCheckedBeforeShellDefaults(t *testing.T) {
+	h := &fakeHandler{}
+	var seen []string
+	m := New(h, WithGlobalKeys(func(msg tea.KeyPressMsg) (tea.Cmd, bool) {
+		if msg.Text == "f3" || msg.String() == "f3" {
+			seen = append(seen, "f3")
+			return nil, true
+		}
+		return nil, false
+	}))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF3})
+	if len(seen) != 1 {
+		t.Fatalf("global key hook fired %d times, want 1", len(seen))
+	}
+
+	// A key the hook doesn't consume still reaches the normal composer path.
+	m.input.SetValue("hi")
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(h.submitted) != 1 {
+		t.Fatalf("submitted = %v, want the Enter that the hook did not consume to reach the composer", h.submitted)
+	}
+}
+
+func TestReplaceBlockUpdatesInPlace(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	first := &fakeBlock{}
+	m.AppendBlock(transcript.Entry{ID: "grid-1", Block: first}.Block)
+	m.transcript.Append(transcript.Entry{ID: "grid-1", Block: first})
+	second := &fakeBlock{}
+	m.ReplaceBlock("grid-1", second)
+	entries := m.transcript.Entries()
+	found := false
+	for _, e := range entries {
+		if e.ID == "grid-1" {
+			found = true
+			if e.Block != transcript.Block(second) {
+				t.Errorf("entry Block not replaced")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("entry grid-1 not found")
+	}
+}
+
+func TestSetComposerTextSetsInputValue(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetComposerText("edit this")
+	if m.input.Value() != "edit this" {
+		t.Errorf("input.Value() = %q, want %q", m.input.Value(), "edit this")
+	}
+}
+
+func TestClearTranscriptEmptiesAndFocusesInput(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.AppendUser("hi")
+	m.AppendAssistant("hello")
+	if len(m.transcript.Entries()) == 0 {
+		t.Fatal("expected entries before Clear")
+	}
+	m.ClearTranscript()
+	if len(m.transcript.Entries()) != 0 {
+		t.Errorf("Entries() = %v, want empty after ClearTranscript", m.transcript.Entries())
+	}
+	if m.focusRing.Zone() != focus.ZoneInput {
+		t.Errorf("Zone() = %v, want ZoneInput after ClearTranscript", m.focusRing.Zone())
+	}
+}
+
+// TestClearTranscriptCallsSetBusyCancel covers r2's m6: a product's own
+// SetBusy(true) phase (no stream, e.g. a decision chain) has no DoneMsg to
+// cancel it asynchronously, so ClearTranscript must invoke the registered
+// SetBusyCancel callback directly, same as Esc/Ctrl+C's cancelBusy does.
+func TestClearTranscriptCallsSetBusyCancel(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	var canceled bool
+	m.SetBusy(true)
+	m.SetBusyCancel(func() { canceled = true })
+
+	m.ClearTranscript()
+
+	if !canceled {
+		t.Error("ClearTranscript did not call the registered SetBusyCancel callback")
+	}
+	if m.Busy() {
+		t.Error("still busy after ClearTranscript")
+	}
+}
+
+func TestWithTopBarAndStatusBarOverrideDefaults(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h,
+		WithTopBar(func(width int) string { return "TOP" }),
+		WithStatusBar(func(width int) string { return "STATUS" }),
+	)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	view := m.View()
+	content := view.Content
+	if !strings.Contains(content, "TOP") {
+		t.Error("expected product-rendered top bar in the view")
+	}
+	if !strings.Contains(content, "STATUS") {
+		t.Error("expected product-rendered status bar in the view")
+	}
+}
+
+// --- r1 review fixes ------------------------------------------------------
+
+func TestOverlayOnlyCapturesInputStreamStillCompletesAndClearsBusy(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventTextDelta, Text: "Hel"},
+		{Type: ai.EventTextDelta, Text: "lo"},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStream("turn-1", openSeq(events...))
+	if !m.Busy() {
+		t.Fatal("StartStream did not set busy")
+	}
+
+	ov := &fakeOverlay{name: "dialog", closeKey: "q"}
+	m.PushOverlay(ov)
+
+	drainCmd(t, m, cmd, 20)
+
+	if m.Busy() {
+		t.Fatal("stream must still complete (and clear busy) while an overlay is open — only key/paste/mouse route to the overlay")
+	}
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || entries[0].Text != "Hello" {
+		t.Fatalf("entries = %+v, want the stream's text to have rendered despite the open overlay", entries)
+	}
+	if len(ov.seen) != 0 {
+		t.Fatalf("overlay saw %d non-input messages, want 0", len(ov.seen))
+	}
+}
+
+func TestSidePanelReceivesWindowSizeAndUnhandledMsgs(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	if panel.updates == 0 {
+		t.Fatal("expected the SidePanel to receive the WindowSizeMsg")
+	}
+
+	type productMsg struct{}
+	before := panel.updates
+	m.Update(productMsg{})
+	if panel.updates <= before {
+		t.Fatal("expected the SidePanel to receive an otherwise-unhandled message")
+	}
+}
+
+func TestClearTranscriptCancelsStreamAndIgnoresStaleEvents(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+	m.AppendUser("hi")
+
+	ch := make(chan ai.Event)
+	seq := func(yield func(ai.Event, error) bool) {
+		for ev := range ch {
+			if !yield(ev, nil) {
+				return
+			}
+		}
+	}
+	cmd := m.StartStream("turn-1", func(ctx context.Context) iter.Seq2[ai.Event, error] { return seq })
+	_ = cmd
+	if !m.Busy() {
+		t.Fatal("expected StartStream to set busy")
+	}
+
+	m.ClearTranscript()
+	if m.Busy() {
+		t.Fatal("ClearTranscript must cancel the active stream and clear busy")
+	}
+	if len(m.transcript.Entries()) != 0 {
+		t.Fatalf("transcript not cleared: %+v", m.transcript.Entries())
+	}
+
+	// A stale EventMsg for the cancelled stream's ID must not resurrect a
+	// transcript entry.
+	m.Update(stream.EventMsg{ID: "turn-1", Event: ai.Event{Type: ai.EventTextDelta, Text: "stale"}, Next: func() tea.Msg { return nil }})
+	if len(m.transcript.Entries()) != 0 {
+		t.Fatalf("stale event resurrected a transcript entry: %+v", m.transcript.Entries())
+	}
+	close(ch)
+}
+
+func TestReplaceBlockKeepsFocusOnSameEntryWhenFocusabilityChanges(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.AppendUser("first")                                                // stop 0
+	m.transcript.Append(transcript.Entry{ID: "b1", Block: &fakeBlock{}}) // stop 1
+
+	// Focus the block entry (last stop).
+	m.focusRing.FocusStop(m.transcript.Stops() - 1)
+	m.transcript.Focus(m.focusRing.Stop())
+	before := m.transcript.FocusedEntry()
+	if before == nil || before.ID != "b1" {
+		t.Fatalf("before = %+v, want focused on b1", before)
+	}
+
+	m.ReplaceBlock("b1", &fakeBlock{})
+
+	after := m.transcript.FocusedEntry()
+	if after == nil || after.ID != "b1" {
+		t.Fatalf("after = %+v, want still focused on b1 (same entry) after ReplaceBlock", after)
+	}
+}
+
+// variableFocusBlock is a fakeBlock whose Focusable() answer can flip, used
+// to reproduce the "an EARLIER entry's ReplaceBlock shifts a LATER entry's
+// stop index" scenario.
+type variableFocusBlock struct {
+	fakeBlock
+	focusable bool
+}
+
+func (b *variableFocusBlock) Focusable() bool { return b.focusable }
+
+// TestReplaceBlockMovesFocusToNearestStopWhenFocusedEntryBecomesNonFocusable
+// covers r3's m2: when a ReplaceBlock makes the CURRENTLY FOCUSED entry
+// itself non-focusable, focus must move to the nearest remaining focusable
+// stop, not just fall silently unfocused inside the transcript zone.
+func TestReplaceBlockMovesFocusToNearestStopWhenFocusedEntryBecomesNonFocusable(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &fakeBlock{}})                         // stop 0
+	m.transcript.Append(transcript.Entry{ID: "b", Block: &variableFocusBlock{focusable: true}}) // stop 1
+	m.transcript.Append(transcript.Entry{ID: "c", Block: &fakeBlock{}})                         // stop 2
+
+	m.focusRing.FocusStop(1)
+	m.syncFocus()
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.ID != "b" {
+		t.Fatalf("setup: focused entry = %+v, want b", fe)
+	}
+
+	m.ReplaceBlock("b", &variableFocusBlock{focusable: false})
+
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		t.Fatalf("Zone() = %v, want still ZoneTranscript (a focusable entry remains)", m.focusRing.Zone())
+	}
+	fe := m.transcript.FocusedEntry()
+	if fe == nil {
+		t.Fatal("no focused entry after ReplaceBlock made \"b\" non-focusable, want the nearest remaining stop")
+	}
+	if fe.ID != "a" && fe.ID != "c" {
+		t.Errorf("focused entry = %+v, want the nearest remaining focusable entry (a or c)", fe)
+	}
+}
+
+// TestReplaceBlockFallsBackToComposerWhenNoFocusableEntryRemains covers r3's
+// m2's other branch: when the focused entry becomes non-focusable and NO
+// other focusable entry remains, focus hands off to the composer.
+func TestReplaceBlockFallsBackToComposerWhenNoFocusableEntryRemains(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.transcript.Append(transcript.Entry{ID: "only", Block: &variableFocusBlock{focusable: true}})
+
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	if fe := m.transcript.FocusedEntry(); fe == nil || fe.ID != "only" {
+		t.Fatalf("setup: focused entry = %+v, want only", fe)
+	}
+
+	m.ReplaceBlock("only", &variableFocusBlock{focusable: false})
+
+	if m.focusRing.Zone() != focus.ZoneInput {
+		t.Errorf("Zone() = %v, want ZoneInput (composer) since no focusable entry remains", m.focusRing.Zone())
+	}
+	if fe := m.transcript.FocusedEntry(); fe != nil {
+		t.Errorf("FocusedEntry() = %+v, want nil", fe)
+	}
+}
+
+// TestReplaceBlockSyncsFocusRingStopNotJustTranscript covers r2's m5:
+// ReplaceBlock must resync m.focusRing's own stop, not just
+// transcript.Model's internal focusIndex — otherwise the next syncFocus
+// call (e.g. a WindowSizeMsg) reapplies the OLD, stale focusRing.Stop()
+// value into the transcript, silently undoing the fix
+// TestReplaceBlockKeepsFocusOnSameEntryWhenFocusabilityChanges checks for.
+func TestReplaceBlockSyncsFocusRingStopNotJustTranscript(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	// "a" starts non-focusable, so "b1" is the only stop (index 0).
+	m.transcript.Append(transcript.Entry{ID: "a", Block: &variableFocusBlock{focusable: false}})
+	m.transcript.Append(transcript.Entry{ID: "b1", Block: &fakeBlock{}})
+
+	m.focusRing.FocusStop(0)
+	m.syncFocus()
+	before := m.transcript.FocusedEntry()
+	if before == nil || before.ID != "b1" {
+		t.Fatalf("before = %+v, want focused on b1", before)
+	}
+
+	// Replacing "a" with a NOW-focusable block shifts "b1" from stop 0 to
+	// stop 1 — the transcript-level fix follows the focused entry by id, but
+	// chatshell's own focusRing.Stop() must be updated too.
+	m.ReplaceBlock("a", &variableFocusBlock{focusable: true})
+
+	// Simulate an unrelated later event that re-applies focusRing.Stop()
+	// into the transcript, the way syncFocus normally runs on a zone change
+	// or resize.
+	m.syncFocus()
+
+	after := m.transcript.FocusedEntry()
+	if after == nil || after.ID != "b1" {
+		t.Fatalf("after re-sync = %+v, want still focused on b1 — focusRing.Stop() must have been updated by ReplaceBlock, not left stale", after)
+	}
+}
+
+func TestSidePanelPinnerRoutesPinUnpinAndSidebarRefs(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &pinnerSidePanel{}
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	ref := session.EntityRef{Type: "row", Keys: map[string]string{"id": "1"}}
+	m.PinToSidebar(ref)
+	if len(m.SidebarRefs()) != 1 {
+		t.Fatalf("SidebarRefs() = %v, want 1 ref routed through the SidePanelPinner", m.SidebarRefs())
+	}
+	if len(h.sidebarSeen) != 1 {
+		t.Fatalf("handler not notified: %v", h.sidebarSeen)
+	}
+	m.UnpinFromSidebar(ref)
+	if len(m.SidebarRefs()) != 0 {
+		t.Fatalf("SidebarRefs() = %v, want empty after unpin", m.SidebarRefs())
+	}
+}
+
+func TestSidePanelWithoutPinnerIsANoOp(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{} // does not implement SidePanelPinner
+	m := New(h, WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	ref := session.EntityRef{Type: "row", Keys: map[string]string{"id": "1"}}
+	m.PinToSidebar(ref)
+	if got := m.SidebarRefs(); got != nil {
+		t.Fatalf("SidebarRefs() = %v, want nil (documented no-op without SidePanelPinner)", got)
+	}
+	if len(h.sidebarSeen) != 0 {
+		t.Fatalf("handler should not be notified for a no-op pin: %v", h.sidebarSeen)
+	}
+}
+
+func TestOverlayClampedToGivenSize(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h) // width 120, height 40
+	huge := &oversizedOverlay{}
+	m.PushOverlay(huge)
+	view := m.View()
+	for _, line := range strings.Split(view.Content, "\n") {
+		if w := lipgloss.Width(line); w > m.width {
+			t.Fatalf("rendered line width %d exceeds screen width %d: %q", w, m.width, line)
+		}
+	}
+	if lines := strings.Split(view.Content, "\n"); len(lines) > m.height+2 {
+		t.Fatalf("rendered %d lines, want roughly bounded by screen height %d", len(lines), m.height)
+	}
+}
+
+// pinnerSidePanel is a fakeSidePanel that also implements SidePanelPinner.
+type pinnerSidePanel struct {
+	fakeSidePanel
+	refs []session.EntityRef
+}
+
+// Update overrides the promoted fakeSidePanel.Update, which would otherwise
+// return the embedded *fakeSidePanel itself (losing the Pinner capability
+// on the very first Update, since chatshell replaces m.sidePanel with
+// whatever Update returns).
+func (p *pinnerSidePanel) Update(msg tea.Msg) (SidePanel, tea.Cmd) {
+	_, cmd := p.fakeSidePanel.Update(msg)
+	return p, cmd
+}
+
+func (p *pinnerSidePanel) PinRef(ref session.EntityRef) bool {
+	for _, r := range p.refs {
+		if r.Same(ref) {
+			return false
+		}
+	}
+	p.refs = append(p.refs, ref)
+	return true
+}
+
+func (p *pinnerSidePanel) UnpinRef(ref session.EntityRef) bool {
+	for i, r := range p.refs {
+		if r.Same(ref) {
+			p.refs = append(p.refs[:i], p.refs[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func (p *pinnerSidePanel) Refs() []session.EntityRef { return p.refs }
+
+// oversizedOverlay renders far larger than any reasonable box, to exercise
+// renderOverlay's clamp.
+type oversizedOverlay struct{}
+
+func (o *oversizedOverlay) View(width, height int) string {
+	line := strings.Repeat("X", width+200)
+	lines := make([]string, height+200)
+	for i := range lines {
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (o *oversizedOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd, bool) { return o, nil, false }
+
+func TestFocusEntryFocusesTranscriptStopByID(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.AppendUser("first")
+	m.transcript.Append(transcript.Entry{ID: "grid-1", Block: &fakeBlock{}})
+
+	if !m.FocusEntry("grid-1") {
+		t.Fatal("FocusEntry(\"grid-1\") = false, want true")
+	}
+	if m.focusRing.Zone() != focus.ZoneTranscript {
+		t.Fatalf("Zone() = %v, want ZoneTranscript", m.focusRing.Zone())
+	}
+	entry := m.transcript.FocusedEntry()
+	if entry == nil || entry.ID != "grid-1" {
+		t.Fatalf("FocusedEntry() = %+v, want grid-1", entry)
+	}
+}
+
+func TestFocusEntryUnknownIDLeavesFocusUnchanged(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.AppendUser("first")
+	before := m.focusRing.Zone()
+
+	if m.FocusEntry("nope") {
+		t.Fatal("FocusEntry(\"nope\") = true, want false for an unknown id")
+	}
+	if m.focusRing.Zone() != before {
+		t.Fatalf("Zone() changed to %v after a failed FocusEntry", m.focusRing.Zone())
+	}
+}
+
+func TestWithMarkdownRendererAndAppendAssistantMarkdown(t *testing.T) {
+	h := &fakeHandler{}
+	var gotText string
+	var gotWidth int
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		gotText, gotWidth = text, width
+		return "RENDERED:" + text
+	}))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.AppendAssistantMarkdown("# hi")
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || !entries[0].Markdown || entries[0].Text != "# hi" {
+		t.Fatalf("entries = %+v, want one Markdown entry with the raw text", entries)
+	}
+	view := m.transcript.View()
+	if !strings.Contains(view, "RENDERED:# hi") {
+		t.Fatalf("view = %q, want the configured renderer's output", view)
+	}
+	if gotText != "# hi" || gotWidth <= 0 {
+		t.Errorf("renderer called with text=%q width=%d", gotText, gotWidth)
+	}
+}
+
+func TestAppendBlockWithIDIsLaterFocusable(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+	if !m.AppendBlockWithID("grid-1", &fakeBlock{}) {
+		t.Fatal("AppendBlockWithID(\"grid-1\", ...) = false, want true for a fresh id")
+	}
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || entries[0].ID != "grid-1" {
+		t.Fatalf("entries = %+v, want one entry with ID %q", entries, "grid-1")
+	}
+	if !m.FocusEntry("grid-1") {
+		t.Fatal("FocusEntry(\"grid-1\") = false, want true: AppendBlockWithID must make the block focusable by id")
+	}
+}
+
+func TestAppendBlockWithIDRejectsDuplicateAndStreamIDClashes(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+
+	if !m.AppendBlockWithID("grid-1", &fakeBlock{}) {
+		t.Fatal("first AppendBlockWithID(\"grid-1\", ...) = false, want true")
+	}
+	if m.AppendBlockWithID("grid-1", &fakeBlock{}) {
+		t.Error("AppendBlockWithID(\"grid-1\", ...) = true on a duplicate id, want false (no second entry appended)")
+	}
+	if m.AppendBlockWithID("", &fakeBlock{}) {
+		t.Error("AppendBlockWithID(\"\", ...) = true, want false (empty id rejected)")
+	}
+
+	events := []ai.Event{{Type: ai.EventStarted}}
+	m.StartStream("turn-1", openSeq(events...))
+	if m.AppendBlockWithID("turn-1", &fakeBlock{}) {
+		t.Error("AppendBlockWithID(\"turn-1\", ...) = true while a stream owns that id, want false")
+	}
+
+	entries := m.transcript.Entries()
+	if len(entries) != 2 {
+		t.Fatalf("entries = %+v, want exactly 2 (grid-1, and the streaming entry) after the rejected calls", entries)
+	}
+}
+
+func TestStartStreamMarkdownRendersAccumulatedTextThroughRenderer(t *testing.T) {
+	h := &fakeHandler{}
+	var renderCalls int
+	var lastText string
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		renderCalls++
+		lastText = text
+		return "RENDERED:" + text
+	}))
+	m.ctx = context.Background()
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventTextDelta, Text: "# Hel"},
+		{Type: ai.EventTextDelta, Text: "lo"},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStreamMarkdown("turn-1", openSeq(events...))
+	drainCmd(t, m, cmd, 20)
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || !entries[0].Markdown || entries[0].Text != "# Hello" {
+		t.Fatalf("entries = %+v, want one Markdown entry with the accumulated text", entries)
+	}
+	view := m.transcript.View()
+	if !strings.Contains(view, "RENDERED:# Hello") {
+		t.Fatalf("view = %q, want the final accumulated text rendered through the configured renderer", view)
+	}
+	if renderCalls == 0 {
+		t.Error("renderer was never called")
+	}
+	if lastText != "# Hello" {
+		t.Errorf("last render call text = %q, want the fully accumulated text", lastText)
+	}
+}
+
+// TestStartStreamMarkdownThrottlesReRenderAcrossRapidDeltas covers r2's m8:
+// a burst of rapid deltas with no newline must not re-run the (potentially
+// expensive) markdown renderer once per delta — only the throttle window's
+// first hit, plus the guaranteed final render on completion. The
+// accumulated Text is still complete even though intermediate renders were
+// skipped.
+func TestStartStreamMarkdownThrottlesReRenderAcrossRapidDeltas(t *testing.T) {
+	h := &fakeHandler{}
+	var renderCalls int
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		renderCalls++
+		return "RENDERED:" + text
+	}))
+	m.ctx = context.Background()
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// A fake clock that advances 1ms per call (far under
+	// markdownRenderThrottle's 100ms window) makes the throttle
+	// deterministic without depending on how fast the test itself runs —
+	// real wall-clock deltas between rapid, back-to-back events are not
+	// reliably sub-100ms in a loaded test environment.
+	fakeNow := time.Now()
+	m.nowFunc = func() time.Time {
+		fakeNow = fakeNow.Add(time.Millisecond)
+		return fakeNow
+	}
+
+	const n = 20
+	events := make([]ai.Event, 0, n+2)
+	events = append(events, ai.Event{Type: ai.EventStarted})
+	for i := 0; i < n; i++ {
+		events = append(events, ai.Event{Type: ai.EventTextDelta, Text: "x"})
+	}
+	events = append(events, ai.Event{Type: ai.EventCompleted})
+
+	cmd := m.StartStreamMarkdown("turn-1", openSeq(events...))
+	drainCmd(t, m, cmd, 4*n+20)
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || entries[0].Text != strings.Repeat("x", n) {
+		t.Fatalf("entries = %+v, want the fully accumulated %d-char text despite throttled rendering", entries, n)
+	}
+	// Rapid, newline-free deltas fired back-to-back land inside one 100ms
+	// throttle window: at most the window's first hit plus the guaranteed
+	// completion render, well under one render per delta.
+	if renderCalls >= n {
+		t.Errorf("renderCalls = %d for %d deltas, want throttled (well under one call per delta)", renderCalls, n)
+	}
+	view := m.transcript.View()
+	if !strings.Contains(view, "RENDERED:"+strings.Repeat("x", n)) {
+		t.Fatalf("view = %q, want the final render to reflect the complete accumulated text", view)
+	}
+}
+
+// TestStartStreamMarkdownRendersOnNewlineBoundary covers r2's m8's other
+// throttle trigger: a delta crossing a newline forces a re-render even
+// inside the throttle window, not just the timer.
+func TestStartStreamMarkdownRendersOnNewlineBoundary(t *testing.T) {
+	h := &fakeHandler{}
+	var renderTexts []string
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		renderTexts = append(renderTexts, text)
+		return "RENDERED:" + text
+	}))
+	m.ctx = context.Background()
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventTextDelta, Text: "line one\n"},
+		{Type: ai.EventTextDelta, Text: "line two"},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStreamMarkdown("turn-1", openSeq(events...))
+	drainCmd(t, m, cmd, 20)
+
+	if len(renderTexts) < 2 {
+		t.Fatalf("renderTexts = %v, want at least 2 renders: one triggered by the newline-crossing delta, one on completion", renderTexts)
+	}
+	var sawNewlineRender bool
+	for _, txt := range renderTexts {
+		if txt == "line one\n" {
+			sawNewlineRender = true
+		}
+	}
+	if !sawNewlineRender {
+		t.Errorf("renderTexts = %v, want a render with exactly the text as of the newline-crossing delta", renderTexts)
+	}
+	if last := renderTexts[len(renderTexts)-1]; last != "line one\nline two" {
+		t.Errorf("last render text = %q, want the full accumulated text on completion", last)
+	}
+}
+
+// TestStartStreamMarkdownScheduledFollowUpTickRendersTrailingFragment is r3's
+// m1 regression test: a delta that gets throttled out (no newline, inside
+// the throttle window) must still render within ~markdownRenderThrottle even
+// if NO further delta ever arrives (e.g. the stream stalls) -- via a
+// scheduled tea.Tick follow-up, not only "wait for the next delta or
+// completion". Drives the stream through a channel it controls (never
+// closed, no completion) so the only way the trailing fragment renders is
+// the scheduled tick firing.
+func TestStartStreamMarkdownScheduledFollowUpTickRendersTrailingFragment(t *testing.T) {
+	h := &fakeHandler{}
+	var renderTexts []string
+	m := New(h, WithMarkdownRenderer(func(text string, width int) string {
+		renderTexts = append(renderTexts, text)
+		return "RENDERED:" + text
+	}))
+	m.ctx = context.Background()
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	fakeNow := time.Now()
+	m.nowFunc = func() time.Time { return fakeNow }
+
+	var tickDur time.Duration
+	var tickFn func(time.Time) tea.Msg
+	m.tickFunc = func(d time.Duration, fn func(time.Time) tea.Msg) tea.Cmd {
+		tickDur, tickFn = d, fn
+		return func() tea.Msg { return nil } // never auto-fires; the test invokes tickFn itself
+	}
+
+	// A manual, one-event-at-a-time driver (not drainCmd, which greedily
+	// re-arms the pump and would block forever waiting on the next send
+	// this test controls by hand): unwrap StartStreamMarkdown's initial
+	// tea.Batch once, keep the stream.Start half, and thread stream.
+	// EventMsg.Next by hand between sends.
+	ch := make(chan ai.Event)
+	seq := func(yield func(ai.Event, error) bool) {
+		for ev := range ch {
+			if !yield(ev, nil) {
+				return
+			}
+		}
+	}
+	initial := m.StartStreamMarkdown("turn-1", func(ctx context.Context) iter.Seq2[ai.Event, error] { return seq })
+	batch, ok := initial().(tea.BatchMsg)
+	if !ok || len(batch) == 0 {
+		t.Fatalf("initial cmd = %T, want a non-empty tea.BatchMsg", initial())
+	}
+	pump := batch[0] // stream.Start's re-armable half
+
+	// First delta: lastMarkdownRender is zero-value, so time.Since is huge
+	// -> renders immediately (establishing a recent lastMarkdownRender).
+	ch <- ai.Event{Type: ai.EventTextDelta, Text: "Hel"}
+	ev1, ok := pump().(stream.EventMsg)
+	if !ok {
+		t.Fatalf("pump() = %#v, want stream.EventMsg", ev1)
+	}
+	m.Update(ev1)
+	if len(renderTexts) == 0 || renderTexts[len(renderTexts)-1] != "Hel" {
+		t.Fatalf("renderTexts = %v, want the first delta rendered immediately", renderTexts)
+	}
+	rendersAfterFirst := len(renderTexts)
+
+	// Second delta: no newline, and fakeNow hasn't advanced, so this one is
+	// throttled out -- but it must schedule a follow-up tick.
+	ch <- ai.Event{Type: ai.EventTextDelta, Text: "lo"}
+	ev2, ok := ev1.Next().(stream.EventMsg)
+	if !ok {
+		t.Fatalf("ev1.Next() = %#v, want stream.EventMsg", ev2)
+	}
+	m.Update(ev2)
+	if len(renderTexts) != rendersAfterFirst {
+		t.Fatalf("renderTexts = %v, want no new render yet (this delta should have been throttled)", renderTexts)
+	}
+	if tickFn == nil {
+		t.Fatal("no follow-up tick was scheduled for the throttled delta")
+	}
+	if tickDur != markdownRenderThrottle {
+		t.Errorf("tick duration = %v, want markdownRenderThrottle (%v)", tickDur, markdownRenderThrottle)
+	}
+
+	// Fire the scheduled tick myself -- no further delta, no completion.
+	fakeNow = fakeNow.Add(markdownRenderThrottle)
+	msg := tickFn(fakeNow)
+	m.Update(msg)
+
+	if len(renderTexts) != rendersAfterFirst+1 {
+		t.Fatalf("renderTexts = %v, want exactly one more render after the tick fired", renderTexts)
+	}
+	if last := renderTexts[len(renderTexts)-1]; last != "Hello" {
+		t.Errorf("tick-triggered render text = %q, want the full accumulated \"Hello\"", last)
+	}
+	close(ch)
+}
+
+func TestStartStreamWithoutMarkdownRendererBehavesLikeStartStream(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.ctx = context.Background()
+	events := []ai.Event{
+		{Type: ai.EventStarted},
+		{Type: ai.EventTextDelta, Text: "hi"},
+		{Type: ai.EventCompleted},
+	}
+	cmd := m.StartStreamMarkdown("turn-1", openSeq(events...))
+	drainCmd(t, m, cmd, 20)
+
+	entries := m.transcript.Entries()
+	if len(entries) != 1 || entries[0].Text != "hi" {
+		t.Fatalf("entries = %+v, want the plain accumulated text", entries)
+	}
 }

@@ -41,8 +41,38 @@ func TestWriteReadEvents_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestWriteReadEvents_ToolCallRoundTrip(t *testing.T) {
+	events := []ai.Event{
+		{Type: ai.EventStarted, Provider: "anthropic", Model: "claude-haiku-4-5"},
+		{Type: ai.EventToolCall, ToolCall: &ai.ToolCall{ID: "call_1", Name: "lookup", Arguments: json.RawMessage(`{"q":"x"}`)}},
+		{Type: ai.EventCompleted, StopReason: ai.StopReasonToolCalls},
+	}
+	var buf bytes.Buffer
+	for _, ev := range events {
+		if err := WriteEvent(&buf, ev); err != nil {
+			t.Fatalf("WriteEvent: %v", err)
+		}
+	}
+	var got []ai.Event
+	for ev, err := range ReadEvents(&buf) {
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		got = append(got, ev)
+	}
+	if len(got) != len(events) {
+		t.Fatalf("got %d events, want %d: %+v", len(got), len(events), got)
+	}
+	if got[1].Type != ai.EventToolCall || got[1].ToolCall == nil || got[1].ToolCall.Name != "lookup" {
+		t.Errorf("tool call event = %+v", got[1])
+	}
+	if got[2].StopReason != ai.StopReasonToolCalls {
+		t.Errorf("StopReason = %q", got[2].StopReason)
+	}
+}
+
 func TestReadEvents_UnknownEventIgnored(t *testing.T) {
-	raw := "event: tool.call\ndata: {\"foo\":\"bar\"}\n\n" +
+	raw := "event: some.future.event\ndata: {\"foo\":\"bar\"}\n\n" +
 		"event: text.delta\ndata: {\"type\":\"text.delta\",\"text\":\"hi\"}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
 	var got []ai.Event
