@@ -1770,6 +1770,14 @@ func TestMouse_WithMouseOffStaysOff(t *testing.T) {
 	if view := m.View(); view.MouseMode != tea.MouseModeNone {
 		t.Fatalf("View().MouseMode = %v, want MouseModeNone", view.MouseMode)
 	}
+
+	// m1 (r1 review): an explicit WithMouse(MouseOff) must not clobber the
+	// mode a later SetMouseEnabled(true) restores -- it must still come
+	// back as MouseCellMotion (New's default), never a silent no-op.
+	m.SetMouseEnabled(true)
+	if view := m.View(); view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("View().MouseMode after SetMouseEnabled(true) = %v, want MouseModeCellMotion", view.MouseMode)
+	}
 }
 
 func TestMouse_WithMouseCellMotionEnablesFromStart(t *testing.T) {
@@ -1841,5 +1849,131 @@ func TestMouse_WheelIgnoredWhileOverlayOpen(t *testing.T) {
 	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
 	if got := m.transcript.View(); got != before {
 		t.Fatal("wheel scrolled the transcript while an overlay was open")
+	}
+}
+
+// M3 (r1 review): with a SidePanel installed and the pane split, a wheel
+// event in the side panel's column routes to the SidePanel instead of
+// scrolling the transcript, and every wheel event -- routed to the
+// SidePanel or not -- is also always forwarded to an optional MsgHandler.
+
+func TestMouse_WheelInSidePanelColumnRoutesToSidePanel(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{title: "workspace"}
+	m := New(h, WithMouse(MouseCellMotion), WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	beforeTranscript := m.transcript.View()
+
+	sideX := m.chatWidth() + splitSeparatorWidth + 1
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: sideX})
+
+	if panel.updates == 0 {
+		t.Fatal("SidePanel.Update was not called for a wheel event in its column")
+	}
+	if _, ok := panel.lastMsg.(tea.MouseWheelMsg); !ok {
+		t.Fatalf("SidePanel received %T, want tea.MouseWheelMsg", panel.lastMsg)
+	}
+	if got := m.transcript.View(); got != beforeTranscript {
+		t.Fatal("transcript scrolled even though the wheel event was in the side panel's column")
+	}
+	if len(h.msgsSeen) == 0 {
+		t.Fatal("MsgHandler.OnMsg was not called for the wheel event")
+	}
+}
+
+func TestMouse_WheelInChatColumnStillScrollsWithSidePanelInstalled(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{title: "workspace"}
+	m := New(h, WithMouse(MouseCellMotion), WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	beforeTranscript := m.transcript.View()
+	updatesBefore := panel.updates // WindowSizeMsg above already forwarded once
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: 2})
+
+	if got := m.transcript.View(); got == beforeTranscript {
+		t.Fatal("transcript did not scroll for a wheel event in the chat column")
+	}
+	if panel.updates != updatesBefore {
+		t.Fatal("SidePanel.Update was called for a wheel event in the chat column")
+	}
+	if len(h.msgsSeen) == 0 {
+		t.Fatal("MsgHandler.OnMsg was not called")
+	}
+}
+
+// cmdSidePanel is a minimal SidePanel whose Update returns a caller-supplied
+// tea.Cmd, for exercising handleMouseWheel's batching of a non-nil SidePanel
+// command (fakeSidePanel above always returns nil).
+type cmdSidePanel struct {
+	cmd tea.Cmd
+}
+
+func (p *cmdSidePanel) Title() string                               { return "panel" }
+func (p *cmdSidePanel) View(width, height int, focused bool) string { return "panel" }
+func (p *cmdSidePanel) Update(msg tea.Msg) (SidePanel, tea.Cmd)     { return p, p.cmd }
+
+func TestMouse_WheelBatchesSidePanelCmd(t *testing.T) {
+	h := &fakeHandler{}
+	ran := false
+	panel := &cmdSidePanel{cmd: func() tea.Msg { ran = true; return nil }}
+	m := New(h, WithMouse(MouseCellMotion), WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+
+	sideX := m.chatWidth() + splitSeparatorWidth + 1
+	_, cmd := m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: sideX})
+	if cmd == nil {
+		t.Fatal("expected a non-nil batched cmd")
+	}
+	cmd() // drive the batch; the SidePanel's cmd must be among what runs
+	if !ran {
+		t.Fatal("SidePanel's returned cmd was not included in the batch")
+	}
+}
+
+func TestMouse_WheelForwardedToMsgHandlerWithoutSidePanel(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	for i := 0; i < 50; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	if len(h.msgsSeen) != 1 {
+		t.Fatalf("msgsSeen = %d, want 1", len(h.msgsSeen))
+	}
+	if _, ok := h.msgsSeen[0].(tea.MouseWheelMsg); !ok {
+		t.Fatalf("msgsSeen[0] = %T, want tea.MouseWheelMsg", h.msgsSeen[0])
+	}
+}
+
+// cmdMsgHandler is a Handler+MsgHandler whose OnMsg returns a
+// caller-supplied tea.Cmd, for exercising handleMouseWheel's batching of a
+// non-nil MsgHandler command (fakeHandler.OnMsg above always returns nil).
+type cmdMsgHandler struct {
+	cmd tea.Cmd
+}
+
+func (h *cmdMsgHandler) Submit(text string) tea.Cmd { return nil }
+func (h *cmdMsgHandler) OnMsg(msg tea.Msg) tea.Cmd  { return h.cmd }
+
+func TestMouse_WheelBatchesMsgHandlerCmd(t *testing.T) {
+	ran := false
+	h := &cmdMsgHandler{cmd: func() tea.Msg { ran = true; return nil }}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	_, cmd := m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	if cmd == nil {
+		t.Fatal("expected a non-nil batched cmd")
+	}
+	cmd()
+	if !ran {
+		t.Fatal("MsgHandler's returned cmd was not included in the batch")
 	}
 }

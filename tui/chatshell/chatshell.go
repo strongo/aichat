@@ -189,7 +189,16 @@ func (mm MouseMode) mouseTeaMode() tea.MouseMode {
 // later. The default (no WithMouse call) is MouseOff.
 func WithMouse(mode MouseMode) Option {
 	return func(m *Model) {
-		m.mouseMode = mode
+		// m1 (r1 review): WithMouse(MouseOff) must NOT clobber mouseMode
+		// down to MouseOff -- doing so would make a later
+		// SetMouseEnabled(true) a silent no-op (mouseTeaMode() on
+		// MouseOff is always tea.MouseModeNone). Only an actual enabling
+		// mode updates mouseMode; MouseOff only clears mouseEnabled,
+		// leaving New's MouseCellMotion default (or an earlier WithMouse
+		// call's mode) in place for SetMouseEnabled(true) to restore.
+		if mode != MouseOff {
+			m.mouseMode = mode
+		}
 		m.mouseEnabled = mode != MouseOff
 	}
 }
@@ -824,19 +833,49 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // matching a typical terminal's own default scroll step.
 const mouseWheelScrollLines = 3
 
-// handleMouseWheel scrolls the transcript viewport. It is reachable only
-// while mouse reporting is on (View's MouseMode gates whether the terminal
-// ever sends these events at all), but does not itself re-check
-// mouseEnabled -- a wheel event that already arrived is honoured
-// regardless, same as chatshell honours a key press it happens to receive.
+// splitSeparatorWidth is the width, in columns, of the " │ " divider View()
+// draws between the chat column and the side panel/sidebar when split
+// (see View, chatWidth/sidebarWidth) -- handleMouseWheel uses it to tell
+// whether a wheel event's X falls in the chat column or past the divider.
+const splitSeparatorWidth = 3
+
+// handleMouseWheel scrolls the transcript viewport, UNLESS a product
+// SidePanel is installed and the event's X falls in its column (past the
+// chat column and its " │ " divider) while the pane is split -- then the
+// event is forwarded to the SidePanel instead (e.g. a product's own
+// scrollable list), and the transcript does not scroll. Either way, the
+// event is then ALSO forwarded to an optional MsgHandler (same as every
+// other message dispatchUnhandled reaches), so a product can react to
+// wheel events beyond just scrolling. It is reachable only while mouse
+// reporting is on (View's MouseMode gates whether the terminal ever sends
+// these events at all), but does not itself re-check mouseEnabled -- a
+// wheel event that already arrived is honoured regardless, same as
+// chatshell honours a key press it happens to receive.
 func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
-	switch msg.Button {
-	case tea.MouseWheelUp:
-		m.transcript.ScrollUp(mouseWheelScrollLines)
-	case tea.MouseWheelDown:
-		m.transcript.ScrollDown(mouseWheelScrollLines)
+	var cmds []tea.Cmd
+	if m.sidePanel != nil && m.splitEnabled() && msg.X >= m.chatWidth()+splitSeparatorWidth {
+		var cmd tea.Cmd
+		m.sidePanel, cmd = m.sidePanel.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	} else {
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			m.transcript.ScrollUp(mouseWheelScrollLines)
+		case tea.MouseWheelDown:
+			m.transcript.ScrollDown(mouseWheelScrollLines)
+		}
 	}
-	return m, nil
+	if h, ok := m.handler.(MsgHandler); ok {
+		if cmd := h.OnMsg(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if len(cmds) == 0 {
+		return m, nil
+	}
+	return m, tea.Batch(cmds...)
 }
 
 // isOverlayInputMsg reports whether msg is user input an open Overlay
