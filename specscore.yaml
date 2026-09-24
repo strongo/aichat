@@ -1,0 +1,30 @@
+# SpecScore Repo Config Schema: https://specscore.md/repo-config
+
+project:
+    title: strongo/aichat
+    host: github.com
+    org: strongo
+    repo: aichat
+
+# Required before using Plan commands; may point to this repository.
+# plans_repo: owner/repository
+
+# Gate keys are event-keyed, not command-keyed (mirrors sneat-co/sneat-cli).
+gates:
+    feature.approved:
+        reviewers:
+            - name: ai-spec-reviewer
+              type: ai
+              prompt: .specscore/reviewers/specify-feature-reviewer.md
+            - name: human-approval
+              type: human
+
+    implementation.pre_commit:
+        reviewers:
+            - name: auto-approve
+              type: auto-approve
+
+    implementation.pre_push:
+        reviewers:
+            - name: human-approval
+              type: human
