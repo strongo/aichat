@@ -330,7 +330,7 @@ func (m *Model) tableViewAt(width int) string {
 		t = t.WithFilterInputValue(filterText)
 	}
 	if len(m.rows) > 0 {
-		pos := visiblePositionForSource(t.GetVisibleRows(), highlightedSource)
+		pos := findVisiblePositionForTableViewAt(t.GetVisibleRows(), highlightedSource)
 		if pos < 0 {
 			pos = 0
 		}
@@ -340,6 +340,15 @@ func (m *Model) tableViewAt(width int) string {
 	t = m.scrollColumnIntoView(t, width)
 	return t.View()
 }
+
+// findVisiblePositionForTableViewAt is tableViewAt's seam over
+// visiblePositionForSource. The throwaway table t is built from the same
+// rows/filter as the real m.table read moments earlier, so there is no
+// legitimate sequence through the public API where the real highlighted
+// source row is absent from t's visible set — the "pos < 0" fallback above
+// is defensive. Swapped out in
+// TestTableViewAtFallsBackToFirstRowWhenSourceMissing to drive it directly.
+var findVisiblePositionForTableViewAt = visiblePositionForSource
 
 // ActiveViewContent renders just the active view's own body (table or the
 // active ExtraView) at the given size, without any card chrome and without

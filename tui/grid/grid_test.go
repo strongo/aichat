@@ -10,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/evertras/bubble-table/table"
 
 	"github.com/strongo/aichat/ai/session"
 	"github.com/strongo/aichat/tui"
@@ -1247,5 +1248,672 @@ func TestWithoutViewSwitcherHidesSwitcherText(t *testing.T) {
 	}
 	if !strings.Contains(header, "Bookmarks") {
 		t.Fatalf("header missing title: %q", header)
+	}
+}
+
+// TestWithoutViewSwitcherFocusedUsesActiveTitleStyle exercises headerLine's
+// focused branch for a WithoutViewSwitcher grid (grid.go's viewSwitcherHidden
+// path styles the title differently when focused vs not) — every other test
+// touching this path leaves the grid unfocused.
+func TestWithoutViewSwitcherFocusedUsesActiveTitleStyle(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithTitle("Bookmarks"), WithoutViewSwitcher())
+	m.SetFocused(true)
+	header := ansi.Strip(m.HeaderLine(60))
+	if !strings.Contains(header, "Bookmarks") {
+		t.Fatalf("focused header missing title: %q", header)
+	}
+}
+
+// TestHeaderLineControlsFillWidthOmitsTitle is the regression test for
+// headerLine's "the view switcher itself already fills the available width"
+// branch: with enough long-labelled ExtraViews, the switcher text alone can
+// reach or exceed the width budget headerLine reserves for it, in which case
+// the title is dropped entirely rather than being squeezed to zero/negative
+// width.
+func TestHeaderLineControlsFillWidthOmitsTitle(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithTitle("Should Not Appear"), WithExtraViews(
+		ExtraView{Label: "ChartsChartsCharts"},
+		ExtraView{Label: "InspectorInspectorInspector"},
+		ExtraView{Label: "RawRawRaw"},
+	))
+	header := ansi.Strip(m.HeaderLine(62))
+	if strings.Contains(header, "Should Not Appear") {
+		t.Fatalf("header should have omitted the title once the switcher filled the width: %q", header)
+	}
+	if !strings.Contains(header, "1 Table") {
+		t.Fatalf("header missing view switcher text: %q", header)
+	}
+}
+
+// TestRowFieldViewRenderZeroHeightReturnsUnclamped and
+// TestRowFieldViewRenderEmptyContent cover rowFieldView's Render func's own
+// early-return guard (content == "" or height <= 0 skip the scroll-window
+// clamping entirely).
+func TestRowFieldViewRenderZeroHeightReturnsUnclamped(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(CardView("")))
+	extra := m.ExtraViews()[0]
+	want := currentRowContent(m.columns, m.rows, m.CurrentIndex(), 40, false)
+	if got := extra.Render(m, 40, 0); got != want {
+		t.Fatalf("Render with height<=0 = %q, want unclamped %q", got, want)
+	}
+}
+
+func TestRowFieldViewRenderEmptyContent(t *testing.T) {
+	rows := []Row{{Key: "0"}}
+	m := New(nil, rows, WithExtraViews(CardView("")))
+	extra := m.ExtraViews()[0]
+	if got := extra.Render(m, 40, 5); got != "" {
+		t.Fatalf("Render with no columns = %q, want empty", got)
+	}
+}
+
+// TestFormatValueInvalidUTF8BytesAndFloat32 covers FormatValue's remaining
+// two type switches: invalid-UTF8 []byte (hex-encoded) and float32.
+func TestFormatValueInvalidUTF8BytesAndFloat32(t *testing.T) {
+	if got := FormatValue([]byte{0xff, 0xfe}); got != "0x"+strings.ToLower("FFFE") {
+		t.Errorf("invalid utf8 bytes = %q, want 0xfffe", got)
+	}
+	if got := FormatValue(float32(2.5)); got != "2.5" {
+		t.Errorf("float32 = %q, want 2.5", got)
+	}
+}
+
+// TestSanitizeReplacesControlChars covers sanitize's control-character
+// substitution branch (values below 0x20 or in 0x7f-0x9f become a space).
+func TestSanitizeReplacesControlChars(t *testing.T) {
+	got := sanitize("a\x01b\x7fc")
+	if got != "a b c" {
+		t.Fatalf("sanitize control chars = %q, want %q", got, "a b c")
+	}
+}
+
+// TestVisiblePositionForSourceNotFound covers the "no visible row carries
+// this source index" branch (falls through the whole loop to -1), distinct
+// from the sourceIndex<0 fast path.
+func TestVisiblePositionForSourceNotFound(t *testing.T) {
+	rows := []table.Row{table.NewRow(table.RowData{sourceKey: 5})}
+	if got := visiblePositionForSource(rows, 3); got != -1 {
+		t.Fatalf("visiblePositionForSource(no match) = %d, want -1", got)
+	}
+}
+
+// TestSelectRowOnEmptyGridIsNoop and TestSelectColumnOnEmptyGridIsNoop cover
+// the early-return guards for a grid with no rows/columns.
+func TestSelectRowOnEmptyGridIsNoop(t *testing.T) {
+	m := New(nil, nil)
+	m.SelectRow(0) // must not panic
+	if m.CurrentIndex() != -1 {
+		t.Fatalf("CurrentIndex() after SelectRow on empty grid = %d, want -1", m.CurrentIndex())
+	}
+}
+
+func TestSelectColumnOnEmptyGridIsNoop(t *testing.T) {
+	m := New(nil, nil)
+	m.SelectColumn(0) // must not panic
+	if m.SelectedColumn() != 0 {
+		t.Fatalf("SelectedColumn() after SelectColumn on empty grid = %d, want 0", m.SelectedColumn())
+	}
+}
+
+// TestColumnWidthForOutOfRangeIndex covers columnWidthFor's bounds guard.
+func TestColumnWidthForOutOfRangeIndex(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	if got := m.columnWidthFor(50, -1); got != 1 {
+		t.Fatalf("columnWidthFor(-1) = %d, want 1", got)
+	}
+	if got := m.columnWidthFor(50, len(cols)+5); got != 1 {
+		t.Fatalf("columnWidthFor(out of range) = %d, want 1", got)
+	}
+}
+
+// TestVisibleColumnWindowForNoColumns and
+// TestVisibleColumnWindowForNonZeroOffset cover visibleColumnWindowFor's
+// empty-grid guard and its "already scrolled past the start" overflow-marker
+// accounting.
+func TestVisibleColumnWindowForNoColumns(t *testing.T) {
+	m := New(nil, nil)
+	offset, last := m.visibleColumnWindowFor(0, 50)
+	if offset != 0 || last != -1 {
+		t.Fatalf("visibleColumnWindowFor(no columns) = %d,%d want 0,-1", offset, last)
+	}
+}
+
+func TestVisibleColumnWindowForNonZeroOffset(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	offset, last := m.visibleColumnWindowFor(1, 50)
+	if offset != 1 || last < offset-1 {
+		t.Fatalf("visibleColumnWindowFor(offset=1) = %d,%d", offset, last)
+	}
+}
+
+// TestVisibleColumnRangeTooNarrowForAnyColumn covers visibleColumnRange's
+// "no column fits at all" fallback (0, 0) at an extreme width.
+func TestVisibleColumnRangeTooNarrowForAnyColumn(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.SetWidth(1)
+	first, last := m.VisibleColumnRange()
+	if first != 0 || last != 0 {
+		t.Fatalf("VisibleColumnRange() at width 1 = %d,%d want 0,0", first, last)
+	}
+}
+
+// TestScrollColumnIntoViewScrollsBothDirections drives scrollColumnIntoView's
+// scroll-left and scroll-right loops for real, across many columns at a
+// narrow width, rather than merely asserting SelectedColumn().
+func TestScrollColumnIntoViewScrollsBothDirections(t *testing.T) {
+	cols := make([]Column, 8)
+	values := make([]any, 8)
+	for i := range cols {
+		cols[i] = Column{Name: "column" + strconv.Itoa(i)}
+		values[i] = "value-" + strconv.Itoa(i)
+	}
+	rows := []Row{{Key: "0", Values: values}}
+	m := New(cols, rows)
+	m.SetWidth(20)
+
+	m.SelectColumn(len(cols) - 1) // scroll right toward the last column
+	if got := m.ColumnOffset(); got == 0 {
+		t.Fatalf("ColumnOffset() after selecting the last column = %d, want > 0", got)
+	}
+
+	m.SelectColumn(0) // scroll back left to the first column
+	if got := m.ColumnOffset(); got != 0 {
+		t.Fatalf("ColumnOffset() after selecting the first column = %d, want 0", got)
+	}
+}
+
+// TestScrollColumnIntoViewRightScrollStopsAtBoundary drives the scroll-right
+// loop's break: with a column too wide to ever become fully "visible", the
+// loop must stop once ScrollRight() itself stops advancing the offset,
+// rather than spinning.
+func TestScrollColumnIntoViewRightScrollStopsAtBoundary(t *testing.T) {
+	cols := make([]Column, 6)
+	values := make([]any, 6)
+	for i := range cols {
+		cols[i] = Column{Name: "col" + strconv.Itoa(i)}
+		values[i] = strings.Repeat("x", 40) + strconv.Itoa(i)
+	}
+	rows := []Row{{Key: "0", Values: values}}
+	m := New(cols, rows)
+	m.SetWidth(10) // far too narrow for any column's natural width
+	m.SelectColumn(len(cols) - 1)
+	if got := m.ColumnOffset(); got != len(cols)-1 {
+		t.Fatalf("ColumnOffset() after selecting the last (oversized) column = %d, want %d", got, len(cols)-1)
+	}
+}
+
+// TestScrollColumnIntoViewBreaksWhenScrollingStalls drives both loops'
+// break statements directly: scrollColumnIntoView is called with a
+// selectedColumn set (via the unexported field, bypassing SelectColumn's
+// clamp) outside the columns range in each direction, so the underlying
+// table's ScrollLeft/ScrollRight eventually stop moving the offset while the
+// loop condition still wants more — the scenario the break guards against.
+func TestScrollColumnIntoViewBreaksWhenScrollingStalls(t *testing.T) {
+	cols := make([]Column, 5)
+	values := make([]any, 5)
+	for i := range cols {
+		cols[i] = Column{Name: "col" + strconv.Itoa(i)}
+		values[i] = "v" + strconv.Itoa(i)
+	}
+	rows := []Row{{Key: "0", Values: values}}
+	m := New(cols, rows)
+	m.SetWidth(15)
+
+	// Scroll-right break: an out-of-range selectedColumn can never be
+	// reached, so ScrollRight() eventually stops advancing the offset.
+	m.selectedColumn = len(cols) + 50
+	m.table = m.scrollColumnIntoView(m.table, m.width)
+	if got := m.table.GetHorizontalScrollColumnOffset(); got != len(cols)-1 {
+		t.Fatalf("offset after an unreachable rightward selectedColumn = %d, want %d (maxed out)", got, len(cols)-1)
+	}
+
+	// Scroll-left break: a negative selectedColumn can never be reached
+	// either, so ScrollLeft() eventually stops once the offset hits 0.
+	m.selectedColumn = -50
+	m.table = m.scrollColumnIntoView(m.table, m.width)
+	if got := m.table.GetHorizontalScrollColumnOffset(); got != 0 {
+		t.Fatalf("offset after an unreachable leftward selectedColumn = %d, want 0", got)
+	}
+}
+
+// TestFooterShowsDescendingSortArrow covers footer's descending-direction
+// branch (every other footer-related test only sorts ascending or not at
+// all).
+func TestFooterShowsDescendingSortArrow(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.Sort(0) // ascending
+	m.Sort(0) // descending
+	if got := m.Footer(); !strings.Contains(got, "↓") {
+		t.Fatalf("Footer() after a descending sort = %q, missing ↓", got)
+	}
+}
+
+// TestFooterNoRowsVisibleUnderFilter covers footer's "rows exist but none
+// are currently visible" branch (VisibleIndices' end < start), distinct from
+// the "no rows at all" case — an active filter matching nothing.
+func TestFooterNoRowsVisibleUnderFilter(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.SetFocused(true)
+	m.table = m.table.Focused(true)
+	var cmd tea.Cmd
+	m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: "/", Code: '/'})
+	_ = cmd
+	for _, r := range "zzznomatch" {
+		m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: string(r), Code: r})
+		_ = cmd
+	}
+	if got := m.Footer(); got != "No rows returned." {
+		t.Fatalf("Footer() with a filter matching nothing = %q, want %q", got, "No rows returned.")
+	}
+}
+
+// TestUpdateFallsThroughToBubbleTableForUnhandledKeys covers Update's final
+// fallback: a key the table itself has focus for, but that none of the
+// grid's own switch cases claim (e.g. pgdown), still reaches bubble-table's
+// own Update.
+func TestUpdateFallsThroughToBubbleTableForUnhandledKeys(t *testing.T) {
+	cols := []Column{{Name: "n", Numeric: true}}
+	rows := make([]Row, 30)
+	for i := range rows {
+		rows[i] = Row{Key: strconv.Itoa(i), Values: []any{i}}
+	}
+	m := New(cols, rows, WithMaxVisibleRows(5))
+	m.SetFocused(true)
+	m.table = m.table.Focused(true)
+	before, _ := m.VisibleIndices()
+	_, cmd := m.Update(tea.KeyPressMsg{Text: "", Code: tea.KeyPgDown})
+	_ = cmd
+	after, _ := m.VisibleIndices()
+	if after == before {
+		t.Fatalf("pgdown through Update did not reach bubble-table's own paging: before=%d after=%d", before, after)
+	}
+}
+
+// TestVisibleIndicesColumnOffsetTableViewFooterActiveViewContent exercises
+// the small public accessor/view methods directly against known grid state.
+func TestVisibleIndicesColumnOffsetTableViewFooterActiveViewContent(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+
+	first, last := m.VisibleIndices()
+	if first != 0 || last != len(rows)-1 {
+		t.Fatalf("VisibleIndices() = %d,%d want 0,%d", first, last, len(rows)-1)
+	}
+	if got := m.ColumnOffset(); got != 0 {
+		t.Fatalf("ColumnOffset() = %d, want 0", got)
+	}
+	if got := ansi.Strip(m.TableView()); !strings.Contains(got, "Prague") {
+		t.Fatalf("TableView() = %q, missing a data row", got)
+	}
+	if got := m.Footer(); !strings.Contains(got, "Rows 1") {
+		t.Fatalf("Footer() = %q, missing the row range", got)
+	}
+	if got := ansi.Strip(m.ActiveViewContent(40, 10)); !strings.Contains(got, "Prague") {
+		t.Fatalf("ActiveViewContent() = %q, missing a data row", got)
+	}
+}
+
+// TestViewBodyFallsBackToTableForUnknownView covers viewBody's defensive
+// fallback for a View value outside [ViewTable, len(extraViews)) — not
+// reachable via SetView (which clamps/rejects), only by calling the
+// unexported method directly with a value that predates a shrunk
+// ExtraViews set.
+func TestViewBodyFallsBackToTableForUnknownView(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	got := ansi.Strip(m.viewBody(View(99), 40, 10))
+	want := ansi.Strip(m.table.View())
+	if got != want {
+		t.Fatalf("viewBody(invalid view) = %q, want the table view %q", got, want)
+	}
+}
+
+// TestCurrentRowOnEmptyGrid covers CurrentRow's bounds guard.
+func TestCurrentRowOnEmptyGrid(t *testing.T) {
+	m := New(nil, nil)
+	row, ok := m.CurrentRow()
+	if ok || row.Key != "" || row.Values != nil || row.Ref != nil {
+		t.Fatalf("CurrentRow() on empty grid = %+v,%v want zero Row,false", row, ok)
+	}
+}
+
+// TestSetFocusedNoopWhenUnchanged covers SetFocused's early return when the
+// requested state already matches (no rebuild triggered).
+func TestSetFocusedNoopWhenUnchanged(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	if m.Focused() {
+		t.Fatal("grid should start unfocused")
+	}
+	m.SetFocused(false) // no-op: already false
+	if m.Focused() {
+		t.Fatal("Focused() true after a same-value SetFocused(false)")
+	}
+}
+
+// TestToggleSecondaryFocusIfSplitWithoutLayoutIsNoop covers
+// ToggleSecondaryFocusIfSplit's "not currently split" guard for a non-table
+// view with no LayoutFunc registered at all (splitNow() is unconditionally
+// false without one).
+func TestToggleSecondaryFocusIfSplitWithoutLayoutIsNoop(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(CardView("")))
+	m.SetView(View(firstExtraView))
+	if m.ToggleSecondaryFocusIfSplit() {
+		t.Fatal("ToggleSecondaryFocusIfSplit() = true with no LayoutFunc registered")
+	}
+}
+
+// TestSetViewRejectsOutOfRangeIndex covers SetView's bounds guard: an
+// invalid View value leaves the current view untouched.
+func TestSetViewRejectsOutOfRangeIndex(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(CardView("")))
+	before := m.CurrentView()
+	m.SetView(View(99))
+	if m.CurrentView() != before {
+		t.Fatalf("CurrentView() after SetView(99) = %v, want unchanged %v", m.CurrentView(), before)
+	}
+}
+
+// TestSortRejectsOutOfRangeColumn covers Sort's bounds guard: rows/sort
+// state are left untouched for a column index outside the grid.
+func TestSortRejectsOutOfRangeColumn(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	before := append([]Row(nil), m.rows...)
+	m.Sort(-1)
+	m.Sort(len(cols) + 5)
+	if !reflect.DeepEqual(m.rows, before) {
+		t.Fatalf("rows changed after Sort() with an out-of-range column: %+v, want %+v", m.rows, before)
+	}
+	if column, _ := m.SortState(); column != -1 {
+		t.Fatalf("SortState() column after an out-of-range Sort = %d, want -1 (unchanged)", column)
+	}
+}
+
+// TestExtraViewKeyIndexRejectsInvalidKeys covers extraViewKeyIndex's guard
+// clause for a non-digit or multi-character key.
+func TestExtraViewKeyIndexRejectsInvalidKeys(t *testing.T) {
+	for _, key := range []string{"1", "0", "ab", "", "s"} {
+		if got := extraViewKeyIndex(key); got != -1 {
+			t.Fatalf("extraViewKeyIndex(%q) = %d, want -1", key, got)
+		}
+	}
+}
+
+// TestPaneHeightDefaultsWhenDisabled covers paneHeight's fallback to
+// DefaultMaxVisibleRows when WithMaxVisibleRows(0) disabled paging.
+func TestPaneHeightDefaultsWhenDisabled(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithMaxVisibleRows(0))
+	if got := m.paneHeight(); got != DefaultMaxVisibleRows {
+		t.Fatalf("paneHeight() with paging disabled = %d, want %d", got, DefaultMaxVisibleRows)
+	}
+}
+
+// TestPadOrClampHeightTruncatesExcessLines covers padOrClampHeight's
+// truncation branch (more lines than the requested height).
+func TestPadOrClampHeightTruncatesExcessLines(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	got := m.padOrClampHeight("a\nb\nc\nd", 2)
+	if got != "a\nb" {
+		t.Fatalf("padOrClampHeight truncation = %q, want %q", got, "a\nb")
+	}
+}
+
+// TestTableViewAtSameWidthReturnsRealTableView covers tableViewAt's
+// fast-path short-circuit when asked to render at the Model's own current
+// width.
+func TestTableViewAtSameWidthReturnsRealTableView(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	if got, want := m.tableViewAt(m.Width()), m.table.View(); got != want {
+		t.Fatalf("tableViewAt(m.Width()) diverged from m.table.View()")
+	}
+}
+
+// TestTableViewAtDifferentWidthPreservesFilter covers tableViewAt's "apply
+// the real table's active filter text to the throwaway table" branch, only
+// reachable when rendering at a width other than the Model's own.
+func TestTableViewAtDifferentWidthPreservesFilter(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.SetWidth(60)
+	m.SetFocused(true)
+	m.table = m.table.Focused(true)
+	var cmd tea.Cmd
+	m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: "/", Code: '/'})
+	_ = cmd
+	for _, r := range "Prague" {
+		m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: string(r), Code: r})
+		_ = cmd
+	}
+	view := ansi.Strip(m.tableViewAt(30))
+	if !strings.Contains(view, "Prague") {
+		t.Fatalf("tableViewAt(different width) lost the active filter's match: %q", view)
+	}
+}
+
+// TestTableViewAtFallsBackToFirstRowWhenSourceMissing drives tableViewAt's
+// pos<0 fallback (see findVisiblePositionForTableViewAt's doc comment for
+// why this cannot happen through public API + realistic state alone) via the
+// unexported seam.
+func TestTableViewAtFallsBackToFirstRowWhenSourceMissing(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	original := findVisiblePositionForTableViewAt
+	findVisiblePositionForTableViewAt = func([]table.Row, int) int { return -1 }
+	defer func() { findVisiblePositionForTableViewAt = original }()
+	view := ansi.Strip(m.tableViewAt(30))
+	if !strings.Contains(view, "Prague") && !strings.Contains(view, "Vienna") {
+		t.Fatalf("tableViewAt with a forced-missing source produced no row content: %q", view)
+	}
+}
+
+// TestUnfocusedViewUsesInactiveStyles covers the whole family of "if
+// m.focused {...} else {...}" branches in rebuildTable's rowStyleFunc and
+// card's title/border rendering, none of which any other test drives since
+// every other View() call in this file passes focused=true.
+func TestUnfocusedViewUsesInactiveStyles(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	view := ansi.Strip(m.View(60, false))
+	if !strings.Contains(view, "○") {
+		t.Fatalf("unfocused view missing the inactive bullet: %q", view)
+	}
+	if strings.Contains(view, "●") {
+		t.Fatalf("unfocused view should not show the active bullet: %q", view)
+	}
+	if !strings.Contains(view, "Prague") || !strings.Contains(view, "Vienna") {
+		t.Fatalf("unfocused view missing rows: %q", view)
+	}
+}
+
+// TestUnfocusedViewShowsScrollbarThumb covers scrollbarLine's unfocused thumb
+// and unfocused empty-track branches (a dataset larger than one page,
+// rendered unfocused, so both the "line is within the thumb" and "line is
+// outside the thumb" cases hit their m.focused==false paths).
+func TestUnfocusedViewShowsScrollbarThumb(t *testing.T) {
+	cols := []Column{{Name: "n", Numeric: true}}
+	rows := make([]Row, 30)
+	for i := range rows {
+		rows[i] = Row{Key: strconv.Itoa(i), Values: []any{i}}
+	}
+	m := New(cols, rows, WithMaxVisibleRows(5))
+	view := m.View(40, false)
+	if !strings.Contains(view, "▐") {
+		t.Fatalf("unfocused view over a multi-page dataset should show a scrollbar thumb: %q", ansi.Strip(view))
+	}
+}
+
+// TestEmptyGridViewRendersPlaceholderCard covers card()'s content=="" guard
+// (a grid with no rows renders an empty content block rather than a nil
+// slice) and footer()'s own "No rows returned." branch.
+func TestEmptyGridViewRendersPlaceholderCard(t *testing.T) {
+	m := New(nil, nil)
+	view := ansi.Strip(m.View(30, true))
+	if !strings.Contains(view, "No rows returned.") {
+		t.Fatalf("empty grid view missing the no-rows footer: %q", view)
+	}
+}
+
+// TestUpdateIgnoresNonKeyMessages covers Update's type-assertion guard: a
+// non-KeyPressMsg tea.Msg passes through untouched.
+func TestUpdateIgnoresNonKeyMessages(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	type otherMsg struct{}
+	before := m.CurrentIndex()
+	_, cmd := m.Update(otherMsg{})
+	if cmd != nil {
+		t.Fatal("Update on a non-key message returned a command")
+	}
+	if m.CurrentIndex() != before {
+		t.Fatal("Update on a non-key message changed grid state")
+	}
+}
+
+// TestUpdateRoutesToFocusedFilterInput covers Update's own filter-focused
+// branch (distinct from the tests that drive m.table.Update directly): a
+// key press reaching Update itself while the filter is focused must still
+// reach the filter, not the grid's default key handling.
+func TestUpdateRoutesToFocusedFilterInput(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows)
+	m.SetFocused(true)
+	m.table = m.table.Focused(true)
+	var cmd tea.Cmd
+	m.table, cmd = m.table.Update(tea.KeyPressMsg{Text: "/", Code: '/'})
+	_ = cmd
+	if !m.table.GetIsFilterInputFocused() {
+		t.Fatal("filter did not focus on /")
+	}
+	_, cmd = m.Update(tea.KeyPressMsg{Text: "P", Code: 'P'})
+	_ = cmd
+	if got := m.table.GetCurrentFilter(); got != "P" {
+		t.Fatalf("filter text after Update('P') while focused = %q, want %q", got, "P")
+	}
+}
+
+// TestUpdateOneKeySwitchesToTableView covers Update's own "1" case (as
+// opposed to the digit-2..9 ExtraView path already covered elsewhere).
+func TestUpdateOneKeySwitchesToTableView(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(CardView("")))
+	m.SetView(View(firstExtraView))
+	m.Update(tea.KeyPressMsg{Text: "1", Code: '1'})
+	if m.CurrentView() != ViewTable {
+		t.Fatalf("CurrentView() after '1' = %v, want ViewTable", m.CurrentView())
+	}
+}
+
+// TestUpdateTabTogglesSecondaryFocus covers Update's own "tab" case.
+func TestUpdateTabTogglesSecondaryFocus(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows,
+		WithExtraViews(ExtraView{Label: "Charts", Render: func(*Model, int, int) string { return "" }}),
+		WithSplitLayout(func(totalWidth, naturalWidth int, view View) SplitLayout {
+			return SplitLayout{Split: true, PrimaryWidth: totalWidth / 2, SecondaryWidth: totalWidth / 2}
+		}),
+	)
+	m.SetWidth(100)
+	m.SetView(View(firstExtraView))
+	if m.SecondaryFocus() {
+		t.Fatal("SecondaryFocus() true right after SetView with a split layout")
+	}
+	m.Update(tea.KeyPressMsg{Text: "", Code: tea.KeyTab})
+	if !m.SecondaryFocus() {
+		t.Fatal("SecondaryFocus() false after 'tab' through Update")
+	}
+}
+
+// TestUpdateEnterWithNoCurrentRowIsNoop and TestUpdatePlusWithNoCurrentRefIsNoop
+// cover Enter/+'s own "nothing to act on" fallbacks on an empty grid.
+func TestUpdateEnterWithNoCurrentRowIsNoop(t *testing.T) {
+	m := New(nil, nil)
+	_, cmd := m.Update(tea.KeyPressMsg{Text: "", Code: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("Enter on an empty grid returned a command")
+	}
+}
+
+func TestUpdatePlusWithNoCurrentRefIsNoop(t *testing.T) {
+	m := New(nil, nil)
+	_, cmd := m.Update(tea.KeyPressMsg{Text: "+", Code: '+'})
+	if cmd != nil {
+		t.Fatal("+ on an empty grid returned a command")
+	}
+}
+
+// TestUpdateSecondaryFocusUnclaimedKeyIsNoop covers Update's final
+// secondaryFocus guard: a key the active ExtraView's own Update doesn't
+// claim, isn't one of the grid's own switch cases, and isn't a view-switch
+// digit, is swallowed rather than falling through to bubble-table.
+func TestUpdateSecondaryFocusUnclaimedKeyIsNoop(t *testing.T) {
+	cols, rows := sampleRows()
+	m := New(cols, rows, WithExtraViews(ExtraView{Label: "X", Render: func(*Model, int, int) string { return "" }}))
+	m.SetView(View(firstExtraView))
+	if !m.SecondaryFocus() {
+		t.Fatal("SecondaryFocus() should be true for a non-split non-table view")
+	}
+	_, cmd := m.Update(tea.KeyPressMsg{Text: "z", Code: 'z'})
+	if cmd != nil {
+		t.Fatal("unclaimed key while secondary-focused returned a command")
+	}
+	if m.CurrentView() != View(firstExtraView) {
+		t.Fatal("unclaimed key while secondary-focused changed the view")
+	}
+}
+
+// TestBorderLineLabelStillTooWide drives borderLine's defensive "the
+// truncated label still doesn't fit" fallback via its ansiTruncate seam.
+// ansi.Truncate's own real behaviour guarantees the label always fits once
+// truncated to available-2, so this branch is otherwise unreachable through
+// any text this package can construct — see ansiTruncate's doc comment.
+func TestBorderLineLabelStillTooWide(t *testing.T) {
+	original := ansiTruncate
+	ansiTruncate = func(s string, n int, tail string) string {
+		return strings.Repeat("x", n+10) // deliberately wider than requested
+	}
+	defer func() { ansiTruncate = original }()
+	got := borderLine("╭", "title", "╮", 20)
+	want := "╭" + strings.Repeat("─", 18) + "╮"
+	if got != want {
+		t.Fatalf("borderLine with an oversized truncated label = %q, want the plain fallback %q", got, want)
+	}
+}
+
+// TestPadAnsiLineNonPositiveWidth and TestBorderLineNonPositiveAndTinyWidths
+// cover padAnsiLine/borderLine's own width<=0 and width<3/available<3 guard
+// clauses directly.
+func TestPadAnsiLineNonPositiveWidth(t *testing.T) {
+	if got := padAnsiLine("hello", 0); got != "" {
+		t.Fatalf("padAnsiLine(width=0) = %q, want empty", got)
+	}
+	if got := padAnsiLine("hello", -1); got != "" {
+		t.Fatalf("padAnsiLine(width=-1) = %q, want empty", got)
+	}
+}
+
+func TestBorderLineNonPositiveAndTinyWidths(t *testing.T) {
+	if got := borderLine("╭", "t", "╮", 0); got != "" {
+		t.Fatalf("borderLine(width=0) = %q, want empty", got)
+	}
+	if got := borderLine("╭", "t", "╮", 2); got != "──" {
+		t.Fatalf("borderLine(width=2) = %q, want a plain dashed fallback", got)
+	}
+	// width=4: available=2, below the available<3 floor.
+	if got := borderLine("╭", "title", "╮", 4); got != "╭──╮" {
+		t.Fatalf("borderLine(width=4) = %q, want the plain fallback", got)
 	}
 }
