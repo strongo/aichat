@@ -244,6 +244,35 @@ func TestStream_MidStreamCancelIsCanceled(t *testing.T) {
 	}
 }
 
+// TestStream_TransportErrorAlreadyCanceledIsCanceled mirrors
+// TestDecide_TransportErrorAlreadyCanceledIsCanceled for the Stream path:
+// doStreamRequest's own ctx.Err()!=nil branch (cloud.go around line 153)
+// used to be covered only incidentally by timing-sensitive
+// mid-stream-cancel tests, which missed it under -race often enough to be
+// nondeterministic. An already-cancelled ctx plus a transport that always
+// fails hits that branch on the very first (and only, since the resulting
+// *ai.Error is not retryable) attempt -- no goroutine, no timing.
+func TestStream_TransportErrorAlreadyCanceledIsCanceled(t *testing.T) {
+	c := New(Config{
+		BaseURL: "https://unused.example/",
+		Product: "sneat",
+		Token:   tokenFunc("t"),
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, errors.New("boom: connection aborted")
+		})},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, _, err := ai.Collect(c.Stream(ctx, ai.ChatRequest{}))
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeCanceled {
+		t.Fatalf("err = %v, want ai.Error{Code: ErrCodeCanceled}", err)
+	}
+	if aiErr.Retryable {
+		t.Error("a cancellation must never be retryable")
+	}
+}
+
 func TestDecodeHTTPError_429QuotaNotRetryable(t *testing.T) {
 	// n3: a 429 whose body names ErrCodeQuota (allowance exhausted) must
 	// NOT be forced retryable just because the status is 429 -- retrying an
