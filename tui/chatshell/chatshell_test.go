@@ -2,6 +2,7 @@ package chatshell
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"strings"
 	"testing"
@@ -2266,5 +2267,643 @@ func TestReplaceBlockClampsStaleOldStopAboveRange(t *testing.T) {
 	fe := m.transcript.FocusedEntry()
 	if fe == nil || fe.ID != "b" {
 		t.Fatalf("FocusedEntry() = %+v, want clamped to the remaining stop (b)", fe)
+	}
+}
+
+// --- Mouse support -----------------------------------------------------
+
+func TestMouseMode_MouseTeaMode(t *testing.T) {
+	if got := MouseOff.mouseTeaMode(); got != tea.MouseModeNone {
+		t.Fatalf("MouseOff.mouseTeaMode() = %v, want MouseModeNone", got)
+	}
+	if got := MouseCellMotion.mouseTeaMode(); got != tea.MouseModeCellMotion {
+		t.Fatalf("MouseCellMotion.mouseTeaMode() = %v, want MouseModeCellMotion", got)
+	}
+}
+
+func TestMouse_DefaultIsOff(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	if m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = true, want false by default")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeNone {
+		t.Fatalf("View().MouseMode = %v, want MouseModeNone", view.MouseMode)
+	}
+}
+
+func TestMouse_WithMouseOffStaysOff(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseOff))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	if m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = true, want false")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeNone {
+		t.Fatalf("View().MouseMode = %v, want MouseModeNone", view.MouseMode)
+	}
+
+	// m1 (r1 review): an explicit WithMouse(MouseOff) must not clobber the
+	// mode a later SetMouseEnabled(true) restores -- it must still come
+	// back as MouseCellMotion (New's default), never a silent no-op.
+	m.SetMouseEnabled(true)
+	if view := m.View(); view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("View().MouseMode after SetMouseEnabled(true) = %v, want MouseModeCellMotion", view.MouseMode)
+	}
+}
+
+func TestMouse_WithMouseCellMotionEnablesFromStart(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	if !m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = false, want true")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("View().MouseMode = %v, want MouseModeCellMotion", view.MouseMode)
+	}
+}
+
+func TestMouse_SetMouseEnabledToggle(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+
+	// SetMouseEnabled(true) without ever calling WithMouse falls back to
+	// MouseCellMotion (New's default mouseMode), not a silent no-op.
+	m.SetMouseEnabled(true)
+	if !m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = false after SetMouseEnabled(true)")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("View().MouseMode = %v, want MouseModeCellMotion", view.MouseMode)
+	}
+
+	m.SetMouseEnabled(false)
+	if m.MouseEnabled() {
+		t.Fatal("MouseEnabled() = true after SetMouseEnabled(false)")
+	}
+	if view := m.View(); view.MouseMode != tea.MouseModeNone {
+		t.Fatalf("View().MouseMode = %v, want MouseModeNone", view.MouseMode)
+	}
+}
+
+func TestMouse_WheelScrollsTranscript(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	before := m.transcript.View()
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	afterUp := m.transcript.View()
+	if afterUp == before {
+		t.Fatal("wheel up did not change the transcript view (already at top with room to scroll up? check fixture)")
+	}
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	afterDown := m.transcript.View()
+	if afterDown != before {
+		t.Fatalf("wheel down did not return to the original view:\nbefore=%q\nafterDown=%q", before, afterDown)
+	}
+}
+
+func TestMouse_WheelIgnoredWhileOverlayOpen(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	before := m.transcript.View()
+	m.PushOverlay(&fakeOverlay{})
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	if got := m.transcript.View(); got != before {
+		t.Fatal("wheel scrolled the transcript while an overlay was open")
+	}
+}
+
+// M3 (r1 review): with a SidePanel installed and the pane split, a wheel
+// event in the side panel's column routes to the SidePanel instead of
+// scrolling the transcript, and every wheel event -- routed to the
+// SidePanel or not -- is also always forwarded to an optional MsgHandler.
+
+func TestMouse_WheelInSidePanelColumnRoutesToSidePanel(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{title: "workspace"}
+	m := New(h, WithMouse(MouseCellMotion), WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	beforeTranscript := m.transcript.View()
+
+	sideX := m.chatWidth() + splitSeparatorWidth + 1
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: sideX})
+
+	if panel.updates == 0 {
+		t.Fatal("SidePanel.Update was not called for a wheel event in its column")
+	}
+	if _, ok := panel.lastMsg.(tea.MouseWheelMsg); !ok {
+		t.Fatalf("SidePanel received %T, want tea.MouseWheelMsg", panel.lastMsg)
+	}
+	if got := m.transcript.View(); got != beforeTranscript {
+		t.Fatal("transcript scrolled even though the wheel event was in the side panel's column")
+	}
+	if len(h.msgsSeen) == 0 {
+		t.Fatal("MsgHandler.OnMsg was not called for the wheel event")
+	}
+}
+
+func TestMouse_WheelInChatColumnStillScrollsWithSidePanelInstalled(t *testing.T) {
+	h := &fakeHandler{}
+	panel := &fakeSidePanel{title: "workspace"}
+	m := New(h, WithMouse(MouseCellMotion), WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	beforeTranscript := m.transcript.View()
+	updatesBefore := panel.updates // WindowSizeMsg above already forwarded once
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: 2})
+
+	if got := m.transcript.View(); got == beforeTranscript {
+		t.Fatal("transcript did not scroll for a wheel event in the chat column")
+	}
+	if panel.updates != updatesBefore {
+		t.Fatal("SidePanel.Update was called for a wheel event in the chat column")
+	}
+	if len(h.msgsSeen) == 0 {
+		t.Fatal("MsgHandler.OnMsg was not called")
+	}
+}
+
+// cmdSidePanel2 is a minimal SidePanel whose Update returns a caller-supplied
+// tea.Cmd, for exercising handleMouseWheel's batching of a non-nil SidePanel
+// command (fakeSidePanel above always returns nil).
+type cmdSidePanel2 struct {
+	cmd tea.Cmd
+}
+
+func (p *cmdSidePanel2) Title() string                               { return "panel" }
+func (p *cmdSidePanel2) View(width, height int, focused bool) string { return "panel" }
+func (p *cmdSidePanel2) Update(msg tea.Msg) (SidePanel, tea.Cmd)     { return p, p.cmd }
+
+func TestMouse_WheelBatchesSidePanelCmd(t *testing.T) {
+	h := &fakeHandler{}
+	ran := false
+	panel := &cmdSidePanel2{cmd: func() tea.Msg { ran = true; return nil }}
+	m := New(h, WithMouse(MouseCellMotion), WithSidePanel(panel))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+
+	sideX := m.chatWidth() + splitSeparatorWidth + 1
+	_, cmd := m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: sideX})
+	if cmd == nil {
+		t.Fatal("expected a non-nil batched cmd")
+	}
+	cmd() // drive the batch; the SidePanel's cmd must be among what runs
+	if !ran {
+		t.Fatal("SidePanel's returned cmd was not included in the batch")
+	}
+}
+
+func TestMouse_WheelForwardedToMsgHandlerWithoutSidePanel(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	for i := 0; i < 50; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	if len(h.msgsSeen) != 1 {
+		t.Fatalf("msgsSeen = %d, want 1", len(h.msgsSeen))
+	}
+	if _, ok := h.msgsSeen[0].(tea.MouseWheelMsg); !ok {
+		t.Fatalf("msgsSeen[0] = %T, want tea.MouseWheelMsg", h.msgsSeen[0])
+	}
+}
+
+// cmdMsgHandler is a Handler+MsgHandler whose OnMsg returns a
+// caller-supplied tea.Cmd, for exercising handleMouseWheel's batching of a
+// non-nil MsgHandler command (fakeHandler.OnMsg above always returns nil).
+type cmdMsgHandler struct {
+	cmd tea.Cmd
+}
+
+func (h *cmdMsgHandler) Submit(text string) tea.Cmd { return nil }
+func (h *cmdMsgHandler) OnMsg(msg tea.Msg) tea.Cmd  { return h.cmd }
+
+// r2 review minor: a wheel event over the BUILT-IN sidebar (no SidePanel
+// installed) moves its cursor like Up/Down would, rather than scrolling the
+// transcript -- the sidebar has no scroll offset of its own, it's a cursor
+// list.
+func TestMouse_WheelOverBuiltInSidebarMovesCursorNotTranscript(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+	m.PinToSidebar(session.EntityRef{Type: "t", Keys: map[string]string{"id": "1"}})
+	m.PinToSidebar(session.EntityRef{Type: "t", Keys: map[string]string{"id": "2"}})
+	m.PinToSidebar(session.EntityRef{Type: "t", Keys: map[string]string{"id": "3"}})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	beforeTranscript := m.transcript.View()
+	if got := m.sidebar.Cursor(); got != 0 {
+		t.Fatalf("initial cursor = %d, want 0", got)
+	}
+
+	sideX := m.chatWidth() + splitSeparatorWidth + 1
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown, X: sideX})
+	if got := m.sidebar.Cursor(); got != 1 {
+		t.Fatalf("cursor after wheel-down = %d, want 1", got)
+	}
+	if got := m.transcript.View(); got != beforeTranscript {
+		t.Fatal("transcript scrolled from a wheel event over the sidebar")
+	}
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: sideX})
+	if got := m.sidebar.Cursor(); got != 0 {
+		t.Fatalf("cursor after wheel-up = %d, want 0", got)
+	}
+}
+
+// r2 review minor: a wheel event, wherever it routes, must still reach
+// transcript Blocks via the normal broadcast path (restored -- it was
+// dropped when the dedicated tea.MouseWheelMsg case in Update stopped
+// falling through to dispatchUnhandled).
+// r3 review minor 2: a wheel event in the CHAT column must NOT also
+// broadcast to transcript Blocks -- only the direct viewport scroll fires
+// there. Broadcasting there too would move a Block that handles the wheel
+// itself (scrolling its own internal view) TWICE for one tick: once via its
+// own Update from the broadcast, once via the outer viewport's
+// ScrollUp/Down. See TestMouse_WheelInSideColumnReachesTranscriptBlocksViaBroadcast
+// for the complementary side-column case, where broadcasting IS safe
+// (nothing else moves the transcript there).
+// wheelConsumerBlock is a transcript.Block that also implements
+// transcript.WheelConsumer, for exercising the r4-review "focused Block
+// gets first refusal" rule in the chat column.
+type wheelConsumerBlock struct {
+	fakeBlock
+	consume bool
+}
+
+func (b *wheelConsumerBlock) ConsumesWheel(msg tea.MouseWheelMsg) bool { return b.consume }
+
+// r4 review minor: a wheel event over the SIDE column (sidebar/SidePanel)
+// must never reach the transcript at all -- not the viewport, not any
+// Block -- the transcript has nothing to do with a wheel tick over the
+// sidebar.
+func TestMouse_WheelInSideColumnNeverReachesTranscript(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 20})
+	block := &wheelConsumerBlock{consume: true}
+	m.AppendBlock(block)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift}) // focus the block
+	beforeTranscript := m.transcript.View()
+
+	sideX := m.chatWidth() + splitSeparatorWidth + 1
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown, X: sideX})
+
+	if block.updates != 0 {
+		t.Fatalf("transcript Block received the wheel event over the side column (updates=%d), want 0", block.updates)
+	}
+	if got := m.transcript.View(); got != beforeTranscript {
+		t.Fatal("transcript viewport moved for a wheel event over the side column")
+	}
+}
+
+// r4 review minor: in the CHAT column, a focused Block implementing
+// transcript.WheelConsumer that reports it consumes the event gets the
+// message delivered to it INSTEAD OF chatshell scrolling the transcript
+// viewport.
+func TestMouse_WheelChatColumn_ConsumingFocusedBlockSkipsViewportScroll(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	block := &wheelConsumerBlock{consume: true}
+	m.AppendBlock(block)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift}) // focus the block
+	beforeTranscript := m.transcript.View()
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown, X: 2})
+
+	if block.updates != 1 {
+		t.Fatalf("block.updates = %d, want 1 (delivered once)", block.updates)
+	}
+	if _, ok := block.lastEvent.(tea.MouseWheelMsg); !ok {
+		t.Fatalf("block.lastEvent = %T, want tea.MouseWheelMsg", block.lastEvent)
+	}
+	if got := m.transcript.View(); got != beforeTranscript {
+		t.Fatal("transcript viewport also scrolled even though the focused Block consumed the wheel event")
+	}
+}
+
+// r4 review minor: a focused Block that implements WheelConsumer but
+// DECLINES the event (ConsumesWheel returns false) falls back to
+// chatshell's own viewport scroll -- and the Block is never delivered the
+// message at all (it declined, nothing to dispatch).
+func TestMouse_WheelChatColumn_DecliningFocusedBlockFallsBackToViewportScroll(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	// Appended LAST (so it's near the bottom, where the viewport already
+	// sits, leaving room to scroll UP into the 100 lines above it once
+	// focused).
+	block := &wheelConsumerBlock{consume: false}
+	m.AppendBlock(block)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift}) // focus the block (the only focusable stop)
+	beforeTranscript := m.transcript.View()
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: 2})
+
+	if block.updates != 0 {
+		t.Fatalf("block.updates = %d, want 0 (it declined, so it must not be dispatched to)", block.updates)
+	}
+	if got := m.transcript.View(); got == beforeTranscript {
+		t.Fatal("transcript viewport did not scroll despite the focused Block declining the wheel event")
+	}
+}
+
+// r4 review minor: a non-WheelConsumer focused Block (the common case)
+// falls back to chatshell's own viewport scroll, same as no Block focused
+// at all.
+func TestMouse_WheelChatColumn_NonConsumerBlockFallsBackToViewportScroll(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := 0; i < 100; i++ {
+		m.AppendAssistant(fmt.Sprintf("line %d", i))
+	}
+	block := &fakeBlock{} // appended LAST -- see the decline test above for why
+	m.AppendBlock(block)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift})
+	beforeTranscript := m.transcript.View()
+
+	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp, X: 2})
+
+	if block.updates != 0 {
+		t.Fatalf("block.updates = %d, want 0 (fakeBlock does not implement WheelConsumer)", block.updates)
+	}
+	if got := m.transcript.View(); got == beforeTranscript {
+		t.Fatal("transcript viewport did not scroll despite the focused Block not implementing WheelConsumer")
+	}
+}
+
+func TestMouse_WheelBatchesMsgHandlerCmd(t *testing.T) {
+	ran := false
+	h := &cmdMsgHandler{cmd: func() tea.Msg { ran = true; return nil }}
+	m := New(h, WithMouse(MouseCellMotion))
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	_, cmd := m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	if cmd == nil {
+		t.Fatal("expected a non-nil batched cmd")
+	}
+	cmd()
+	if !ran {
+		t.Fatal("MsgHandler's returned cmd was not included in the batch")
+	}
+}
+
+// --- Zone / FocusedEntryID -------------------------------------------------
+
+func TestZone_ReflectsFocusRing(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	if got := m.Zone(); got != focus.ZoneInput {
+		t.Fatalf("Zone() = %v, want ZoneInput", got)
+	}
+
+	m.AppendBlock(&fakeBlock{})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift})
+	if got := m.Zone(); got != focus.ZoneTranscript {
+		t.Fatalf("Zone() = %v, want ZoneTranscript", got)
+	}
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift})
+	if got := m.Zone(); got != focus.ZoneSidebar {
+		t.Fatalf("Zone() = %v, want ZoneSidebar", got)
+	}
+}
+
+func TestFocusedEntryID_ReportsFocusedTranscriptEntry(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+
+	if got := m.FocusedEntryID(); got != "" {
+		t.Fatalf("FocusedEntryID() = %q, want \"\" before anything is focused", got)
+	}
+
+	if ok := m.AppendBlockWithID("blk-1", &fakeBlock{}); !ok {
+		t.Fatal("AppendBlockWithID failed")
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModShift})
+	if got := m.FocusedEntryID(); got != "blk-1" {
+		t.Fatalf("FocusedEntryID() = %q, want blk-1", got)
+	}
+
+	// Moving focus to the sidebar leaves the transcript unfocused again.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift})
+	if got := m.FocusedEntryID(); got != "" {
+		t.Fatalf("FocusedEntryID() = %q, want \"\" once focus left the transcript", got)
+	}
+}
+
+// --- PopOverlay / async-safe overlay pattern -------------------------------
+
+func TestPopOverlay_ClosesTopOverlay(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.PushOverlay(&fakeOverlay{name: "a"})
+	m.PushOverlay(&fakeOverlay{name: "b"})
+	if len(m.overlays) != 2 {
+		t.Fatalf("overlays = %d, want 2", len(m.overlays))
+	}
+	m.PopOverlay()
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays after PopOverlay = %d, want 1", len(m.overlays))
+	}
+	if name := m.overlays[0].(*fakeOverlay).name; name != "a" {
+		t.Fatalf("remaining overlay = %q, want a", name)
+	}
+	m.PopOverlay()
+	if len(m.overlays) != 0 {
+		t.Fatalf("overlays after 2nd PopOverlay = %d, want 0", len(m.overlays))
+	}
+}
+
+func TestPopOverlay_NoopWhenNoneOpen(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	if cmd := m.PopOverlay(); cmd != nil {
+		t.Fatal("expected nil cmd popping an empty overlay stack")
+	}
+	if len(m.overlays) != 0 {
+		t.Fatalf("overlays = %d, want 0", len(m.overlays))
+	}
+}
+
+// asyncResultMsg is a stand-in for a product's own async submit-result
+// message (e.g. a save-to-server response), used by
+// TestAsyncOverlay_StaysOpenOnFailureClosesOnSuccess below.
+type asyncResultMsg struct{ ok bool }
+
+// asyncFakeOverlay is a minimal Overlay whose own Update never itself
+// closes it (done is always false) -- exactly the async-safe pattern
+// PopOverlay documents: the PRODUCT closes it later, once an async result
+// message (routed through MsgHandler.OnMsg, per dispatchUnhandled -- never
+// overlay input) tells it the submit succeeded.
+type asyncFakeOverlay struct {
+	lastErr string
+}
+
+func (o *asyncFakeOverlay) View(width, height int) string { return "overlay" }
+
+func (o *asyncFakeOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd, bool) {
+	return o, nil, false
+}
+
+// asyncOverlayHandler is a Handler+MsgHandler that reacts to asyncResultMsg
+// by either closing the overlay it holds (success) or recording an error on
+// it while leaving it open (failure) -- the product-side half of the
+// async-safe overlay pattern PopOverlay documents.
+type asyncOverlayHandler struct {
+	model   *Model
+	overlay *asyncFakeOverlay
+}
+
+func (h *asyncOverlayHandler) Submit(text string) tea.Cmd { return nil }
+
+func (h *asyncOverlayHandler) OnMsg(msg tea.Msg) tea.Cmd {
+	res, ok := msg.(asyncResultMsg)
+	if !ok {
+		return nil
+	}
+	if res.ok {
+		// r3 review MAJOR: CloseOverlay(h.overlay), not PopOverlay() --
+		// PopOverlay closes whatever is CURRENTLY on top, which is wrong
+		// once a second overlay might have been stacked on top of this one
+		// before the async result arrived (see
+		// TestCloseOverlay_ClosesCorrectOverlayEvenWhenAnotherIsStackedOnTop).
+		h.model.CloseOverlay(h.overlay)
+	} else {
+		h.overlay.lastErr = "submit failed"
+	}
+	return nil
+}
+
+func TestAsyncOverlay_StaysOpenOnFailureClosesOnSuccess(t *testing.T) {
+	overlay := &asyncFakeOverlay{}
+	h := &asyncOverlayHandler{overlay: overlay}
+	m := New(h)
+	h.model = m
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.PushOverlay(overlay)
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays = %d, want 1", len(m.overlays))
+	}
+
+	// A failed async result is NOT overlay input (isOverlayInputMsg only
+	// classifies key/paste/mouse messages), so it reaches OnMsg via
+	// dispatchUnhandled's default routing even while the overlay is open,
+	// and the product leaves the overlay open with an error recorded.
+	m.Update(asyncResultMsg{ok: false})
+	if len(m.overlays) != 1 {
+		t.Fatal("overlay closed on a failed async submit, want it to stay open")
+	}
+	if overlay.lastErr != "submit failed" {
+		t.Fatalf("overlay.lastErr = %q, want it updated in place", overlay.lastErr)
+	}
+
+	// A successful async result closes it via CloseOverlay.
+	m.Update(asyncResultMsg{ok: true})
+	if len(m.overlays) != 0 {
+		t.Fatal("overlay still open after a successful async submit")
+	}
+}
+
+// TestCloseOverlay_ClosesCorrectOverlayEvenWhenAnotherIsStackedOnTop is the
+// r3 review MAJOR regression PopOverlay could not handle: dialog A's async
+// submit is in flight, the user opens dialog B on top of it, and A's result
+// lands -- CloseOverlay(A) must remove A specifically and leave B open,
+// where PopOverlay() would have wrongly closed B (whatever is on top).
+func TestCloseOverlay_ClosesCorrectOverlayEvenWhenAnotherIsStackedOnTop(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	a := &fakeOverlay{name: "a"}
+	b := &fakeOverlay{name: "b"}
+	m.PushOverlay(a)
+	m.PushOverlay(b)
+	if len(m.overlays) != 2 {
+		t.Fatalf("overlays = %d, want 2", len(m.overlays))
+	}
+
+	if ok := m.CloseOverlay(a); !ok {
+		t.Fatal("CloseOverlay(a) = false, want true")
+	}
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays after CloseOverlay(a) = %d, want 1", len(m.overlays))
+	}
+	if got := m.overlays[0].(*fakeOverlay).name; got != "b" {
+		t.Fatalf("remaining overlay = %q, want b (a was removed, not the top)", got)
+	}
+}
+
+func TestCloseOverlay_NotFoundReturnsFalse(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.PushOverlay(&fakeOverlay{name: "a"})
+	other := &fakeOverlay{name: "never pushed"}
+	if ok := m.CloseOverlay(other); ok {
+		t.Fatal("CloseOverlay of an overlay never pushed = true, want false")
+	}
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays = %d, want 1 (untouched)", len(m.overlays))
+	}
+}
+
+func TestCloseOverlay_EmptyStackReturnsFalse(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	if ok := m.CloseOverlay(&fakeOverlay{}); ok {
+		t.Fatal("CloseOverlay on an empty stack = true, want false")
+	}
+}
+
+// nonPointerOverlay is a VALUE-typed Overlay (never a *T), used to prove
+// CloseOverlay reports false rather than panicking or matching by value
+// equality -- see Overlay's doc: implementations MUST be pointer types.
+type nonPointerOverlay struct{}
+
+func (nonPointerOverlay) View(width, height int) string { return "" }
+func (nonPointerOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd, bool) {
+	return nonPointerOverlay{}, nil, false
+}
+
+func TestCloseOverlay_NonPointerOverlayNeverMatches(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.PushOverlay(nonPointerOverlay{})
+	if ok := m.CloseOverlay(nonPointerOverlay{}); ok {
+		t.Fatal("CloseOverlay matched a non-pointer Overlay, want false")
+	}
+	if len(m.overlays) != 1 {
+		t.Fatalf("overlays = %d, want 1 (untouched)", len(m.overlays))
+	}
+}
+
+func TestCloseOverlay_NilPointerOverlayNeverMatches(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	var nilOverlay *fakeOverlay
+	if ok := m.CloseOverlay(nilOverlay); ok {
+		t.Fatal("CloseOverlay matched a nil *fakeOverlay, want false")
 	}
 }

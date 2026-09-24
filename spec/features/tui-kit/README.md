@@ -44,11 +44,19 @@ The module's `tui/*` tree MUST be organised as: `tui` (the message vocabulary sh
 
 #### REQ: transcript-block-contract
 
-`tui/transcript.Block` MUST be the extension point for a rich transcript entry (e.g. a `tui/grid.Model`): `View(width int, focused bool) string`, `Update(msg tea.Msg) (Block, tea.Cmd)` (the Bubble Tea value-model convention: `Update` returns the possibly-new `Block` value, never mutates in place), and `Focusable() bool`. A `Block` that also implements `EntityBlock` (`Current() *session.EntityRef`) additionally reports which entity is under its cursor, which `chatshell.Model.FocusedRef` and "Add to sidebar" use.
+`tui/transcript.Block` MUST be the extension point for a rich transcript entry (e.g. a `tui/grid.Model`): `View(width int, focused bool) string`, `Update(msg tea.Msg) (Block, tea.Cmd)` (the Bubble Tea value-model convention: `Update` returns the possibly-new `Block` value, never mutates in place), and `Focusable() bool`. A `Block` that also implements `EntityBlock` (`Current() *session.EntityRef`) additionally reports which entity is under its cursor, which `chatshell.Model.FocusedRef` and "Add to sidebar" use; one that implements `WheelConsumer` (`ConsumesWheel(msg tea.MouseWheelMsg) bool`) can claim a mouse wheel event for itself while focused instead of chatshell scrolling the transcript viewport for it (see REQ: chatshell-mouse-support).
 
 #### REQ: transcript-streamed-append
 
 `transcript.Model` MUST support appending a streamed entry by `ID` once (`Append` with a non-empty `ID`) and then progressively extending its text (`AppendDelta(id, text)`) as further deltas arrive, without re-rendering or re-flowing entries that aren't changing -- a streamed response must not require buffering its full text before any of it can be displayed.
+
+Every path that can add or change transcript content (`Append`, `AppendDelta`, `ReplaceBlock`, `InvalidateAndRebuild`) auto-scrolls to the bottom ONLY when the viewport was already at the bottom (r4 review, folding in a pre-existing gap): focus being unset (`focusIndex < 0`, i.e. focus is on the composer or sidebar, not any transcript stop) MUST NOT by itself be treated as a reason to follow -- an UNFOCUSED viewport the user has manually wheel-scrolled up MUST NOT be yanked back to the bottom by an arriving delta, same as a focused-on-an-earlier-stop viewport already wasn't. This is `shouldAutoFollow`'s single rule (`viewport.AtBottom()`), shared with `SetSize`'s own follow-unless-at-bottom behaviour (REQ: transcript-setsize-idempotent-and-preserves-scroll) -- a resize with no new content and a streamed delta that IS new content now agree on exactly when following is appropriate.
+
+#### REQ: transcript-setsize-idempotent-and-preserves-scroll
+
+`transcript.Model.SetSize(width, height int)` MUST be a NO-OP (no re-`Rebuild`, no viewport mutation) when NEITHER dimension actually changed from the Model's current size (r3 review, B1). This matters because a caller may legitimately call `SetSize` with the SAME dimensions on every single render -- `chatshell.Model.View()` does exactly this (REQ: chatshell-composer-chips's `historyHeight`/`resize` note) -- and unconditionally re-`Rebuild`ing on every such call had two user-visible regressions: it silently scrolled a manually-scrolled-up viewport back to the bottom on every no-op call, and it re-ran `ensureBlockVisible` for a focused entry on every no-op call too, both on top of the wasted re-render cost of resizing to the size it already was.
+
+When the size DOES change, `SetSize` MUST preserve the viewport's current scroll position UNLESS it was already at the bottom (`viewport.AtBottom()`, checked BEFORE applying the new dimensions), in which case it keeps following -- the same "at the bottom" rule `shouldAutoFollow` applies for `Append`/`ReplaceBlock`/`AppendDelta` (REQ: transcript-streamed-append, r4 review): a genuine resize with no NEW content to show has no reason to jump a scrolled-up viewport back to the bottom the way new content arriving does.
 
 ### Stream pump
 
@@ -82,6 +90,18 @@ An optional `SidePanelPinner` capability (`PinRef(ref session.EntityRef) bool`, 
 
 `chatshell.Model.PushOverlay(o Overlay) tea.Cmd` (`Overlay`: `View(width, height int) string`, `Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)`) MUST push a modal dialog onto an overlay stack. While the stack is non-empty, the TOP overlay MUST capture user INPUT ONLY — key presses, paste, and mouse events — until its `Update` returns `done: true`, at which point it is popped; an OLDER overlay beneath it MUST NOT receive any message while a newer one is on top. Every OTHER message (stream pump events, the spinner tick, sidebar/product messages, ...) takes chatshell's NORMAL path even while an overlay is open, so e.g. a stream keeps completing and clears `Busy()` behind an open dialog. A `tea.WindowSizeMsg` MUST still resize the shell (and forward to an active `SidePanel`) even while an overlay is open. The top overlay MUST be rendered centred over the rest of the screen, CLAMPED to the box it was asked to render into (`View`'s `width`/`height` arguments) regardless of what it actually draws.
 
+`Overlay` implementations MUST be POINTER types (r3 review, minor 1): `updateOverlay` stores back whatever value `Update` returns, so a value receiver's own mutations are preserved regardless, but `CloseOverlay`'s identity match (below) can only ever find a pointer, since Go interface equality on a struct value compares fields, not "is this the same logical dialog" — a value `Overlay` a product still holds a copy of never `==` the (possibly re-wrapped) value `Update` last returned.
+
+`chatshell.Model.PopOverlay() tea.Cmd` MUST close the TOP overlay PROGRAMMATICALLY, without waiting for its own `Update` to report `done: true`, and MUST be a no-op (return `nil`) when the overlay stack is empty. PopOverlay is TOP-ONLY: it closes whatever happens to be on top, regardless of which overlay a caller "meant" — correct for the common single-overlay case, but WRONG (r3 review, MAJOR) for the ASYNC-SAFE overlay pattern below once a SECOND overlay can be stacked on top of the first before its async result arrives (dialog A's submit is in flight, the user opens dialog B on top of it, A's result lands: `PopOverlay` would close B, not A).
+
+`chatshell.Model.CloseOverlay(o Overlay) bool` MUST remove `o` from the overlay stack WHEREVER IT IS (not only if it's on top), matching by POINTER IDENTITY, and report whether it was found and removed. A non-pointer `Overlay`, or a nil pointer, MUST NOT match anything (`CloseOverlay` returns `false`) rather than panicking — identity MUST be extracted via reflection (or an equivalent safe mechanism) specifically to avoid a runtime panic comparing two interface values whose dynamic type is non-comparable (e.g. one holding a slice or map field), which a direct `==` comparison would risk.
+
+Async-safe overlay pattern: an `Overlay` that must stay open ACROSS an async round trip (e.g. a form whose submission posts to a server before the dialog can close) returns `done: false` plus a product `tea.Cmd` from its own `Update` on submit, exactly like any other command chatshell dispatches. The product's own async RESULT message, once it arrives, is NOT itself overlay input (`isOverlayInputMsg` classifies only key/paste/mouse messages) — it takes chatshell's normal `Update` path and reaches an optional `MsgHandler.OnMsg` EVEN WHILE THE OVERLAY IS STILL OPEN (even while ANOTHER overlay has since been stacked on top of it), the same as every other non-input message this REQ already routes around an open overlay. From there the product calls `CloseOverlay(o)` with the SAME `*T` it passed to `PushOverlay` on success (`PopOverlay` is unsafe here once more than one overlay might be open at once), or updates the overlay in place to show an error while keeping the user's draft (e.g. an optional `interface{ OnResult(any) }` capability the product's own `Overlay` implements, or simply because the product holds that same pointer and can mutate it directly) — `chatshell` itself defines no such result-routing interface; it only guarantees the message reaches `OnMsg` and that `CloseOverlay`/`PopOverlay` work.
+
+#### REQ: chatshell-focus-accessors
+
+`(m *Model) Zone() focus.Zone` MUST report the focus ring's current zone (`focus.ZoneInput`, `focus.ZoneTranscript`, or `focus.ZoneSidebar` — the sidebar zone covers both the built-in sidebar and an installed `SidePanel`), e.g. for a product's context-specific status hint. `(m *Model) FocusedEntryID() string` MUST report the `id` of the transcript entry currently under focus (`AppendBlockWithID`/`StartStream`'s id), and MUST return `""` when the transcript isn't the focused zone, no entry is focused, or the focused entry was never given an id (a plain `AppendUser`/`AppendAssistant`/`AppendBlock` entry).
+
 #### REQ: chatshell-global-keys
 
 `chatshell.WithGlobalKeys(func(tea.KeyPressMsg) (tea.Cmd, bool))` MUST be checked BEFORE chatshell's own key handling (Ctrl+C, Esc, F6, Shift+arrows, the composer, ...) on every `tea.KeyPressMsg` chatshell would otherwise process (i.e. when no `Overlay` is capturing it) -- returning `consumed: true` stops chatshell from handling that key at all this cycle; `consumed: false` lets chatshell's normal handling proceed as if the hook were absent.
@@ -101,6 +121,35 @@ An optional `SidePanelPinner` capability (`PinRef(ref session.EntityRef) bool`, 
 `chatshell.WithMarkdownRenderer(r transcript.MarkdownRenderer)` MUST configure the renderer `AppendAssistantMarkdown(text string)` — and any `transcript.Entry` with `Markdown` set — uses (e.g. a glamour-backed renderer for agent or HTTP-response markdown), equivalent to `transcript.New(transcript.WithMarkdownRenderer(r))` but settable on a `chatshell.Model`'s already-constructed transcript. `StartStreamMarkdown(id string, open func(ctx context.Context) iter.Seq2[ai.Event, error]) tea.Cmd` MUST behave exactly like `StartStream` except the streaming entry is created with `Markdown` set; with no renderer configured it behaves identically to `StartStream` (the flag is inert).
 
 Every delta's text MUST be accumulated onto the entry immediately (so the final `Text` is always complete), but re-running the renderer over that accumulated text on every single delta is NOT required and MUST be throttled: at most once per a bounded time window (`markdownRenderThrottle`, 100ms), PLUS any delta whose text crosses a newline (a likely-stable rendering point such as a completed list item or paragraph) forces an immediate re-render even inside that window, PLUS the stream's completion MUST always force one final re-render regardless of the window, so the displayed markdown is never stale once the stream ends. A delta that gets throttled out (m1, r3 review) MUST also schedule a ONE-SHOT `tea.Tick` follow-up render `markdownRenderThrottle` later, guaranteeing its trailing fragment still renders even if NO further delta ever arrives (a stalled or slow-trickling stream) -- not only "wait for the next delta or completion"; at most one such follow-up is pending at a time (a delta arriving before it fires does not schedule a second one). `chatshell.Model` exposes no way to disable this throttle; a product that needs every-delta rendering re-renders its own copy of the accumulated `Text` outside `chatshell`.
+
+#### REQ: chatshell-mouse-support
+
+`chatshell.WithMouse(mode MouseMode)` MUST set the chat screen's initial mouse-reporting state: `MouseOff` (the default when `WithMouse` is never called) requests no mouse reporting at all -- the terminal's own native text selection/copy keeps working -- and `MouseCellMotion` requests click/release/wheel events (`tea.MouseModeCellMotion`) from construction. `WithMouse(MouseOff)` MUST NOT overwrite the Model's configured mode down to `MouseOff` -- only an actual enabling mode (`MouseCellMotion`) updates it; `MouseOff` only clears the enabled flag, so a LATER `SetMouseEnabled(true)` still restores `MouseCellMotion` (New's default) rather than silently staying off forever because the mode itself was clobbered. `(m *Model) SetMouseEnabled(enabled bool)` MUST toggle mouse reporting at runtime -- e.g. DataTug's F2 capture toggle, since a terminal's native text selection is unusable while mouse reporting is on, so a product offering both needs a key to flip between them -- taking effect on the next `View()` (chatshell has no way to push a mode change to the terminal outside the normal render cycle); `enabled: true` restores the mode configured via `WithMouse` (`MouseCellMotion` if `WithMouse` was never called OR was only ever called with `MouseOff`, never a silent no-op), `enabled: false` requests `tea.MouseModeNone` regardless of that configured mode. `(m *Model) MouseEnabled() bool` MUST report the current toggle state. `View()` MUST set the returned `tea.View`'s `MouseMode` from this state on every render.
+
+EXCEPT while an `Overlay` is on the stack (where it is already captured as overlay input, per REQ: chatshell-overlay's existing `isOverlayInputMsg` classification, unchanged by this REQ, and never reaches any of the below), a `tea.MouseWheelMsg` routes on whether the pane is split (REQ: chatshell-side-panel's `splitEnabled`) and the event's `X` falls at or past the side/sidebar column (`chatWidth() + 3`, the width of the " │ " divider `View()` draws between the chat column and that column):
+
+- in the SIDE column, the event goes ONLY to the `SidePanel`/sidebar (r4 review: the transcript has NOTHING to do with a wheel tick over the sidebar/SidePanel column -- an earlier revision broadcast it to transcript `Block`s there too, which read backwards). When a `SidePanel` is installed (`WithSidePanel`), the raw event is forwarded to `SidePanel.Update` (free to interpret `X`/`Y`/`Button` itself); otherwise (the BUILT-IN `tui/sidebar`, which has no scroll offset of its own -- it is a cursor list, not a viewport), the event moves its cursor the same way an Up/Down key would: `tea.KeyPressMsg{Code: tea.KeyUp}` for `tea.MouseWheelUp`, `tea.KeyPressMsg{Code: tea.KeyDown}` for `tea.MouseWheelDown`, forwarded to `sidebar.Model.Update`.
+- in the CHAT column (the default: not split, or `X` short of that boundary), the FOCUSED transcript `Block` gets first refusal via the optional `transcript.WheelConsumer` capability (`ConsumesWheel(msg tea.MouseWheelMsg) bool`, a pure query with no side effect): `transcript.Model.DeliverWheelToFocusedBlock(msg)` MUST dispatch msg to the focused entry's `Block` ONLY (never a broadcast to every entry) IF that `Block` implements `WheelConsumer` AND `ConsumesWheel(msg)` reports true for it, reporting `consumed: true` and the `Block`'s own returned `tea.Cmd`; chatshell scrolls the transcript viewport itself (`tea.MouseWheelUp`/`tea.MouseWheelDown` calling `transcript.Model.ScrollUp`/`ScrollDown`) IF AND ONLY IF `DeliverWheelToFocusedBlock` reported `consumed: false` -- no Block is focused, the focused `Block` doesn't implement `WheelConsumer`, or it declined this particular event. This is what prevents "wheel double-move" (r3 review, minor 2): a focused `Block` that handles `tea.MouseWheelMsg` itself (scrolling its own internal view, e.g. a grid's row list) is dispatched to EXACTLY ONCE and the transcript viewport does NOT also move for the same tick; a `Block` that declines, or doesn't implement the capability at all, is never dispatched to, and the viewport scrolls exactly as if no `Block` were focused.
+
+The transcript receives a wheel event through AT MOST ONE mechanism per tick, never both: the focused-`Block` dispatch OR the direct viewport scroll in the chat column (never simultaneously), and NEITHER in the side column. Regardless of which column applies, a `tea.MouseWheelMsg` MUST ALSO always be forwarded to an optional `MsgHandler.OnMsg` (same as `dispatchUnhandled` forwards every other message chatshell does not itself fully own), and any non-nil `tea.Cmd` from the focused-`Block` dispatch, the `SidePanel`/sidebar routing, or `MsgHandler` MUST be included in the returned batch.
+
+#### REQ: chatshell-composer-chips
+
+`chatshell.Chip{ID, Label string; Ref *session.EntityRef}` is a product-neutral attachment shown as a removable pill above the composer input (ported from DataTug's `ContextReference`-backed attachment chips, datatug-cli#291, matched step for step against DataTug's own `TestComposerAttachmentChipsCanBeFocusedClearedAndRestored`, `origin/main:pkg/chat/workspace_test.go`). `WithChips(chips []Chip)` sets the composer's initial chips; `(m *Model) SetChips(chips []Chip)`/`Chips() []Chip` replace/read the current list at runtime (both take/return defensive copies); `RemoveChip(id string) (tea.Cmd, bool)` (the bool reports whether a chip with that ID was found and removed; false, cmd nil, for an unknown ID) and `ClearChips() tea.Cmd` are product-facing equivalents of a focused-chip removal and Esc's chip-clear step (below), for a product's own UI controls -- both snapshot the pre-change draft exactly like the built-in key/mouse paths, and `ClearChips` on an already-empty list is a no-op. Chips render as one or more WRAPPED rows directly above the input -- each pill `"[Label ×]"`, truncated when a single label would overflow the available width -- and `historyHeight()` (the transcript viewport's fixed height) MUST shrink by exactly the number of chip rows currently rendered, and grow back as chips are removed, so the total layout never overflows `m.height`. `historyHeight()` MUST ALSO account for the rendered top bar's own height (1 line for the default title, or however many a product's `WithTopBar` renders), the open slash-command menu's height, and -- while `Busy()` -- the spinner's own trailing line (`View()` appends `"\n" + spinner + " thinking…"` after the transcript while busy; that line MUST be reserved, not left to silently grow the total by one), so `View()`'s total rendered height equals `m.height` exactly in every combination -- not just the chip-free, single-line-top-bar, no-menu, idle case the constant it replaces silently assumed. Because `historyHeight()` depends on state that can change WITHOUT any of resize()'s traditional call sites (`WindowSizeMsg`, `F6`, `Ctrl+Left`/`Right`, a chip-list change) running -- typing `/` opens the menu, `SetStatus` changes the status segment's height, `SetBusy(true)`/`StartStream` reserves the spinner line -- `View()` MUST re-apply `resize()` (which re-applies `historyHeight()` to the transcript's actual viewport size, among other sizes) at the START of every call, unconditionally, rather than relying on some other event handler to have called it already (r2 review, B1: without this, the transcript's actual on-screen size drifts stale between the state change and the next WindowSizeMsg/F6/chip change, both over/under-filling the screen AND desyncing `chipsTopY`'s click math -- computed fresh from the CURRENT `historyHeight()` at click time -- from whatever was ACTUALLY drawn by the last, stale render, so a click meant for the menu or elsewhere could be misread as landing on a chip's `×`). Calling `resize()` -- and therefore `transcript.SetSize` -- on EVERY render this way relies on `transcript.SetSize` itself being a safe no-op when nothing actually changed (REQ: transcript-setsize-idempotent-and-preserves-scroll, r3 review): without that guarantee, the per-frame call would itself re-snap a wheel-scrolled-up transcript back to the bottom on every single render.
+
+**Composer draft (b1, r1 review):** chatshell keeps ONE `composerDraft{text, chips}` snapshot at a time, covering BOTH the composer's text and its chip list together (not a chips-only snapshot) -- mirroring DataTug's own `composerUndo`/`rememberComposerDraft`/`restoreComposerDraft`. `snapshotComposerUndo` captures the CURRENT text and chips the first time either changes since the last successful restore, submit, or composer text edit; a run of several changes (several chip removals, or a chip removal following Esc's text-clear step) with nothing resetting the snapshot in between is undone as ONE unit by Shift+Esc, not one change at a time. The snapshot is dropped (set to nil) as soon as ANY of these happen: the composer text is edited (even to the same value being re-typed --any change to `input.Value()` counts, matching DataTug), a message is submitted (`Enter`), or a restore succeeds.
+
+**Esc's two-step clear, in the input zone, checked after the slash-menu and busy checks (b1):** the FIRST Esc, while the composer has text, clears the TEXT ONLY -- even while a chip is currently focused, since "there's text to clear" and "a chip is focused" are independent conditions, and the first Esc always answers the text question first. The SECOND Esc, once the text is already empty, detaches EVERY chip (equivalent to `ClearChips`). When Esc is pressed with NO text already (chips or not), it goes straight to the chip-clearing step -- there is no empty first step. Either step snapshots the draft first (`snapshotComposerUndo`). Esc with nothing to clear (no text, no chips) is a no-op that falls through to the existing default focus-ring Esc behaviour, unchanged.
+
+**Shift+Esc / Ctrl+Y** (both keys, same behaviour) restore the composer draft: the TEXT exactly as snapshotted, and the CHIP LIST as the snapshot's chips UNION any chip present now that ISN'T represented in the snapshot (matched by `ID`, or by `Label` when `ID` is empty) -- appended after the snapshot's own chips, in their current order (m2, r1 review). This means a chip removed since the snapshot is restored (that's the whole point), while a chip the product attached via `SetChips` AFTER the snapshot was taken is KEPT, not silently discarded by an undo that was never about it. Restoring clears chip focus (returns keyboard focus to the input) and clears the snapshot itself. It is a no-op when there is nothing to restore, or while `Busy()` is true.
+
+**Keyboard, in the input zone:** `Tab`/`Shift+Tab` cycle chip focus through every chip index plus one extra "no chip focused" state (`(focus+1)%(count+1)`, matching DataTug's `attachmentFocus` cycle) -- `Tab` from the input focuses the first chip, `Tab` from the last chip returns focus to the input, `Shift+Tab` is the same cycle in reverse; entering/leaving chip focus blurs/focuses the composer's textarea to match, since chip focus and text-input focus are mutually exclusive. While a chip is focused, `Left`/`Right` move focus to the adjacent chip (clamped at the first/last, no wrap), and `Backspace`/`Delete` remove exactly that chip (snapshotting first). `Ctrl+D` removes the LAST chip regardless of which (if any) chip is focused (DataTug's own built-in shortcut), also snapshotting first. `Enter` with a chip focused (m1, r1 review) submits normally AND resets chip focus to "none", returning keyboard focus to the input -- same end state as any other way of leaving the chip row. All chip key handling is a no-op while there are no chips, and the composer (chips, Esc's clear steps, and Shift+Esc/Ctrl+Y included) is disabled while `Busy()` is true, same as the rest of the input.
+
+**Mouse** (only while `MouseEnabled()`): a left-button `tea.MouseClickMsg` landing exactly on a chip's `×` glyph removes that chip (snapshotting first); any other click (wrong button, off-glyph, outside the chip row, or mouse reporting off) falls through to chatshell's normal unhandled-message path (`dispatchUnhandled`) exactly as a click did before this REQ (no chatshell-specific handling existed for `tea.MouseClickMsg` at all).
+
+`ChipObserver{ OnChipsChange(chips []Chip) tea.Cmd }` is an optional `Handler` capability: chatshell calls it after every chip-list change IT PERFORMS (a removal, `ClearChips`/Esc's chip-clear step, or a Shift+Esc/Ctrl+Y restore), so a product can keep its own attachment/context state in sync. It is deliberately NOT called from `WithChips`/`SetChips` -- those calls already come FROM the product. `SetChips` does NOT clear a pending Shift+Esc/Ctrl+Y undo snapshot: the snapshot exists to let the user recover a change THEY just made, and a product-driven `SetChips` call for an unrelated reason (e.g. attaching something new from its own workspace UI) must not silently discard that recovery option -- see the merge behaviour above for how such a newly-attached chip survives a later restore.
+
+`ClearTranscript()` (M1, r1 review) additionally drops any pending composer-draft snapshot and clears chip focus -- e.g. a session switch, where the OLD session's "undo my last change" and chip-row cursor position no longer apply to the NEW session's own chips. It does NOT itself clear the chip list; which chips belong to the new session is the product's own call, made via `SetChips`.
 
 ### Sidebar
 
@@ -144,6 +193,34 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a fake `transcript.Block` whose `Update` returns a distinct new value
 **When** the transcript dispatches a message to it
 **Then** the transcript's stored entry is the NEW `Block` value, not the original, matching the Bubble Tea value-model convention
+
+### AC: transcript-streamed-delta-does-not-auto-follow-when-unfocused-but-scrolled-up
+**Requirements:** tui-kit#req:transcript-streamed-append
+
+**Given** a `transcript.Model` with enough streamed text already appended to overflow the viewport (at the bottom, unfocused), then scrolled up (`ScrollUp`, e.g. a mouse wheel tick)
+**When** `AppendDelta` is called again with more text for the SAME streaming entry
+**Then** the viewport's `YOffset` is UNCHANGED -- the reader is NOT yanked back to the bottom merely because nothing is focused; separately, in a fresh instance still AT the bottom, a further `AppendDelta` keeps the viewport at the bottom (following continues for a reader who hasn't scrolled away)
+
+### AC: transcript-setsize-same-dimensions-preserves-wheel-scroll
+**Requirements:** tui-kit#req:transcript-setsize-idempotent-and-preserves-scroll
+
+**Given** a `transcript.Model` sized and filled with enough unfocused content to overflow the viewport, then scrolled up (`ScrollUp`, e.g. a mouse wheel tick)
+**When** `SetSize` is called again with the SAME width and height, once or twice in a row
+**Then** the viewport's `YOffset` is UNCHANGED by either call -- it is not snapped back to the bottom despite nothing being focused
+
+### AC: transcript-setsize-same-dimensions-does-not-reforce-focused-entry
+**Requirements:** tui-kit#req:transcript-setsize-idempotent-and-preserves-scroll
+
+**Given** a `transcript.Model` with several focusable entries, the LAST one focused (which scrolls it into view via `ensureBlockVisible`), then scrolled away from that entry
+**When** `SetSize` is called again with the SAME width and height
+**Then** the viewport's `YOffset` is UNCHANGED -- the focused entry is not re-forced back into view
+
+### AC: transcript-setsize-height-change-preserves-offset-unless-at-bottom
+**Requirements:** tui-kit#req:transcript-setsize-idempotent-and-preserves-scroll
+
+**Given** a `transcript.Model` with enough unfocused content to overflow the viewport, scrolled partway up (not at the bottom, not at the top)
+**When** `SetSize` is called with a DIFFERENT height, and separately, in a fresh instance where the viewport IS at the bottom, `SetSize` is called with a different height
+**Then** in the first case `YOffset` is unchanged by the resize; in the second case the viewport is still at the bottom after the resize (it keeps following)
 
 ### AC: stream-pump-drains-without-buffering-and-rearms
 **Requirements:** tui-kit#req:stream-pump-contract
@@ -228,6 +305,27 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a `chatshell.Model` with an in-flight `StartStream` and an `Overlay` pushed mid-stream, and separately an `Overlay` whose `View` renders far larger than the box it's given
 **When** the stream's events are drained
 **Then** the stream still completes and `Busy()` clears (its `EventMsg`/`DoneMsg` never reached the overlay, only key/paste/mouse would have); and every rendered line of `View()`'s output is no wider than the screen, whatever the oversized overlay tried to draw
+
+### AC: async-overlay-stays-open-on-failure-closes-on-success
+**Requirements:** tui-kit#req:chatshell-overlay
+
+**Given** a `chatshell.Model` with an `Overlay` pushed whose own `Update` never itself reports `done: true`, and a `Handler` that also implements `MsgHandler` and holds a reference to the `Model` and the overlay
+**When** a product-defined async result message carrying failure is sent through `Update`, and separately one carrying success
+**Then** the failure message reaches `MsgHandler.OnMsg` while the overlay is still open (it is not overlay input) and the overlay stays open (state on it can be mutated in place, e.g. to show an error); the success message likewise reaches `OnMsg`, whose handler calls `CloseOverlay(o)` with that same overlay, and the overlay is thereafter removed from the stack; separately, `PopOverlay()`/`CloseOverlay(o)` on an empty overlay stack both return `nil`/`false` respectively and do not panic
+
+### AC: close-overlay-removes-correct-overlay-when-another-is-stacked-on-top
+**Requirements:** tui-kit#req:chatshell-overlay
+
+**Given** a `chatshell.Model` with two `*fakeOverlay` pushed in order (A then B, B on top)
+**When** `CloseOverlay(A)` is called
+**Then** it returns `true`, A is removed from the stack, and B remains (specifically NOT removed, unlike what `PopOverlay()` would have done since B is on top); separately, `CloseOverlay` given an overlay that was never pushed returns `false` and leaves the stack untouched, and `CloseOverlay` given a NON-POINTER `Overlay` value or a nil `*T` pointer also returns `false` without panicking (never matches by Go's `==`, which would risk a panic on a non-comparable underlying type)
+
+### AC: focus-accessors-report-zone-and-focused-entry-id
+**Requirements:** tui-kit#req:chatshell-focus-accessors
+
+**Given** a `chatshell.Model` with one `AppendBlockWithID`-appended transcript entry
+**When** `Zone()`/`FocusedEntryID()` are read at construction (composer focused), after `Shift+Up` focuses the transcript entry, and after `Shift+Right` moves focus to the sidebar
+**Then** they report `(focus.ZoneInput, "")`, `(focus.ZoneTranscript, "<that entry's id>")`, and `(focus.ZoneSidebar, "")` respectively — `FocusedEntryID()` only ever reports non-empty while `Zone() == focus.ZoneTranscript` AND the focused entry was given an id
 
 ### AC: global-keys-checked-before-shell-defaults
 **Requirements:** tui-kit#req:chatshell-global-keys
@@ -319,6 +417,112 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a `chatshell.Model` built `WithMarkdownRenderer(r)`, a fake clock, and a fake `tea.Tick` that the test fires by hand
 **When** a delta is rendered immediately, then a second delta arrives that the throttle window suppresses (no newline, no elapsed window) and NO further delta or completion ever arrives
 **Then** a one-shot follow-up tick is scheduled for `markdownRenderThrottle` out, and firing it (with no further stream activity) triggers exactly one more render carrying the full accumulated text, including the previously-suppressed fragment
+
+### AC: mouse-wheel-scrolls-transcript-and-toggle-restores-configured-mode
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` with enough transcript entries to overflow the viewport
+**When** a `tea.MouseWheelMsg{Button: tea.MouseWheelUp}` is sent through `Update`, followed by `tea.MouseWheelMsg{Button: tea.MouseWheelDown}`
+**Then** `View().MouseMode` is `tea.MouseModeCellMotion` throughout, the transcript's rendered view changes after the wheel-up and returns to its original rendering after the matching wheel-down; separately, `SetMouseEnabled(false)` then `View()` reports `tea.MouseModeNone`, and a later `SetMouseEnabled(true)` (with no further `WithMouse` call) restores `tea.MouseModeCellMotion` rather than staying off; separately again, pushing an `Overlay` and sending the same wheel-up leaves the transcript's rendered view unchanged (the overlay captures it first)
+
+### AC: mouse-with-mouse-off-does-not-clobber-later-set-mouse-enabled
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseOff)` (an EXPLICIT off, not the implicit default of never calling `WithMouse` at all)
+**When** `SetMouseEnabled(true)` is called afterward, with no further `WithMouse` call
+**Then** `View().MouseMode` is `tea.MouseModeCellMotion`, not `tea.MouseModeNone` -- the explicit `MouseOff` must not have overwritten the Model's underlying configured mode
+
+### AC: mouse-wheel-routes-to-sidepanel-column-and-always-reaches-msghandler
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` and `WithSidePanel(p)`, split (width ≥ 104), with a `Handler` that also implements `MsgHandler`, and enough transcript entries to overflow the viewport
+**When** a `tea.MouseWheelMsg` with `X` at or past the side panel's column is sent through `Update`, and separately one with `X` inside the chat column
+**Then** the side-panel-column event reaches `p.Update` (and the transcript's rendered view is unchanged) while the chat-column event scrolls the transcript (and `p.Update` is NOT additionally called for it); in BOTH cases `MsgHandler.OnMsg` is called with the `tea.MouseWheelMsg`, and a non-nil `tea.Cmd` returned by either `p.Update` or `OnMsg` is included in `Update`'s returned command
+
+### AC: mouse-wheel-never-reaches-transcript-in-the-side-column
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` with a focused `transcript.Block` implementing `WheelConsumer` (`ConsumesWheel` returning `true`), split (width ≥ 104), no `SidePanel` installed
+**When** a `tea.MouseWheelMsg` with `X` at or past the sidebar column is sent through `Update`
+**Then** the `Block`'s `Update` is NOT called and the transcript's rendered view is unchanged -- only the built-in sidebar's cursor moves (r4 review: the transcript has nothing to do with a wheel event over the sidebar column, regardless of what the focused `Block` would otherwise consume)
+
+### AC: mouse-wheel-chat-column-focused-block-first-refusal
+**Requirements:** tui-kit#req:chatshell-mouse-support
+
+**Given** a `chatshell.Model` built `WithMouse(MouseCellMotion)` with enough transcript entries to overflow the viewport, and separately: (a) a focused `transcript.Block` implementing `WheelConsumer` with `ConsumesWheel` returning `true`, (b) a focused `transcript.Block` implementing `WheelConsumer` with `ConsumesWheel` returning `false`, (c) a focused `transcript.Block` that does not implement `WheelConsumer` at all
+**When** a `tea.MouseWheelMsg` with `X` in the chat column is sent through `Update` in each case
+**Then** in case (a) the `Block`'s `Update` is called exactly once with the wheel message and the transcript viewport does NOT also scroll; in cases (b) and (c) the `Block`'s `Update` is NEVER called and the transcript viewport DOES scroll, identically to no `Block` being focused at all
+
+### AC: chip-tab-cycle-and-backspace-remove
+
+**Given** a `chatshell.Model` `WithChips` three chips, freshly constructed (no chip focused, the input holds keyboard focus)
+**When** `Tab` is pressed three times, then `Backspace`, then `Tab` once more
+**Then** the first two `Tab` presses move chip focus to index 0 then 1 (blurring the input each time); the third `Tab` press returns focus to the input (index -1); `Backspace` at that point does nothing (no chip is focused) and `Chips()` is unchanged; the final `Tab` focuses chip index 0 again
+
+### AC: chip-backspace-removes-focused-chip-and-notifies-observer
+
+**Given** a `chatshell.Model` `WithChips` three chips and a `Handler` implementing `ChipObserver`, with chip index 1 focused
+**When** `Backspace` is pressed
+**Then** `Chips()` has two entries (the middle chip removed, the other two in their original order) and `OnChipsChange` is called exactly once with that two-chip list; removing the LAST remaining chip the same way returns chip focus to -1 and keyboard focus to the input
+
+### AC: chip-ctrl-d-removes-last-chip-and-enter-with-chip-focused-submits-and-resets-focus
+
+**Given** a `chatshell.Model` `WithChips` three chips
+**When** `Ctrl+D` is pressed with NO chip focused (the input holds keyboard focus), and separately, in a fresh instance, `Enter` is pressed with composer text set and chip index 1 focused
+**Then** `Ctrl+D` removes the LAST chip (snapshotting the pre-removal draft) regardless of chip focus; the `Enter` case submits the composer text to `Handler.Submit` exactly as it would with no chip focused, AND resets chip focus to -1, returning keyboard focus to the input (m1, r1 review)
+
+### AC: chip-esc-two-step-clear-text-then-chips-even-while-a-chip-is-focused
+
+**Given** a `chatshell.Model` `WithChips` three chips, with composer text set and a chip focused (b1, r1 review, replaying DataTug's own `TestComposerAttachmentChipsCanBeFocusedClearedAndRestored`)
+**When** `Esc` is pressed once, then again
+**Then** the FIRST `Esc` clears the composer text ONLY -- `Chips()` is unchanged despite the chip being focused -- and the SECOND `Esc` (text now empty) detaches every chip; a `Model` with no text already set goes straight to clearing chips on a single `Esc`; `Esc` with neither text nor chips is a no-op that falls through to the existing default focus-ring Esc
+
+### AC: chip-shift-esc-and-ctrl-y-restore-text-and-chips-as-one-unit
+
+**Given** a `chatshell.Model` `WithChips` three chips and composer text set (b1, r1 review)
+**When** `Esc` is pressed twice (clearing text, then chips), then `Shift+Esc`; separately, in a fresh instance, two chips are removed one after another via `Backspace` (no restore or submit in between), then `Ctrl+Y`
+**Then** `Shift+Esc` restores BOTH the composer text and the full three-chip list in one press; `Ctrl+Y` behaves identically to `Shift+Esc` and restores all chips removed by the run of `Backspace`es as ONE unit, not one chip at a time; a further `Shift+Esc`/`Ctrl+Y` immediately after either case is a no-op (the snapshot was consumed); submitting a message via `Enter`, or editing the composer text, instead of restoring, clears the pending snapshot so a later `Shift+Esc`/`Ctrl+Y` no longer recovers it
+
+### AC: chip-shift-esc-restore-merges-a-chip-attached-since-the-snapshot
+
+**Given** a `chatshell.Model` `WithChips` three chips (IDs `a`, `b`, `c`), one chip removed via `Backspace` (snapshotting the original three), then `SetChips` called with the remaining two PLUS a new chip (ID `d`, not present in the snapshot) (m2, r1 review)
+**When** `Shift+Esc` is pressed
+**Then** `Chips()` contains all four chips -- the three from the snapshot (including the one `Backspace` removed) UNION the one (`d`) added since, which is kept rather than discarded; a chip with no `ID` set is matched for this union by `Label` instead, so a still-present ID-less chip is not duplicated by the merge
+
+### AC: chip-mouse-click-on-close-glyph-removes-else-falls-through
+
+**Given** a `chatshell.Model` `WithChips` three chips, `WithMouse(MouseCellMotion)`, `SetMouseEnabled(true)`, and a `Handler` implementing `MsgHandler`
+**When** a left-button `tea.MouseClickMsg` lands exactly on a chip's `×` glyph -- located by scanning `View()`'s actual rendered output for the glyph, not by calling an internal layout helper directly (m3, r1 review) -- and separately one lands one column to its left (still inside the pill, not on `×`)
+**Then** the first click removes that chip (and notifies `ChipObserver` if implemented); the second reaches `MsgHandler.OnMsg` via chatshell's normal unhandled-message path and leaves `Chips()` unchanged, exactly as any other click did before chip support existed
+
+### AC: chip-clear-transcript-drops-composer-undo-and-chip-focus
+
+**Given** a `chatshell.Model` `WithChips` three chips, a chip focused, and a chip removed via `Backspace` (so a composer-draft snapshot is pending) (M1, r1 review)
+**When** `ClearTranscript()` is called
+**Then** the pending composer-draft snapshot is dropped (a subsequent `Shift+Esc`/`Ctrl+Y` is a no-op) and chip focus resets to -1; `Chips()` itself is UNCHANGED by `ClearTranscript` -- which chips belong to whatever session comes next is the product's own call, made via `SetChips`
+
+### AC: chip-rows-shrink-history-height-and-grow-it-back
+
+**Given** a `chatshell.Model` sized via `WindowSizeMsg`, `historyHeight()` measured before any chips are set
+**When** `SetChips` is called with enough chips to wrap across two rows at the current width, then `SetChips(nil)` clears them
+**Then** `historyHeight()` after `SetChips` is exactly 2 less than before (one row subtracted per wrapped chip row); `historyHeight()` after clearing returns to its original value
+
+### AC: view-total-rendered-height-equals-terminal-height
+
+**Given** a `chatshell.Model` sized via `WindowSizeMsg{Width: 80, Height: 24}`, in four configurations: (a) the default single-line top bar, no menu, no status, no chips; (b) `WithTopBar` returning a THREE-line string; (c) `WithCommands` with the composer text set so the slash-command menu is open; (d) both a multi-line `SetStatus` and `WithChips` chips wrapping across two rows, combined with an open command menu
+**Then** in every configuration, `len(strings.Split(view.Content, "\n"))` (the total rendered line count of `View()`'s output) equals `m.height` EXACTLY -- not merely bounded by it -- because `historyHeight()` measures the top bar's actual rendered height, the menu's actual rendered height (when open), the chip row(s)' height, and the status segment's height (an EMPTY status still occupies one rendered row, same as a one-line one) rather than assuming a fixed "4 rows of chrome" that was only ever correct for the single-line-top-bar, no-menu, no-status, no-chips case
+
+### AC: view-height-stays-exact-after-chrome-changes-that-bypass-resizes-old-call-sites
+
+**Given** a `chatshell.Model` sized via `WindowSizeMsg{Width: 80, Height: 30}` and rendered once (a baseline `View()` call, matching `m.height`), in three separate cases (b1, r2 review): (a) the slash-command menu is then opened by TYPING `/a`, key by key, rather than via `WithCommands`+pre-set text before the first render; (b) `SetBusy(true)` is then called (no `StartStream`); (c) `SetStatus` with a two-line string is then called
+**When** `View()` is called again after each state change, with no intervening `WindowSizeMsg`, `F6`, `Ctrl+Left`/`Right`, or chip-list change
+**Then** in every case the rendered line count still equals `m.height` EXACTLY -- neither one line short (the pre-fix menu-by-keystroke and post-render `SetStatus` cases) nor one line over (the pre-fix busy case, where the spinner's trailing line was not reserved)
+
+### AC: click-on-a-menu-row-never-removes-a-chip-with-the-menu-open
+
+**Given** a `chatshell.Model` `WithChips` three chips, `WithCommands`, `WithMouse(MouseCellMotion)`, `SetMouseEnabled(true)`, sized via `WindowSizeMsg`, rendered once, then the slash-command menu opened by typing (as above) and rendered again
+**When** a left-button `tea.MouseClickMsg` lands on the chip row's `×` (located by scanning the freshly rendered `View()` output, per the mouse-click AC above) -- confirming it still removes a chip with the menu open -- and separately one lands on the MENU's own first row (`topBarHeight() + historyHeight()`, well above the chip row)
+**Then** the click on `×` removes exactly one chip; the click on the menu row removes NO chip and `Chips()` is unchanged -- `chipsTopY`'s click math and the actually-drawn chip row stay in agreement because `View()` re-applied `resize()` before the click's preceding render
 
 ## Open Questions
 

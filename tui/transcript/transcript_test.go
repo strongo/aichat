@@ -47,6 +47,18 @@ type targetedMsg struct{ id string }
 
 func (m targetedMsg) TargetEntryID() string { return m.id }
 
+type wheelConsumingBlock struct {
+	fakeBlock
+	consume bool
+}
+
+func (b *wheelConsumingBlock) ConsumesWheel(msg tea.MouseWheelMsg) bool { return b.consume }
+
+func (b *wheelConsumingBlock) Update(msg tea.Msg) (Block, tea.Cmd) {
+	b.updates++
+	return b, nil
+}
+
 func TestAppendAndView(t *testing.T) {
 	m := New()
 	m.SetSize(40, 10)
@@ -71,6 +83,49 @@ func TestAppendDeltaCreatesAndAppends(t *testing.T) {
 	}
 	if m.Entries()[0].Role != RoleAssistant {
 		t.Fatalf("role = %v, want assistant", m.Entries()[0].Role)
+	}
+}
+
+// --- r4 review: shouldAutoFollow must follow ONLY when the viewport was
+// already at the bottom, not whenever nothing happens to be focused --
+// otherwise a streamed delta (AppendDelta, the exact path a live response
+// uses) yanks an UNFOCUSED but manually wheel-scrolled-up reader back to
+// the bottom on every single delta. ------------------------------------------
+
+func TestAppendDeltaDoesNotAutoFollowWhenUnfocusedButScrolledUp(t *testing.T) {
+	m := New()
+	m.SetSize(20, 3)
+	m.AppendDelta("turn-1", strings.Repeat("line\n", 40))
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected to be at bottom after the initial delta")
+	}
+	bottom := m.viewport.YOffset()
+	m.ScrollUp(3) // e.g. a mouse wheel tick, nothing focused throughout
+	off := m.viewport.YOffset()
+	if off == bottom {
+		t.Fatal("ScrollUp did not move the viewport off the bottom")
+	}
+
+	// A further streamed delta must NOT yank the (still unfocused) reader
+	// back to the bottom just because nothing is focused.
+	m.AppendDelta("turn-1", "more text")
+	if got := m.viewport.YOffset(); got != off {
+		t.Fatalf("YOffset = %d after a delta while scrolled up and unfocused, want unchanged %d", got, off)
+	}
+}
+
+func TestAppendDeltaKeepsFollowingWhenAtBottom(t *testing.T) {
+	m := New()
+	m.SetSize(20, 3)
+	m.AppendDelta("turn-1", strings.Repeat("line\n", 40))
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected to be at bottom after the initial delta")
+	}
+
+	// A further delta while still at the bottom keeps following.
+	m.AppendDelta("turn-1", strings.Repeat("more\n", 5))
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected to still be at bottom after a delta arriving while already at the bottom")
 	}
 }
 
@@ -566,5 +621,180 @@ func TestSetMarkdownRendererAppliesAfterConstruction(t *testing.T) {
 	}
 	if gotWidth <= 0 {
 		t.Errorf("renderer width = %d, want > 0", gotWidth)
+	}
+}
+
+func TestDeliverWheelToFocusedBlock_NoFocus(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{Block: &wheelConsumingBlock{consume: true}})
+	consumed, cmd := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{})
+	if consumed {
+		t.Fatal("consumed = true, want false (nothing focused)")
+	}
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil")
+	}
+}
+
+func TestDeliverWheelToFocusedBlock_FocusedButNoBlock(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	m.Append(Entry{Role: RoleUser, Text: "hi"}) // focusable (RoleUser), no Block
+	m.Focus(0)
+	consumed, _ := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{})
+	if consumed {
+		t.Fatal("consumed = true, want false (focused entry has no Block)")
+	}
+}
+
+func TestDeliverWheelToFocusedBlock_NonConsumerBlock(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	blk := &fakeBlock{label: "b"} // does not implement WheelConsumer
+	m.Append(Entry{Block: blk})
+	m.Focus(0)
+	consumed, _ := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{})
+	if consumed {
+		t.Fatal("consumed = true, want false (Block doesn't implement WheelConsumer)")
+	}
+	if blk.updates != 0 {
+		t.Fatalf("blk.updates = %d, want 0 (never dispatched)", blk.updates)
+	}
+}
+
+func TestDeliverWheelToFocusedBlock_DecliningBlock(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	blk := &wheelConsumingBlock{consume: false}
+	m.Append(Entry{Block: blk})
+	m.Focus(0)
+	consumed, _ := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{})
+	if consumed {
+		t.Fatal("consumed = true, want false (Block declined)")
+	}
+	if blk.updates != 0 {
+		t.Fatalf("blk.updates = %d, want 0 (declined, never dispatched)", blk.updates)
+	}
+}
+
+func TestDeliverWheelToFocusedBlock_ConsumingBlockDispatchesAndRebuilds(t *testing.T) {
+	m := New()
+	m.SetSize(40, 10)
+	blk := &wheelConsumingBlock{consume: true}
+	m.Append(Entry{Block: blk})
+	m.Focus(0)
+	consumed, cmd := m.DeliverWheelToFocusedBlock(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	if !consumed {
+		t.Fatal("consumed = false, want true")
+	}
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil (fake block returns nil)")
+	}
+	if blk.updates != 1 {
+		t.Fatalf("blk.updates = %d, want 1", blk.updates)
+	}
+	// Rebuild ran (and re-validated the cache) as part of the dispatch --
+	// confirmed indirectly via View() not panicking/erroring on the fresh
+	// state; the important behavior is consumed=true, updates=1 above.
+	_ = m.View()
+}
+
+// --- r3 review, B1: SetSize must not re-Rebuild (and so not snap an
+// unfocused, manually-scrolled-up viewport back to the bottom, and not
+// re-force a focused entry back into view) when neither dimension
+// actually changed -- a caller (chatshell's View(), which now calls its
+// own resize() on every render) may call SetSize with the SAME width and
+// height on every single frame. ---------------------------------------------
+
+func TestSetSizeSameDimensionsIsNoopAfterWheelScroll(t *testing.T) {
+	m := New()
+	m.SetSize(20, 3)
+	m.Append(Entry{Role: RoleAssistant, Text: strings.Repeat("line\n", 20)})
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected to be at bottom after an unfocused Append")
+	}
+	m.ScrollUp(3) // e.g. a mouse wheel tick
+	off := m.viewport.YOffset()
+	if off == 0 {
+		t.Fatal("ScrollUp did not move the viewport off the bottom")
+	}
+
+	// The next render calls SetSize with the SAME dimensions (chatshell's
+	// View() does this every frame) -- it must not snap back to the bottom.
+	m.SetSize(20, 3)
+	if got := m.viewport.YOffset(); got != off {
+		t.Fatalf("YOffset = %d after a same-size SetSize, want unchanged %d (wheel scroll was undone)", got, off)
+	}
+
+	// A second same-size call is equally a no-op.
+	m.SetSize(20, 3)
+	if got := m.viewport.YOffset(); got != off {
+		t.Fatalf("YOffset = %d after a second same-size SetSize, want unchanged %d", got, off)
+	}
+}
+
+func TestSetSizeSameDimensionsDoesNotReForceFocusedEntryIntoView(t *testing.T) {
+	m := New()
+	m.SetSize(20, 3)
+	for i := 0; i < 5; i++ {
+		m.Append(Entry{Block: &fakeBlock{label: "grid"}})
+	}
+	m.Focus(4) // focus the LAST stop -- ensureBlockVisible scrolls to it
+	scrolledTo := m.viewport.YOffset()
+
+	// Scroll away from the focused entry, as a user reading earlier
+	// content might (e.g. PgUp/wheel while a block still holds focus).
+	m.ScrollUp(100)
+	off := m.viewport.YOffset()
+	if off == scrolledTo {
+		t.Fatal("ScrollUp did not move the viewport away from the focused entry")
+	}
+
+	// A same-size SetSize (chatshell's per-frame resize()) must not
+	// re-run ensureBlockVisible and pull the view back to the focused
+	// entry -- that's the "focused entry not re-forced into view every
+	// frame" regression this fix closes.
+	m.SetSize(20, 3)
+	if got := m.viewport.YOffset(); got != off {
+		t.Fatalf("YOffset = %d after a same-size SetSize, want unchanged %d (focused entry was re-forced into view)", got, off)
+	}
+}
+
+func TestSetSizeHeightChangePreservesOffsetWhenNotAtBottom(t *testing.T) {
+	m := New()
+	m.SetSize(20, 3)
+	m.Append(Entry{Role: RoleAssistant, Text: strings.Repeat("line\n", 40)})
+	bottom := m.viewport.YOffset()
+	m.ScrollUp(3) // partway up, not all the way to the top
+	off := m.viewport.YOffset()
+	if off == 0 || off == bottom {
+		t.Fatalf("ScrollUp(3) did not move the viewport partway up: bottom=%d off=%d", bottom, off)
+	}
+	if m.viewport.AtBottom() {
+		t.Fatal("expected NOT to be at bottom after scrolling up")
+	}
+
+	// A genuine height change (e.g. the terminal window resized, or
+	// historyHeight() actually grew/shrank) must preserve the scroll
+	// position rather than snapping to the bottom, since nothing NEW
+	// arrived -- unlike Append's own auto-follow-when-unfocused rule.
+	m.SetSize(20, 5)
+	if got := m.viewport.YOffset(); got != off {
+		t.Fatalf("YOffset = %d after a height change while scrolled up, want unchanged %d", got, off)
+	}
+}
+
+func TestSetSizeHeightChangeKeepsFollowingWhenAtBottom(t *testing.T) {
+	m := New()
+	m.SetSize(20, 3)
+	m.Append(Entry{Role: RoleAssistant, Text: strings.Repeat("line\n", 40)})
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected to be at bottom after an unfocused Append")
+	}
+
+	m.SetSize(20, 5)
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected to still be at bottom after a height change that started at the bottom")
 	}
 }

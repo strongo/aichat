@@ -11,6 +11,7 @@ products. Apache-2.0.
 | `ai/session` | Entity refs, focus/selection/sidebar, pending/previous action |
 | `ai/cloudproto` | Product-neutral wire protocol + SSE codec for an AI cloud boundary (e.g. `api.sneat.cloud`) |
 | `ai/openaicompat` | `LLMProvider` over the OpenAI Chat Completions streaming API (plain net/http) |
+| `ai/openairesponses` | `LLMProvider` over OpenAI's Responses API (plain net/http, item-based input/output, same `Config` shape as `ai/openaicompat`) |
 | `ai/anthropic` | `LLMProvider` over the Anthropic Messages streaming API (plain net/http, prompt caching) |
 | `ai/cloud` | `LLMProvider` client for the `ai/cloudproto` cloud boundary; `Decider()` returns its separate `decision.Provider` role, plus `Usage` |
 | `ai/decision/rules` | Deterministic, table-driven `decision.Provider` — no regex/NLP engine |
@@ -26,7 +27,7 @@ products. Apache-2.0.
 | `tui/focus` | The Shift+Arrow focus ring shared by every chatshell (input / transcript stops / sidebar) |
 | `tui/sidebar` | The right-hand working-context panel: pinned `session.EntityRef`s |
 | `tui/stream` | Pumps an `ai.LLMProvider` stream into Bubble Tea messages without buffering |
-| `tui/chatshell` | The reusable chat screen composing the packages above; a product plugs in a `Handler`, and optionally a `SidePanel` (replaces the sidebar), `Overlay`s (modal dialogs), `GlobalKeys`, and product-rendered top/status bars |
+| `tui/chatshell` | The reusable chat screen composing the packages above; a product plugs in a `Handler`, and optionally a `SidePanel` (replaces the sidebar), `Overlay`s (modal dialogs), `GlobalKeys`, product-rendered top/status bars, and mouse support (`WithMouse`/`SetMouseEnabled`: wheel-scrolls the transcript) |
 
 Products own scopes, intents, prompts, actions and controls. This module owns
 only what every product needs to talk to models and render chat the same way.

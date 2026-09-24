@@ -56,6 +56,16 @@ type Targeted interface {
 	TargetEntryID() string
 }
 
+// WheelConsumer is an optional Block capability: a FOCUSED Block that wants
+// to handle a tea.MouseWheelMsg itself (e.g. scrolling its own internal
+// view, such as a grid's row list) implements it. ConsumesWheel is a pure
+// query -- it reports whether the Block WOULD consume msg without any side
+// effect -- so DeliverWheelToFocusedBlock can decide whether to actually
+// dispatch it before doing so.
+type WheelConsumer interface {
+	ConsumesWheel(msg tea.MouseWheelMsg) bool
+}
+
 // MarkdownRenderer renders markdown text to terminal-safe output at width.
 // Entries with Markdown set use it when the Model was built WithMarkdownRenderer;
 // otherwise Markdown is inert and the entry renders as plain text.
@@ -127,21 +137,48 @@ func New(opts ...Option) *Model {
 	return m
 }
 
-// SetSize resizes the viewport and re-renders.
+// SetSize resizes the viewport and re-renders. It is a NO-OP when neither
+// dimension actually changed (r3 review, B1): a caller (e.g. chatshell's
+// View(), which re-applies its own resize() on every render so chrome that
+// changes without a WindowSizeMsg -- the slash-command menu opening by
+// keystroke, SetBusy, SetStatus -- stays in sync) may well call SetSize
+// with the SAME width/height on every single frame. Unconditionally
+// re-Rebuilding on every such call, even with nothing to resize, had two
+// user-visible side effects: it silently snapped a manually-scrolled-up
+// viewport back to the bottom every frame, and it re-forced a FOCUSED
+// entry back into view (ensureBlockVisible) every frame too, both on top
+// of the wasted re-render cost of a no-op resize.
+//
+// When the size DOES change, the viewport's scroll position is preserved
+// UNLESS it was already at the bottom before the resize (checked BEFORE
+// applying the new dimensions, since AtBottom() itself depends on them), in
+// which case it keeps following -- the same "at the bottom" rule
+// shouldAutoFollow applies for Append/ReplaceBlock/AppendDelta (r4 review
+// folded the two rules back into one: shouldAutoFollow no longer treats
+// "unfocused" as its own reason to follow, so a resize with no NEW content
+// and a stream delta that IS new content now agree on exactly when
+// following is appropriate).
 func (m *Model) SetSize(width, height int) {
-	m.width, m.height = max(1, width), max(1, height)
+	width, height = max(1, width), max(1, height)
+	if width == m.width && height == m.height {
+		return
+	}
+	wasAtBottom := m.viewport.AtBottom()
+	m.width, m.height = width, height
 	m.viewport.SetWidth(m.width)
 	m.viewport.SetHeight(m.height)
-	m.Rebuild(m.shouldAutoFollow())
+	m.Rebuild(wasAtBottom)
 }
 
 // Entries returns the current entries (read-only use expected).
 func (m *Model) Entries() []Entry { return m.entries }
 
 // Append adds a new entry to the end of the transcript. It scrolls to the
-// bottom only when the transcript is unfocused or was already at the
-// bottom, so focusing an earlier stop to read it is not disturbed by new
-// content arriving.
+// bottom only when the viewport was already at the bottom (r4 review: NOT
+// merely "unfocused" -- an unfocused but manually scrolled-up viewport is
+// left alone too), so focusing an earlier stop to read it, or simply
+// having scrolled up to re-read something, is not disturbed by new content
+// arriving.
 func (m *Model) Append(e Entry) {
 	m.entries = append(m.entries, e)
 	m.Rebuild(m.shouldAutoFollow())
@@ -234,11 +271,23 @@ func (m *Model) InvalidateAndRebuild(id string) {
 	}
 }
 
-// shouldAutoFollow reports whether new content should scroll the viewport to
-// the bottom: when nothing in the transcript is focused (focus is on the
-// composer or sidebar) or the viewport was already scrolled to the bottom.
+// shouldAutoFollow reports whether new content (a streamed delta, a plain
+// Append, ...) should scroll the viewport to the bottom: ONLY when the
+// viewport was already at the bottom -- regardless of whether an earlier
+// stop is focused (r4 review, folding in a pre-existing gap: focus being
+// unset, i.e. focusIndex < 0, used to short-circuit this to true
+// unconditionally, which meant an UNFOCUSED but manually wheel-scrolled-up
+// viewport got yanked back to the bottom by every single streamed delta --
+// exactly the scroll-position bug REQ: transcript-setsize-idempotent-and-
+// preserves-scroll already fixed for SetSize, but this path (AppendDelta/
+// Append/ReplaceBlock/InvalidateAndRebuild) was still wrong). Being at the
+// bottom already implies nothing EARLIER is meaningfully in view either
+// way, so this one check now covers both cases correctly: focused on an
+// earlier stop and scrolled away -> false (unchanged); unfocused and
+// scrolled up -> false (the fix); either state and actually at the bottom
+// -> true (keeps following, unchanged).
 func (m *Model) shouldAutoFollow() bool {
-	return m.focusIndex < 0 || m.viewport.AtBottom()
+	return m.viewport.AtBottom()
 }
 
 // Stops returns the number of focusable entries.
@@ -330,6 +379,31 @@ func (m *Model) FocusedEntry() *Entry {
 		return nil
 	}
 	return &m.entries[i]
+}
+
+// DeliverWheelToFocusedBlock dispatches msg to the FOCUSED entry's Block
+// ONLY (never a broadcast to every entry, unlike Update's non-key path) --
+// and ONLY when that Block implements WheelConsumer and its ConsumesWheel
+// reports true for msg. It reports whether msg was consumed: false means
+// either no Block is focused, the focused Block doesn't implement
+// WheelConsumer, or it declined this particular event, and the CALLER
+// should handle the wheel event itself instead (e.g. scroll a viewport) --
+// mirroring tui/chatshell's "never both" rule for its own transcript
+// viewport vs. a focused Block's own wheel handling.
+func (m *Model) DeliverWheelToFocusedBlock(msg tea.MouseWheelMsg) (consumed bool, cmd tea.Cmd) {
+	i := m.entryIndexForStop(m.focusIndex)
+	if i < 0 || m.entries[i].Block == nil {
+		return false, nil
+	}
+	wc, ok := m.entries[i].Block.(WheelConsumer)
+	if !ok || !wc.ConsumesWheel(msg) {
+		return false, nil
+	}
+	blk, cmd := m.entries[i].Block.Update(msg)
+	m.entries[i].Block = blk
+	m.entries[i].renderValid = false
+	m.Rebuild(false)
+	return true, cmd
 }
 
 // Current returns the entity ref under focus, when the focused entry's Block
