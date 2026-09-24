@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,9 +105,10 @@ func TestLoop_TwoStepToolUse(t *testing.T) {
 		},
 	}
 
-	events, err := drain(t, loop.Run(context.Background(), ai.ChatRequest{
+	seq, transcriptFn := loop.RunWithTranscript(context.Background(), ai.ChatRequest{
 		Messages: []ai.Message{{Role: ai.RoleUser, Text: "how many?"}},
-	}))
+	})
+	events, err := drain(t, seq)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -143,17 +146,22 @@ func TestLoop_TwoStepToolUse(t *testing.T) {
 		t.Errorf("final usage = %+v, want summed 20/10", finalUsage)
 	}
 
-	// Messages() exposes the full transcript, including the tool-call and
-	// tool-result messages appended between steps.
-	transcript := loop.Messages()
-	if len(transcript) != 3 {
-		t.Fatalf("Messages() len = %d, want 3 (user, assistant tool_calls, tool result): %+v", len(transcript), transcript)
+	// RunWithTranscript's accessor exposes the full transcript, including
+	// the tool-call and tool-result messages appended between steps, AND
+	// the final step's own assistant reply (B3, r1 review: this used to be
+	// silently dropped).
+	transcript := transcriptFn()
+	if len(transcript) != 4 {
+		t.Fatalf("Messages() len = %d, want 4 (user, assistant tool_calls, tool result, final assistant): %+v", len(transcript), transcript)
 	}
-	if transcript[1].Role != ai.RoleAssistant || len(transcript[1].ToolCalls) != 1 {
-		t.Errorf("transcript[1] = %+v", transcript[1])
+	if transcript[1].Role != ai.RoleAssistant || len(transcript[1].ToolCalls) != 1 || transcript[1].Text != "let me check" {
+		t.Errorf("transcript[1] = %+v, want the step-1 narrative text alongside its tool call", transcript[1])
 	}
 	if transcript[2].Role != ai.RoleTool || len(transcript[2].ToolResults) != 1 {
 		t.Errorf("transcript[2] = %+v", transcript[2])
+	}
+	if transcript[3].Role != ai.RoleAssistant || transcript[3].Text != "the answer is 1" || len(transcript[3].ToolCalls) != 0 {
+		t.Errorf("transcript[3] = %+v, want the final step's own text-only assistant message", transcript[3])
 	}
 
 	// Loop also implements ai.LLMProvider.
@@ -214,10 +222,20 @@ func TestLoop_ExceedsMaxToolCalls(t *testing.T) {
 	}
 }
 
-func TestLoop_HandlerErrorBecomesIsErrorResultNotFatal(t *testing.T) {
+// TestLoop_HandlerErrorAbortsWithFatalPair covers the coordinator's r1 ruling
+// on M4: a Handler returning a non-nil error is an infrastructure failure and
+// MUST abort the Run as a fatal error pair, exactly like exceeding
+// MaxSteps/MaxToolCalls or a canceled context — it is NOT downgraded to an
+// IsError ToolResult. Only tool-level failures (missing handler, invalid JSON
+// arguments, a recovered panic) become IsError results that the loop feeds
+// back to the model and continues past.
+func TestLoop_HandlerErrorAbortsWithFatalPair(t *testing.T) {
 	provider := &fakeProvider{steps: [][]ai.Event{
-		toolCallStep("", ai.ToolCall{ID: "call_1", Name: "flaky"}),
-		toolCallStep("recovered"),
+		toolCallStep("",
+			ai.ToolCall{ID: "call_1", Name: "flaky"},
+			ai.ToolCall{ID: "call_2", Name: "flaky"},
+		),
+		toolCallStep("unreachable"),
 	}}
 	loop := &Loop{
 		Provider: provider,
@@ -227,21 +245,53 @@ func TestLoop_HandlerErrorBecomesIsErrorResultNotFatal(t *testing.T) {
 			},
 		},
 	}
-	events, err := drain(t, loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}))
-	if err != nil {
-		t.Fatalf("Run: %v, want the loop to continue past a Handler error as an IsError result", err)
+	seq, transcriptFn := loop.RunWithTranscript(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}})
+	events, err := drain(t, seq)
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) {
+		t.Fatalf("err = %v, want a fatal *ai.Error (Handler errors abort the run per M4)", err)
 	}
-	var sawErrorResult bool
+	if !strings.Contains(aiErr.Message, "boom: infra down") {
+		t.Errorf("aiErr.Message = %q, want it to surface the Handler error", aiErr.Message)
+	}
+	if provider.calls != 1 {
+		t.Errorf("provider.calls = %d, want 1: the loop must not take a second step after a fatal Handler error", provider.calls)
+	}
+
+	// The failing call and every call left unanswered in the same step must
+	// still be synthesized as IsError results so the persisted transcript is
+	// a valid, replayable conversation.
+	var sawErrorResult int
 	for _, ev := range events {
-		if ev.Type == ai.EventToolResult && ev.ToolResult != nil && ev.ToolResult.IsError {
-			sawErrorResult = true
-			if ev.ToolResult.CallID != "call_1" {
-				t.Errorf("CallID = %q", ev.ToolResult.CallID)
+		if ev.Type == ai.EventToolResult && ev.ToolResult != nil {
+			if !ev.ToolResult.IsError {
+				t.Errorf("ToolResult %+v, want IsError: no handler runs after the fatal error", ev.ToolResult)
 			}
+			sawErrorResult++
 		}
 	}
-	if !sawErrorResult {
-		t.Error("expected an IsError ToolResult event for the failing handler")
+	if sawErrorResult != 2 {
+		t.Errorf("sawErrorResult = %d, want 2 (call_1 failed, call_2 never executed)", sawErrorResult)
+	}
+
+	transcript := transcriptFn()
+	var toolMsg *ai.Message
+	for i := range transcript {
+		if transcript[i].Role == ai.RoleTool {
+			toolMsg = &transcript[i]
+		}
+	}
+	if toolMsg == nil {
+		t.Fatal("no RoleTool message in the persisted transcript")
+	}
+	if len(toolMsg.ToolResults) != 2 {
+		t.Fatalf("ToolResults = %+v, want 2 (every tool_use answered, even the one never executed)", toolMsg.ToolResults)
+	}
+	if toolMsg.ToolResults[0].CallID != "call_1" || !toolMsg.ToolResults[0].IsError {
+		t.Errorf("call_1 result = %+v, want IsError (the failing handler)", toolMsg.ToolResults[0])
+	}
+	if toolMsg.ToolResults[1].CallID != "call_2" || !toolMsg.ToolResults[1].IsError {
+		t.Errorf("call_2 result = %+v, want IsError (never executed)", toolMsg.ToolResults[1])
 	}
 }
 
@@ -402,5 +452,168 @@ func TestLoop_NonFatalErrorEventPassesThrough(t *testing.T) {
 	}
 	if !sawNonFatal {
 		t.Error("expected the non-fatal error event to be forwarded")
+	}
+}
+
+func TestLoop_ToolChoiceResetToAutoAfterStepOne(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{
+		toolCallStep("", ai.ToolCall{ID: "call_1", Name: "noop"}),
+		toolCallStep("done"),
+	}}
+	loop := &Loop{
+		Provider: provider,
+		Handlers: map[string]Handler{
+			"noop": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				return ai.ToolResult{CallID: call.ID}, nil
+			},
+		},
+	}
+	_, err := drain(t, loop.Run(context.Background(), ai.ChatRequest{
+		Messages:   []ai.Message{{Role: ai.RoleUser, Text: "go"}},
+		ToolChoice: "required",
+	}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(provider.reqs) != 2 {
+		t.Fatalf("provider saw %d requests, want 2", len(provider.reqs))
+	}
+}
+
+func TestLoop_ExceedsMaxToolCallsSynthesizesIsErrorForUnansweredCalls(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{
+		toolCallStep("",
+			ai.ToolCall{ID: "call_1", Name: "noop"},
+			ai.ToolCall{ID: "call_2", Name: "noop"},
+			ai.ToolCall{ID: "call_3", Name: "noop"},
+		),
+	}}
+	loop := &Loop{
+		Provider:     provider,
+		MaxToolCalls: 1,
+		Handlers: map[string]Handler{
+			"noop": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				return ai.ToolResult{CallID: call.ID}, nil
+			},
+		},
+	}
+	seq, transcriptFn := loop.RunWithTranscript(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}})
+	_, err := drain(t, seq)
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != "limit" {
+		t.Fatalf("err = %v, want ai.Error{Code: \"limit\"}", err)
+	}
+
+	transcript := transcriptFn()
+	var toolMsg *ai.Message
+	for i := range transcript {
+		if transcript[i].Role == ai.RoleTool {
+			toolMsg = &transcript[i]
+		}
+	}
+	if toolMsg == nil {
+		t.Fatal("no RoleTool message in the persisted transcript")
+	}
+	if len(toolMsg.ToolResults) != 3 {
+		t.Fatalf("ToolResults = %+v, want 3 (every tool_use answered, even the ones never executed)", toolMsg.ToolResults)
+	}
+	if toolMsg.ToolResults[0].CallID != "call_1" || toolMsg.ToolResults[0].IsError {
+		t.Errorf("call_1 result = %+v, want the one call that ran under the limit, not an error", toolMsg.ToolResults[0])
+	}
+	for _, r := range toolMsg.ToolResults[1:] {
+		if !r.IsError {
+			t.Errorf("result %+v, want IsError (never executed: limit exceeded)", r)
+		}
+	}
+}
+
+func TestLoop_TruncatedResponseWithToolCallIsFatalNeverRunsHandler(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{
+		{
+			{Type: ai.EventStarted},
+			{Type: ai.EventToolCall, ToolCall: &ai.ToolCall{ID: "call_1", Name: "noop", Arguments: json.RawMessage(`{"partial":`)}},
+			{Type: ai.EventCompleted, StopReason: ai.StopReasonLength},
+		},
+	}}
+	var handlerCalled bool
+	loop := &Loop{
+		Provider: provider,
+		Handlers: map[string]Handler{
+			"noop": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				handlerCalled = true
+				return ai.ToolResult{CallID: call.ID}, nil
+			},
+		},
+	}
+	_, err := drain(t, loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}))
+	if err == nil {
+		t.Fatal("expected a fatal error for a truncated response with an in-progress tool call")
+	}
+	if handlerCalled {
+		t.Error("Handler must never run on a possibly-truncated tool call's arguments")
+	}
+}
+
+func TestLoop_InvalidJSONArgumentsBecomeIsErrorWithoutCallingHandler(t *testing.T) {
+	provider := &fakeProvider{steps: [][]ai.Event{
+		toolCallStep("", ai.ToolCall{ID: "call_1", Name: "noop", Arguments: json.RawMessage(`{not valid json`)}),
+		toolCallStep("ok"),
+	}}
+	var handlerCalled bool
+	loop := &Loop{
+		Provider: provider,
+		Handlers: map[string]Handler{
+			"noop": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+				handlerCalled = true
+				return ai.ToolResult{CallID: call.ID}, nil
+			},
+		},
+	}
+	events, err := drain(t, loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if handlerCalled {
+		t.Error("Handler must never be called with invalid JSON arguments")
+	}
+	var sawErrorResult bool
+	for _, ev := range events {
+		if ev.Type == ai.EventToolResult && ev.ToolResult != nil && ev.ToolResult.IsError {
+			sawErrorResult = true
+		}
+	}
+	if !sawErrorResult {
+		t.Error("expected an IsError result for the invalid-JSON call")
+	}
+}
+
+// TestLoop_ValueSafeCopyableAndReusable is M9's regression test: a Loop
+// value (no pointer) must be safely copyable and independently reusable —
+// it holds no run-scoped mutable state of its own.
+func TestLoop_ValueSafeCopyableAndReusable(t *testing.T) {
+	// Each copy gets its OWN fakeProvider (the fake itself is not
+	// concurrency-safe, unlike Loop) so this isolates Loop's own
+	// value-safety from the test double's.
+	base := Loop{}
+	copyA := base // struct copy -- would fail go vet's copylocks check if Loop still embedded a sync.Mutex
+	copyA.Provider = &fakeProvider{steps: [][]ai.Event{toolCallStep("hi")}}
+	copyB := base
+	copyB.Provider = &fakeProvider{steps: [][]ai.Event{toolCallStep("hi")}}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	run := func(l Loop, i int) {
+		defer wg.Done()
+		_, err := drain(t, l.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}))
+		errs[i] = err
+	}
+	wg.Add(2)
+	go run(copyA, 0)
+	go run(copyB, 1)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("run %d: %v", i, err)
+		}
 	}
 }

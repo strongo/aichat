@@ -701,3 +701,162 @@ func TestStream_ToolMessagesRoundTripInRequestBody(t *testing.T) {
 		t.Errorf("reasoning_effort = %q, want high", gotBody.ReasoningEffort)
 	}
 }
+
+// TestBuildMessages_DynamicContextStaysOnUserMessageAcrossToolTurns is the
+// r1 review's M5 regression test: dynamic context must land on the LAST
+// "user" message, never a "tool" role message, across a multi-step
+// tool-calling turn.
+func TestBuildMessages_DynamicContextStaysOnUserMessageAcrossToolTurns(t *testing.T) {
+	req := ai.ChatRequest{
+		Context: []ai.ContextBlock{{Kind: ai.ContextDynamic, Text: "it is Tuesday"}},
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "how many rows?"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "run_dtql", Arguments: json.RawMessage(`{}`)}}},
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_1", Content: "3 rows"}}},
+		},
+	}
+	msgs := buildMessages(req)
+
+	last := msgs[len(msgs)-1]
+	if last.Role != "tool" || strings.Contains(last.Content, "it is Tuesday") {
+		t.Fatalf("last message = %+v, want the untouched tool result", last)
+	}
+	first := msgs[0]
+	if first.Role != "user" || !strings.Contains(first.Content, "it is Tuesday") {
+		t.Fatalf("first message = %+v, want the dynamic context prefix", first)
+	}
+}
+
+// TestStream_ReasoningEffortRetriedOnceWithoutItOn400 is the r1 review's M1
+// regression test: on a 400 whose error mentions reasoning_effort, the
+// Provider retries once WITHOUT it, and remembers not to send it again on
+// later Stream calls against the SAME Provider instance.
+func TestStream_ReasoningEffortRetriedOnceWithoutItOn400(t *testing.T) {
+	var bodies []chatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body chatRequestBody
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		bodies = append(bodies, body)
+		if body.ReasoningEffort != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'reasoning_effort'","type":"invalid_request_error"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	req := ai.ChatRequest{Reasoning: ai.ReasoningHigh, Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}
+
+	text, _, _, err := ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if text != "ok" {
+		t.Fatalf("text = %q, want ok (the retry-without-reasoning_effort request must succeed)", text)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("got %d requests, want 2 (the 400 attempt + one retry)", len(bodies))
+	}
+	if bodies[0].ReasoningEffort != "high" {
+		t.Errorf("first request ReasoningEffort = %q, want high", bodies[0].ReasoningEffort)
+	}
+	if bodies[1].ReasoningEffort != "" {
+		t.Errorf("retry request ReasoningEffort = %q, want empty", bodies[1].ReasoningEffort)
+	}
+
+	// A SECOND Stream call on the SAME Provider must not send
+	// reasoning_effort at all -- no wasted 400 round trip.
+	bodies = nil
+	_, _, _, err = ai.Collect(p.Stream(context.Background(), req))
+	if err != nil {
+		t.Fatalf("Collect (2nd call): %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("got %d requests on the 2nd Stream call, want 1 (remembered not to send reasoning_effort)", len(bodies))
+	}
+	if bodies[0].ReasoningEffort != "" {
+		t.Errorf("2nd call ReasoningEffort = %q, want empty (remembered from the 1st call's 400)", bodies[0].ReasoningEffort)
+	}
+}
+
+func TestStream_ToolCallMissingIDGetsSynthesized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"noop","arguments":"{}"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	var call *ai.ToolCall
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventToolCall {
+			call = ev.ToolCall
+		}
+	}
+	if call == nil || call.ID == "" {
+		t.Fatalf("call = %+v, want a synthesized non-empty ID", call)
+	}
+}
+
+// TestStream_ToolCallsWithoutIndexKeyedByIDAssembleAsSeparateCalls covers r1's
+// M9: a provider that omits `index` on delta.tool_calls chunks must not have
+// two parallel calls collapse into one just because they share the default
+// index. A new non-empty id distinct from the call being assembled starts a
+// new call; a chunk with no id (or the same id) keeps appending to it.
+func TestStream_ToolCallsWithoutIndexKeyedByIDAssembleAsSeparateCalls(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"nyc\"}"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"get_time","arguments":"{\"city\":"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"nyc\"}"}}]}}]}`)
+		sseWrite(w, `{"model":"m","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+		sseWrite(w, "[DONE]")
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	var calls []ai.ToolCall
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventToolCall {
+			calls = append(calls, *ev.ToolCall)
+		}
+	}
+	if len(calls) != 2 {
+		t.Fatalf("calls = %+v, want 2 separate calls, not merged into one", calls)
+	}
+	if calls[0].ID != "call_a" || calls[0].Name != "get_weather" || string(calls[0].Arguments) != `{"city":"nyc"}` {
+		t.Errorf("calls[0] = %+v", calls[0])
+	}
+	if calls[1].ID != "call_b" || calls[1].Name != "get_time" || string(calls[1].Arguments) != `{"city":"nyc"}` {
+		t.Errorf("calls[1] = %+v", calls[1])
+	}
+}
+
+func TestBuildMessages_EmptyToolCallArgumentsBecomeEmptyObject(t *testing.T) {
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "noop"}}},
+		},
+	}
+	msgs := buildMessages(req)
+	asst := msgs[1]
+	if len(asst.ToolCalls) != 1 || asst.ToolCalls[0].Function.Arguments != "{}" {
+		t.Fatalf("assistant tool call = %+v, want arguments \"{}\"", asst.ToolCalls)
+	}
+}

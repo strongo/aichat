@@ -181,6 +181,16 @@ const (
 	StopReasonToolCalls = "tool_calls"
 	StopReasonEnd       = "end"
 	StopReasonLength    = "length"
+	// StopReasonRefusal: the provider's own safety layer declined to
+	// answer (e.g. Anthropic stop_reason "refusal"). Not an ai.Error --
+	// the response completed normally, just with no usable content.
+	StopReasonRefusal = "refusal"
+	// StopReasonPauseTurn: the provider paused mid-turn expecting the
+	// caller to continue the SAME turn with another request (e.g.
+	// Anthropic stop_reason "pause_turn", used with long-running
+	// server-side tools). Not a stopping point a caller should treat as
+	// "done" the way StopReasonEnd is.
+	StopReasonPauseTurn = "pause_turn"
 )
 
 // Event is one normalised stream event. Exactly the fields relevant to Type
@@ -218,9 +228,15 @@ type Usage struct {
 	OutputTokens     int64 `json:"outputTokens,omitempty"`
 	CacheReadTokens  int64 `json:"cacheReadTokens,omitempty"`
 	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
-	// ReasoningTokens counts provider-side reasoning/thinking tokens, when
-	// reported (e.g. OpenAI o-series/reasoning_effort, Anthropic extended
-	// thinking).
+	// ReasoningTokens counts provider-side reasoning/thinking tokens, ONLY
+	// on adapters that report them SEPARATELY from OutputTokens.
+	// ai/openaicompat populates it from
+	// usage.completion_tokens_details.reasoning_tokens when the API returns
+	// that field. ai/anthropic leaves it zero: the Messages API's usage
+	// object has no separate thinking-token count — thinking tokens are
+	// already included in OutputTokens (usage.output_tokens), not broken
+	// out on top of it, so there is nothing distinct to report here without
+	// double-counting.
 	ReasoningTokens int64 `json:"reasoningTokens,omitempty"`
 	// Allowance is set by the cloud provider (ai/cloud); nil for BYOK.
 	Allowance *Allowance `json:"allowance,omitempty"`

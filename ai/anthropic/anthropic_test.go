@@ -751,3 +751,334 @@ func TestStream_ThinkingBlockCapturedAndReplayedVerbatim(t *testing.T) {
 		t.Errorf("Content[1].Type = %q, want tool_use", assistant.Content[1].Type)
 	}
 }
+
+func TestThinkingModeAdaptive_PerModelFamily(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"claude-opus-5", true},
+		{"claude-opus-5-5", true},
+		{"claude-opus-4-8", true},
+		{"claude-opus-4-7", true},
+		{"claude-opus-4-6", true},
+		{"claude-opus-4-5", false},
+		{"claude-sonnet-5", true},
+		{"claude-sonnet-4-6", true},
+		{"claude-sonnet-4-5", false},
+		{"claude-fable-5", true},
+		{"claude-fable-5-1", true},
+		{"claude-haiku-4-5", false},
+		{"claude-haiku-4-5-20251001", false},
+		{"claude-opus-6-1", true},             // unrecognised future id: default adaptive
+		{"some-custom-anthropic-model", true}, // unrecognised: default adaptive
+	}
+	for _, c := range cases {
+		if got := thinkingModeAdaptive(c.model); got != c.want {
+			t.Errorf("thinkingModeAdaptive(%q) = %v, want %v", c.model, got, c.want)
+		}
+	}
+}
+
+func TestStream_AdaptiveThinkingUsesOutputConfigEffortNotBudgetTokens(t *testing.T) {
+	var gotBody messagesRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-opus-5"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{
+		Reasoning: ai.ReasoningHigh,
+		Messages:  []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+	}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if gotBody.Thinking == nil || gotBody.Thinking.Type != "adaptive" {
+		t.Fatalf("Thinking = %+v, want {Type: adaptive}", gotBody.Thinking)
+	}
+	if gotBody.Thinking.BudgetTokens != 0 {
+		t.Errorf("BudgetTokens = %d, want 0 (adaptive form carries no budget)", gotBody.Thinking.BudgetTokens)
+	}
+	if gotBody.OutputConfig == nil || gotBody.OutputConfig.Effort != "high" {
+		t.Errorf("OutputConfig = %+v, want {Effort: high}", gotBody.OutputConfig)
+	}
+}
+
+func TestStream_LegacyThinkingNeverRaisesCallerMaxTokensShrinksBudgetInstead(t *testing.T) {
+	var gotBody messagesRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	// Reasoning "high" wants a 16000 budget, but the CALLER set MaxTokens to
+	// only 3000: MaxTokens must stay exactly 3000 (never raised), and the
+	// budget must shrink to fit under it (3000-1024=1976), never below the
+	// 1024 floor.
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-haiku-4-5-20251001"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{
+		Reasoning: ai.ReasoningHigh,
+		MaxTokens: 3000,
+		Messages:  []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+	}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if gotBody.MaxTokens != 3000 {
+		t.Errorf("MaxTokens = %d, want unchanged at the caller's 3000", gotBody.MaxTokens)
+	}
+	if gotBody.Thinking == nil || gotBody.Thinking.Type != "enabled" {
+		t.Fatalf("Thinking = %+v, want {Type: enabled}", gotBody.Thinking)
+	}
+	if gotBody.Thinking.BudgetTokens != 1976 {
+		t.Errorf("BudgetTokens = %d, want 1976 (shrunk to fit under the caller's MaxTokens)", gotBody.Thinking.BudgetTokens)
+	}
+}
+
+func TestStream_LegacyThinkingDisabledWhenCallerMaxTokensTooSmall(t *testing.T) {
+	var gotBody messagesRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-haiku-4-5-20251001"})
+	_, _, _, err := ai.Collect(p.Stream(context.Background(), ai.ChatRequest{
+		Reasoning: ai.ReasoningMedium,
+		MaxTokens: 1500, // < 2048: no room for a useful budget
+		Messages:  []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+	}))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if gotBody.MaxTokens != 1500 {
+		t.Errorf("MaxTokens = %d, want unchanged at the caller's 1500", gotBody.MaxTokens)
+	}
+	if gotBody.Thinking != nil {
+		t.Errorf("Thinking = %+v, want nil (disabled: too little room to fit a useful budget under the caller's ceiling)", gotBody.Thinking)
+	}
+}
+
+// TestStream_ProviderStateCapturesEntireContentArrayInterleaved is the r1
+// review's B2 regression test: Event.ProviderState must be the ENTIRE
+// assistant content array in stream order (thinking/text/tool_use exactly
+// as the API returned them), byte-faithful -- including a display:"omitted"
+// thinking block whose "thinking" text is the empty string "" (it must
+// still round-trip as an explicit "" field, not be dropped), and thinking
+// interleaved BETWEEN two tool_use blocks (not just once at the start).
+func TestStream_ProviderStateCapturesEntireContentArrayInterleaved(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// Block 0: thinking, display "omitted" -- empty thinking text, real signature.
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}`)
+		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+		// Block 1: first tool_use.
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"lookup"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"q\":1}"}}`)
+		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":1}`)
+		// Block 2: a SECOND thinking block, interleaved between the two
+		// tool_use blocks, with non-empty text this time.
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":2,"content_block":{"type":"thinking"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"now check the other one"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"sig-2"}}`)
+		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":2}`)
+		// Block 3: second tool_use.
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"call_2","name":"lookup"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"q\":2}"}}`)
+		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":3}`)
+		sseWrite(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-haiku-4-5-20251001"})
+	var providerState json.RawMessage
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{
+		Reasoning: ai.ReasoningLow,
+		Messages:  []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
+		Tools:     []ai.Tool{{Name: "lookup"}},
+	}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventCompleted {
+			providerState = ev.ProviderState
+		}
+	}
+
+	var blocks []providerStateBlock
+	if err := json.Unmarshal(providerState, &blocks); err != nil {
+		t.Fatalf("ProviderState = %s: %v", providerState, err)
+	}
+	if len(blocks) != 4 {
+		t.Fatalf("got %d blocks, want 4 (thinking, tool_use, thinking, tool_use): %+v", len(blocks), blocks)
+	}
+	wantTypes := []string{"thinking", "tool_use", "thinking", "tool_use"}
+	for i, want := range wantTypes {
+		if blocks[i].Type != want {
+			t.Errorf("blocks[%d].Type = %q, want %q", i, blocks[i].Type, want)
+		}
+	}
+	// Block 0: display-omitted thinking -- Thinking must round-trip as an
+	// explicit "" (checked by the field surviving unmarshal, which it does
+	// regardless; the real assertion is that "thinking" was PRESENT in the
+	// raw JSON, not omitted).
+	if blocks[0].Signature != "sig-1" {
+		t.Errorf("blocks[0].Signature = %q, want sig-1", blocks[0].Signature)
+	}
+	if !strings.Contains(string(providerState), `"thinking":""`) {
+		t.Errorf("raw ProviderState JSON = %s, want an explicit \"thinking\":\"\" for the display-omitted block (no omitempty)", providerState)
+	}
+	if blocks[1].ID != "call_1" || string(blocks[1].Input) != `{"q":1}` {
+		t.Errorf("blocks[1] = %+v, want call_1/{\"q\":1}", blocks[1])
+	}
+	if blocks[2].Thinking != "now check the other one" || blocks[2].Signature != "sig-2" {
+		t.Errorf("blocks[2] = %+v, want the interleaved thinking text/signature", blocks[2])
+	}
+	if blocks[3].ID != "call_2" || string(blocks[3].Input) != `{"q":2}` {
+		t.Errorf("blocks[3] = %+v, want call_2/{\"q\":2}", blocks[3])
+	}
+
+	// Now replay it and confirm buildMessages reproduces the SAME order,
+	// bypassing Text/ToolCalls reconstruction entirely.
+	followUp := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{
+				Role: ai.RoleAssistant,
+				// Deliberately WRONG ToolCalls (single call, no thinking) to
+				// prove replay uses ProviderState, not this.
+				ToolCalls:     []ai.ToolCall{{ID: "call_1", Name: "lookup", Arguments: json.RawMessage(`{}`)}},
+				ProviderState: providerState,
+			},
+		},
+	}
+	msgs := buildMessages(followUp)
+	var assistant *wireMessage
+	for i := range msgs {
+		if msgs[i].Role == "assistant" {
+			assistant = &msgs[i]
+		}
+	}
+	if assistant == nil || len(assistant.Content) != 4 {
+		t.Fatalf("replayed assistant content = %+v, want 4 blocks from ProviderState, not rebuilt from ToolCalls", assistant)
+	}
+	for i, want := range wantTypes {
+		if assistant.Content[i].Type != want {
+			t.Errorf("replayed Content[%d].Type = %q, want %q", i, assistant.Content[i].Type, want)
+		}
+	}
+	if assistant.Content[3].ID != "call_2" {
+		t.Errorf("replayed Content[3].ID = %q, want call_2 (from ProviderState, not the wrong ToolCalls)", assistant.Content[3].ID)
+	}
+}
+
+func TestBuildMessages_UnknownProviderStateBlockTypeFiltered(t *testing.T) {
+	// m3: a ProviderState relayed from an untrusted/foreign origin must only
+	// have known block types (thinking, redacted_thinking, text, tool_use)
+	// accepted; anything else is dropped.
+	ps, _ := json.Marshal([]map[string]any{
+		{"type": "thinking", "thinking": "ok", "signature": "sig"},
+		{"type": "some_future_block_type", "weird": "data"},
+	})
+	req := ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "hi"},
+			{Role: ai.RoleAssistant, ProviderState: ps},
+		},
+	}
+	msgs := buildMessages(req)
+	var assistant *wireMessage
+	for i := range msgs {
+		if msgs[i].Role == "assistant" {
+			assistant = &msgs[i]
+		}
+	}
+	if assistant == nil || len(assistant.Content) != 1 || assistant.Content[0].Type != "thinking" {
+		t.Fatalf("assistant content = %+v, want only the known thinking block", assistant)
+	}
+}
+
+// TestBuildMessages_DynamicContextStaysOnUserMessageAcrossToolTurns is the
+// r1 review's M5 regression test: dynamic context must land on the LAST
+// genuine user TEXT message, never a tool_result-carrying "user" message
+// (Anthropic tool_result blocks also use role:"user"), and must stay on
+// the SAME message byte-stable across a multi-step tool-calling turn.
+func TestBuildMessages_DynamicContextStaysOnUserMessageAcrossToolTurns(t *testing.T) {
+	req := ai.ChatRequest{
+		Context: []ai.ContextBlock{{Kind: ai.ContextDynamic, Text: "it is Tuesday"}},
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Text: "how many rows?"},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "run_dtql", Arguments: json.RawMessage(`{}`)}}},
+			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_1", Content: "3 rows"}}},
+		},
+	}
+	msgs := buildMessages(req)
+
+	// The tool_result-carrying "user" message must be untouched.
+	toolResultMsg := msgs[len(msgs)-1]
+	if !isToolResultMessage(toolResultMsg) {
+		t.Fatalf("last message = %+v, want the tool_result message", toolResultMsg)
+	}
+	for _, b := range toolResultMsg.Content {
+		if strings.Contains(b.Content, "it is Tuesday") {
+			t.Fatalf("dynamic context leaked into a tool_result block: %+v", b)
+		}
+	}
+
+	// The genuine user text message must carry it.
+	userMsg := msgs[0]
+	if userMsg.Role != "user" || len(userMsg.Content) == 0 || !strings.Contains(userMsg.Content[0].Text, "it is Tuesday") {
+		t.Fatalf("user message = %+v, want the dynamic context prefix", userMsg)
+	}
+}
+
+func TestStream_ToolCallMissingIDGetsSynthesized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"noop"}}`)
+		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}`)
+		sseWrite(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`)
+		sseWrite(w, "message_stop", `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+	p := New(Config{BaseURL: srv.URL, APIKey: "sk-ant", Model: "claude-haiku-4-5-20251001"})
+	var call *ai.ToolCall
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if ev.Type == ai.EventToolCall {
+			call = ev.ToolCall
+		}
+	}
+	if call == nil || call.ID == "" {
+		t.Fatalf("call = %+v, want a synthesized non-empty ID", call)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -81,8 +82,59 @@ type contentBlock struct {
 	Data      string `json:"data,omitempty"`
 }
 
+// MarshalJSON special-cases Type=="thinking": the "thinking"/"signature"
+// keys MUST be present on the wire even when empty (a display:"omitted"
+// thinking block has "" thinking text but is still a real block the API
+// expects to see both keys on) — the default omitempty tags above are
+// right for every OTHER block type (text/tool_use/tool_result/
+// redacted_thinking), where an absent key is exactly what's wanted, so this
+// override only fires for "thinking".
+func (b contentBlock) MarshalJSON() ([]byte, error) {
+	if b.Type != "thinking" {
+		type alias contentBlock
+		return json.Marshal(alias(b))
+	}
+	return json.Marshal(struct {
+		Type         string        `json:"type"`
+		Thinking     string        `json:"thinking"`
+		Signature    string        `json:"signature"`
+		CacheControl *cacheControl `json:"cache_control,omitempty"`
+	}{Type: b.Type, Thinking: b.Thinking, Signature: b.Signature, CacheControl: b.CacheControl})
+}
+
 type cacheControl struct {
 	Type string `json:"type"`
+}
+
+// providerStateBlock is the wire shape captured into Event.ProviderState /
+// replayed from Message.ProviderState: ONE block of an assistant turn's
+// FULL content array (text, thinking, redacted_thinking, tool_use —
+// whatever the API actually returned, in stream order), byte-faithful. This
+// is deliberately a SEPARATE type from contentBlock (used elsewhere for
+// ordinary request-building, where omitempty is wanted): Thinking and
+// Signature are NOT omitempty here, so a display:"omitted" thinking block's
+// empty "" text still round-trips as an explicit empty string rather than
+// silently vanishing from the replayed block.
+type providerStateBlock struct {
+	Type      string          `json:"type"`
+	Thinking  string          `json:"thinking"`
+	Signature string          `json:"signature"`
+	Data      string          `json:"data,omitempty"`
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+}
+
+// knownProviderStateBlockTypes gates buildMessages' replay of an
+// ai.Message.ProviderState it did not itself produce (e.g. one relayed
+// through ai/cloud from an origin this adapter doesn't fully trust) to only
+// the content-block types this Messages API integration understands.
+var knownProviderStateBlockTypes = map[string]bool{
+	"thinking":          true,
+	"redacted_thinking": true,
+	"text":              true,
+	"tool_use":          true,
 }
 
 // wireMessage's Content is always the block-array form (never the bare
@@ -106,34 +158,86 @@ type toolChoiceWire struct {
 	Name string `json:"name,omitempty"`
 }
 
-// thinkingConfig requests extended thinking. BudgetTokens is required when
-// Type is "enabled".
+// thinkingConfig requests extended thinking. Type "adaptive" (Claude 4.6+:
+// Opus 4.6/4.7/4.8/5/5.5, Sonnet 4.6/5, Fable 5/5.1) pairs with
+// messagesRequestBody.OutputConfig.Effort and carries no BudgetTokens; type
+// "enabled" (Haiku 4.5 and older) requires BudgetTokens and has no effort
+// knob — see thinkingModeAdaptive.
 type thinkingConfig struct {
 	Type         string `json:"type"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
-type messagesRequestBody struct {
-	Model      string          `json:"model"`
-	System     []contentBlock  `json:"system,omitempty"`
-	Messages   []wireMessage   `json:"messages"`
-	MaxTokens  int             `json:"max_tokens"`
-	Stream     bool            `json:"stream"`
-	Tools      []toolDef       `json:"tools,omitempty"`
-	ToolChoice *toolChoiceWire `json:"tool_choice,omitempty"`
-	Thinking   *thinkingConfig `json:"thinking,omitempty"`
+// outputConfigWire carries the adaptive-thinking family's effort control.
+type outputConfigWire struct {
+	Effort string `json:"effort,omitempty"`
 }
 
-// reasoningBudgets maps ai.ChatRequest.Reasoning levels to Anthropic
-// extended-thinking budget_tokens.
+type messagesRequestBody struct {
+	Model        string            `json:"model"`
+	System       []contentBlock    `json:"system,omitempty"`
+	Messages     []wireMessage     `json:"messages"`
+	MaxTokens    int               `json:"max_tokens"`
+	Stream       bool              `json:"stream"`
+	Tools        []toolDef         `json:"tools,omitempty"`
+	ToolChoice   *toolChoiceWire   `json:"tool_choice,omitempty"`
+	Thinking     *thinkingConfig   `json:"thinking,omitempty"`
+	OutputConfig *outputConfigWire `json:"output_config,omitempty"`
+}
+
+// reasoningBudgets maps ai.ChatRequest.Reasoning levels to the legacy
+// extended-thinking budget_tokens form (Haiku 4.5 and older models).
 var reasoningBudgets = map[string]int{
 	ai.ReasoningLow:    1024,
 	ai.ReasoningMedium: 4096,
 	ai.ReasoningHigh:   16000,
 }
 
+// modelFamilyRe extracts a Claude model id's family and version, tolerating
+// a trailing dated snapshot suffix (e.g. "claude-haiku-4-5-20251001"): group
+// 2/3 stop matching before it since FindStringSubmatch only anchors the
+// leading "^claude-<family>-<major>[-<minor>]" shape.
+var modelFamilyRe = regexp.MustCompile(`^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?`)
+
+// thinkingModeAdaptive reports whether model uses the current adaptive-
+// thinking + output_config.effort form, versus the legacy
+// thinking:{type:"enabled",budget_tokens:N} form. Per the claude-api skill
+// (shared/model-migration.md, "Thinking & Effort" quick reference):
+// Opus 4.6/4.7/4.8/5/5.5, Sonnet 4.6/5, and Fable 5/5.1 are adaptive-only
+// (their thinking is on by default and rejects budget_tokens); Haiku 4.5
+// and any pre-4.6 Sonnet/Opus still require budget_tokens. An id this
+// adapter doesn't recognise (a future model not yet in that table) is
+// assumed to be a newer, adaptive-thinking model — the same default the
+// skill's own guidance uses for "unfamiliar model strings".
+func thinkingModeAdaptive(model string) bool {
+	m := modelFamilyRe.FindStringSubmatch(model)
+	if m == nil {
+		return true
+	}
+	family := m[1]
+	major, _ := strconv.Atoi(m[2])
+	minor, _ := strconv.Atoi(m[3]) // "" -> 0, fine: no model has a bare "-4" version
+	switch family {
+	case "haiku":
+		return false
+	case "fable":
+		return true
+	case "opus", "sonnet":
+		return major > 4 || (major == 4 && minor >= 6)
+	default:
+		return true
+	}
+}
+
 // anthropicToolChoice maps ai.ChatRequest.ToolChoice to the Messages API
-// tool_choice shape.
+// tool_choice shape. Caveat: forced tool choice (ai.ToolChoiceRequired, or
+// naming a specific tool) is REMOVED on the adaptive-only model family
+// (Claude Fable 5.1, Claude Mythos 5.1, Claude Opus 5.5) -- the API 400s
+// `{"type":"any"}`/`{"type":"tool",...}` there. Callers targeting one of
+// those models must use ai.ToolChoiceAuto (plus an explicit prompt
+// instruction naming the tool) instead; this adapter does not downgrade a
+// forced choice for them automatically, since doing so silently would hide
+// the caller's actual intent.
 func anthropicToolChoice(choice string) *toolChoiceWire {
 	switch choice {
 	case "":
@@ -222,11 +326,45 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			}
 			body.ToolChoice = anthropicToolChoice(req.ToolChoice)
 		}
+		// Reasoning -> thinking. Ruling (r1 review, M8): this adapter must
+		// never raise MaxTokens above what the caller explicitly asked for
+		// -- a caller-set ceiling is a hard budget, not a suggestion. Only
+		// when the caller left MaxTokens unset (0, so maxTokens above is
+		// already OUR default, not theirs) may we pick a larger default to
+		// make room for a budget. Validating that a server-side minimum
+		// MaxTokens is met is a separate, server-side follow-up -- not this
+		// adapter's job.
 		if budget, ok := reasoningBudgets[req.Reasoning]; ok {
-			if body.MaxTokens <= budget {
-				body.MaxTokens = budget + defaultMax
+			switch {
+			case thinkingModeAdaptive(model):
+				// Claude 4.6+ family: adaptive thinking, no budget_tokens;
+				// depth is controlled by output_config.effort instead.
+				body.Thinking = &thinkingConfig{Type: "adaptive"}
+				body.OutputConfig = &outputConfigWire{Effort: req.Reasoning}
+			case req.MaxTokens > 0 && req.MaxTokens < 2048:
+				// Not enough room for a useful thinking budget (min 1024)
+				// alongside any real output without exceeding the caller's
+				// own MaxTokens: disable thinking rather than raise it.
+			case req.MaxTokens > 0:
+				// Caller set MaxTokens: shrink the budget (never MaxTokens)
+				// to fit under it, floored at 1024.
+				b := budget
+				if b >= req.MaxTokens {
+					b = req.MaxTokens - 1024
+					if b < 1024 {
+						b = 1024
+					}
+				}
+				body.Thinking = &thinkingConfig{Type: "enabled", BudgetTokens: b}
+			default:
+				// Caller left MaxTokens unset (0): free to pick a larger
+				// default so the budget has room -- this is OUR default,
+				// not a ceiling the caller gave us.
+				if body.MaxTokens <= budget {
+					body.MaxTokens = budget + defaultMax
+				}
+				body.Thinking = &thinkingConfig{Type: "enabled", BudgetTokens: budget}
 			}
-			body.Thinking = &thinkingConfig{Type: "enabled", BudgetTokens: budget}
 		}
 		payload, err := json.Marshal(body)
 		if err != nil {
@@ -263,21 +401,21 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		var eventName string
 		sawStop := false
 		stopReasonWire := ""
-		// blockTypes/toolCalls track open content blocks by index so a
-		// content_block_delta (which carries only the index, not the type)
-		// can be routed to the right assembly (tool_use argument JSON is
-		// streamed as input_json_delta chunks; thinking/signature deltas are
-		// intentionally dropped — never emitted as text, per the tool-calling
-		// contract).
-		blockTypes := map[int]string{}
+		// toolCalls tracks tool_use blocks by index for EventToolCall
+		// assembly (id/name at content_block_start, arguments concatenated
+		// across input_json_delta chunks).
 		toolCalls := map[int]*ai.ToolCall{}
 		var toolOrder []int
-		// reasoningBlocks/reasoningOrder capture thinking/redacted_thinking
-		// blocks verbatim (text+signature, or the opaque redacted payload),
-		// in stream order, for Event.ProviderState (see REQ:
-		// anthropic-thinking-block-replay). They are never emitted as text.
-		reasoningBlocks := map[int]*contentBlock{}
-		var reasoningOrder []int
+		// blocks/blockOrder capture EVERY content block (text,
+		// thinking/redacted_thinking, tool_use) verbatim and in stream
+		// order, for Event.ProviderState (REQ: anthropic-thinking-block-
+		// replay, B2): the entire assistant content array, byte-faithful,
+		// so a later request replays it exactly rather than rebuilding it
+		// from Text/ToolCalls (which would drop interleaved thinking).
+		// thinking_delta/signature_delta are captured here but never
+		// emitted as EventTextDelta.
+		blocks := map[int]*providerStateBlock{}
+		var blockOrder []int
 		for sc.Scan() {
 			line := sc.Text()
 			switch {
@@ -305,17 +443,16 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 				case "content_block_start":
 					if se.Index != nil && se.ContentBlock != nil {
 						idx := *se.Index
-						blockTypes[idx] = se.ContentBlock.Type
+						blocks[idx] = &providerStateBlock{Type: se.ContentBlock.Type}
+						blockOrder = append(blockOrder, idx)
 						switch se.ContentBlock.Type {
 						case "tool_use":
 							toolCalls[idx] = &ai.ToolCall{ID: se.ContentBlock.ID, Name: se.ContentBlock.Name}
 							toolOrder = append(toolOrder, idx)
-						case "thinking":
-							reasoningBlocks[idx] = &contentBlock{Type: "thinking"}
-							reasoningOrder = append(reasoningOrder, idx)
+							blocks[idx].ID = se.ContentBlock.ID
+							blocks[idx].Name = se.ContentBlock.Name
 						case "redacted_thinking":
-							reasoningBlocks[idx] = &contentBlock{Type: "redacted_thinking", Data: se.ContentBlock.Data}
-							reasoningOrder = append(reasoningOrder, idx)
+							blocks[idx].Data = se.ContentBlock.Data
 						}
 					}
 				case "content_block_delta":
@@ -328,6 +465,9 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 					}
 					switch se.Delta.Type {
 					case "text_delta":
+						if blk, ok := blocks[idx]; ok {
+							blk.Text += se.Delta.Text
+						}
 						if se.Delta.Text == "" {
 							break
 						}
@@ -343,11 +483,11 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 						}
 					case "thinking_delta":
 						// Never emitted as text; captured for replay.
-						if blk, ok := reasoningBlocks[idx]; ok {
+						if blk, ok := blocks[idx]; ok {
 							blk.Thinking += se.Delta.Thinking
 						}
 					case "signature_delta":
-						if blk, ok := reasoningBlocks[idx]; ok {
+						if blk, ok := blocks[idx]; ok {
 							blk.Signature += se.Delta.Signature
 						}
 					}
@@ -400,6 +540,15 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 
 		for _, idx := range toolOrder {
 			call := *toolCalls[idx]
+			if call.ID == "" {
+				// m2: a malformed/absent id from the provider must not
+				// reach callers as "" -- Handler dispatch and
+				// ToolResult.CallID pairing both key off it.
+				call.ID = fmt.Sprintf("call_%d", idx)
+				if blk, ok := blocks[idx]; ok {
+					blk.ID = call.ID // keep ProviderState's tool_use.id consistent
+				}
+			}
 			if !yield(ai.Event{Type: ai.EventToolCall, ToolCall: &call}, nil) {
 				return
 			}
@@ -411,14 +560,22 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			stopReason = ai.StopReasonToolCalls
 		case "max_tokens":
 			stopReason = ai.StopReasonLength
+		case "refusal":
+			stopReason = ai.StopReasonRefusal
+		case "pause_turn":
+			stopReason = ai.StopReasonPauseTurn
 		}
 		var providerState json.RawMessage
-		if len(reasoningOrder) > 0 {
-			blocks := make([]contentBlock, 0, len(reasoningOrder))
-			for _, idx := range reasoningOrder {
-				blocks = append(blocks, *reasoningBlocks[idx])
+		if len(blockOrder) > 0 {
+			ordered := make([]providerStateBlock, 0, len(blockOrder))
+			for _, idx := range blockOrder {
+				blk := *blocks[idx]
+				if call, ok := toolCalls[idx]; ok {
+					blk.Input = call.Arguments
+				}
+				ordered = append(ordered, blk)
 			}
-			if b, err := json.Marshal(blocks); err == nil {
+			if b, err := json.Marshal(ordered); err == nil {
 				providerState = b
 			}
 		}
@@ -650,37 +807,72 @@ func buildMessages(req ai.ChatRequest) []wireMessage {
 		}
 
 		var blocks []contentBlock
-		// Thinking/redacted_thinking blocks MUST precede text/tool_use in the
-		// assistant turn that produced them, and MUST be replayed unmodified
-		// (see REQ: anthropic-thinking-block-replay) — the API 400s a
-		// tool-use continuation whose thinking blocks were dropped or
-		// edited. m.ProviderState round-trips exactly what this adapter
-		// itself captured off the stream (see Stream); an adapter-neutral
-		// or foreign ProviderState that fails to unmarshal is dropped
-		// rather than sent malformed.
+		// B2 (r1 review): when ProviderState is present, it IS the entire
+		// assistant content array (thinking/redacted_thinking/text/tool_use,
+		// interleaved exactly as the API returned them) — replay it
+		// VERBATIM rather than rebuilding from Text/ToolCalls, which would
+		// drop interleaved thinking and reorder blocks. thinking/
+		// redacted_thinking blocks in particular MUST precede the tool_use
+		// they led to and MUST be replayed byte-faithful (REQ: anthropic-
+		// thinking-block-replay) — the API 400s a tool-use continuation
+		// whose thinking blocks were dropped or edited. m3: only known
+		// block types are accepted, so a ProviderState relayed through an
+		// untrusted/foreign origin (e.g. via ai/cloud) can't smuggle an
+		// unrecognised block onto the wire. A ProviderState that fails to
+		// unmarshal, or unmarshals to zero known blocks, falls back to the
+		// legacy Text/ToolCalls reconstruction below rather than sending an
+		// empty assistant turn.
+		replayed := false
 		if len(m.ProviderState) > 0 {
-			var reasoning []contentBlock
-			if err := json.Unmarshal(m.ProviderState, &reasoning); err == nil {
-				blocks = append(blocks, reasoning...)
+			var replay []providerStateBlock
+			if err := json.Unmarshal(m.ProviderState, &replay); err == nil {
+				for _, b := range replay {
+					if !knownProviderStateBlockTypes[b.Type] {
+						continue
+					}
+					blocks = append(blocks, contentBlock{
+						Type: b.Type, Text: b.Text, ID: b.ID, Name: b.Name, Input: b.Input,
+						Thinking: b.Thinking, Signature: b.Signature, Data: b.Data,
+					})
+				}
+				replayed = len(blocks) > 0
 			}
 		}
-		if m.Text != "" || len(m.ToolCalls) == 0 {
-			blocks = append(blocks, contentBlock{Type: "text", Text: m.Text})
-		}
-		for _, tc := range m.ToolCalls {
-			input := tc.Arguments
-			if len(input) == 0 {
-				input = json.RawMessage("{}")
+		if !replayed {
+			if m.Text != "" || len(m.ToolCalls) == 0 {
+				blocks = append(blocks, contentBlock{Type: "text", Text: m.Text})
 			}
-			blocks = append(blocks, contentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: input})
+			for _, tc := range m.ToolCalls {
+				input := tc.Arguments
+				if len(input) == 0 {
+					input = json.RawMessage("{}")
+				}
+				blocks = append(blocks, contentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: input})
+			}
 		}
 		msgs = append(msgs, wireMessage{Role: string(m.Role), Content: blocks})
 	}
 
-	if dyn := renderDynamic(req.Context); dyn != "" && len(msgs) > 0 {
-		last := &msgs[len(msgs)-1]
-		if n := len(last.Content); n > 0 && last.Content[n-1].Type == "text" {
-			last.Content[n-1].Text = dyn + last.Content[n-1].Text
+	// M5 (r1 review): dynamic context is spliced onto the LAST "user" TEXT
+	// message specifically -- never the literal last wire message, which in
+	// a multi-step tool-calling turn (ai/agent.Loop) is a merged
+	// tool_result "user" message by the time a later step re-renders this
+	// same history (Anthropic's tool_result blocks ALSO carry role:"user",
+	// so a plain Role=="user" check isn't enough -- isToolResultMessage
+	// excludes those). Splicing into a tool_result would corrupt it, and
+	// changes what counts as "last" every step, breaking prompt-cache
+	// stability turn to turn. With no genuine user text message at all,
+	// dynamic context is dropped rather than corrupting whatever IS last.
+	if dyn := renderDynamic(req.Context); dyn != "" {
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role != "user" || isToolResultMessage(msgs[i]) {
+				continue
+			}
+			last := &msgs[i]
+			if n := len(last.Content); n > 0 && last.Content[n-1].Type == "text" {
+				last.Content[n-1].Text = dyn + last.Content[n-1].Text
+			}
+			break
 		}
 	}
 

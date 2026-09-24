@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/internal/retry"
@@ -34,6 +35,15 @@ type Config struct {
 // Provider implements ai.LLMProvider over the Chat Completions API.
 type Provider struct {
 	cfg Config
+
+	// noReasoningEffort is set (M1, r1 review) after this Provider learns,
+	// from a live 400 response, that its endpoint rejects the
+	// reasoning_effort field -- some OpenAI-compatible endpoints (proxies,
+	// older deployments, certain third-party providers) 400 on an unknown
+	// parameter instead of ignoring it. Once set, every later Stream call
+	// on THIS Provider instance omits reasoning_effort from the start,
+	// rather than paying the extra round trip on every request.
+	noReasoningEffort atomic.Bool
 }
 
 // New builds a Provider. It panics if BaseURL is empty.
@@ -208,7 +218,8 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			}
 			body.ToolChoice = toolChoiceWire(req.ToolChoice)
 		}
-		if req.Reasoning != "" {
+		sentReasoningEffort := req.Reasoning != "" && !p.noReasoningEffort.Load()
+		if sentReasoningEffort {
 			body.ReasoningEffort = req.Reasoning
 		}
 		payload, err := json.Marshal(body)
@@ -217,14 +228,30 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			return
 		}
 
-		var resp *http.Response
-		attempt := 0
-		doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
-			attempt++
-			r, e := p.doRequest(ctx, payload, attempt >= retry.DefaultMaxAttempts)
-			resp = r
-			return e
-		})
+		send := func(payload []byte) (*http.Response, error) {
+			var resp *http.Response
+			attempt := 0
+			doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
+				attempt++
+				r, e := p.doRequest(ctx, payload, attempt >= retry.DefaultMaxAttempts)
+				resp = r
+				return e
+			})
+			return resp, doErr
+		}
+
+		resp, doErr := send(payload)
+		if doErr != nil && sentReasoningEffort && isUnsupportedReasoningEffortError(doErr) {
+			// M1 (r1 review): some OpenAI-compatible endpoints 400 on an
+			// unrecognised reasoning_effort instead of ignoring it. Retry
+			// ONCE, before any byte of a response was seen, without it --
+			// and remember not to send it again on this Provider instance.
+			p.noReasoningEffort.Store(true)
+			body.ReasoningEffort = ""
+			if retryPayload, merr := json.Marshal(body); merr == nil {
+				resp, doErr = send(retryPayload)
+			}
+		}
 		if doErr != nil {
 			yieldFatal(yield, toAIError(ctx, doErr))
 			return
@@ -343,6 +370,20 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 type toolCallAssembler struct {
 	order   []int
 	byIndex map[int]*ai.ToolCall
+
+	// M9: some OpenAI-compatible providers omit `index` on delta.tool_calls
+	// chunks entirely. Without an index to key on, a new non-empty id that
+	// differs from the call currently being assembled must start a NEW
+	// call rather than silently merging into the previous one; a chunk
+	// that repeats the same id (or omits it, continuing an in-progress
+	// call's arguments) keeps appending to it. Indexed and non-indexed
+	// calls share `order`/`byIndex` via synthetic negative keys so
+	// interleaving with explicitly-indexed calls still assembles in
+	// arrival order.
+	haveNoIndex    bool
+	lastNoIndexKey int
+	lastNoIndexID  string
+	noIndexNext    int
 }
 
 func newToolCallAssembler() *toolCallAssembler {
@@ -350,9 +391,19 @@ func newToolCallAssembler() *toolCallAssembler {
 }
 
 func (a *toolCallAssembler) addDelta(tc wireToolCall) {
-	idx := 0
+	var idx int
 	if tc.Index != nil {
 		idx = *tc.Index
+	} else if a.haveNoIndex && (tc.ID == "" || tc.ID == a.lastNoIndexID) {
+		idx = a.lastNoIndexKey
+	} else {
+		a.noIndexNext--
+		idx = a.noIndexNext
+		a.haveNoIndex = true
+		a.lastNoIndexKey = idx
+		if tc.ID != "" {
+			a.lastNoIndexID = tc.ID
+		}
 	}
 	call, ok := a.byIndex[idx]
 	if !ok {
@@ -374,7 +425,14 @@ func (a *toolCallAssembler) addDelta(tc wireToolCall) {
 func (a *toolCallAssembler) calls() []ai.ToolCall {
 	out := make([]ai.ToolCall, 0, len(a.order))
 	for _, idx := range a.order {
-		out = append(out, *a.byIndex[idx])
+		call := *a.byIndex[idx]
+		if call.ID == "" {
+			// m2: a malformed/absent id from the provider must not reach
+			// callers as "" -- Handler dispatch and ToolResult.CallID
+			// pairing both key off it. Synthesize a stable, unique one.
+			call.ID = fmt.Sprintf("call_%d", idx)
+		}
+		out = append(out, call)
 	}
 	return out
 }
@@ -419,6 +477,21 @@ func toAIError(ctx context.Context, err error) *ai.Error {
 		return &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
 	}
 	return &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}
+}
+
+// isUnsupportedReasoningEffortError reports whether err is a 400
+// (ai.ErrCodeInvalid) whose message suggests the endpoint rejected the
+// reasoning_effort field itself, rather than some other request problem —
+// see M1 in Stream. This is necessarily a heuristic (providers don't
+// standardise error message text); it only widens the one-time retry, it
+// never blocks a normal request.
+func isUnsupportedReasoningEffortError(err error) bool {
+	var aiErr *ai.Error
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeInvalid {
+		return false
+	}
+	lower := strings.ToLower(aiErr.Message)
+	return strings.Contains(lower, "reasoning_effort") || strings.Contains(lower, "unsupported parameter")
 }
 
 // doRequest issues one attempt. lastAttempt tells it not to bother waiting
@@ -532,12 +605,16 @@ func buildMessages(req ai.ChatRequest) []chatMessage {
 		if len(m.ToolCalls) > 0 {
 			wm.ToolCalls = make([]wireToolCall, len(m.ToolCalls))
 			for i, tc := range m.ToolCalls {
+				args := tc.Arguments
+				if len(args) == 0 {
+					args = json.RawMessage("{}") // m1: empty arguments -> "{}"
+				}
 				wm.ToolCalls[i] = wireToolCall{
 					ID:   tc.ID,
 					Type: "function",
 					Function: wireToolCallFunc{
 						Name:      tc.Name,
-						Arguments: string(tc.Arguments),
+						Arguments: string(args),
 					},
 				}
 			}
@@ -545,9 +622,21 @@ func buildMessages(req ai.ChatRequest) []chatMessage {
 		msgs = append(msgs, wm)
 	}
 
-	if dyn := renderDynamic(req.Context); dyn != "" && len(msgs) > 0 {
-		last := &msgs[len(msgs)-1]
-		last.Content = dyn + last.Content
+	// M5 (r1 review): dynamic context is spliced onto the LAST "user" TEXT
+	// message specifically -- never the literal last wire message, which in
+	// a multi-step tool-calling turn (ai/agent.Loop) is a "tool" message by
+	// the time a later step re-renders this same history. Splicing into a
+	// tool result would corrupt it; splicing changes what counts as "last"
+	// every step, breaking prompt-cache stability turn to turn. With no
+	// user message at all (unusual, but not impossible), dynamic context is
+	// simply dropped rather than corrupting whatever IS last.
+	if dyn := renderDynamic(req.Context); dyn != "" {
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role == "user" {
+				msgs[i].Content = dyn + msgs[i].Content
+				break
+			}
+		}
 	}
 	return msgs
 }
