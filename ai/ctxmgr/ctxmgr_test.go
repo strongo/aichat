@@ -233,6 +233,20 @@ func TestSelect_EstimatedTokensReported(t *testing.T) {
 	}
 }
 
+func TestForget_EmptyIsNoop(t *testing.T) {
+	// forget's early-return-on-empty is defensive: with only one call site
+	// (guarded by `len(dropSet) > 0`) it can't be reached through the
+	// exported API, so exercise the unexported func directly from within
+	// the package to cover it without weakening the guard.
+	m := NewManager(Policy{})
+	m.sent = []string{"a", "b"}
+	m.sentSet = map[string]bool{"a": true, "b": true}
+	m.forget(map[string]bool{})
+	if len(m.sent) != 2 || !m.sentSet["a"] || !m.sentSet["b"] {
+		t.Fatalf("forget(empty) mutated state: sent=%v sentSet=%v", m.sent, m.sentSet)
+	}
+}
+
 func scopesOf(blocks []ai.ContextBlock) []string {
 	seen := map[string]bool{}
 	var out []string
