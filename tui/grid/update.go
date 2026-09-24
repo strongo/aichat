@@ -8,14 +8,17 @@ import (
 )
 
 // Update implements transcript.Block. Key handling order: the filter input
-// (while focused) always wins; then the active ExtraView's own Update (if
-// any); then the product KeyHandler (see WithKeyHandler), which can claim
-// any key including Enter, digits or Tab; then the grid's own defaults:
-// h/l select a column (scrolling it into view), up/k and down move the row,
-// digit keys switch views (1 is always the table), Tab toggles focus between
-// the table and a split secondary view, s sorts by the selected column,
-// Enter emits RowActivatedMsg, + emits tui.AddToSidebarMsg, / opens the
-// built-in filter.
+// (while focused) always wins; then, ONLY while secondary focus holds the
+// active non-table view (see SecondaryFocus/SetSecondaryFocus — always true
+// for a non-split view, since the table isn't reachable there), that
+// ExtraView's own Update; then the product KeyHandler (see WithKeyHandler),
+// which can claim any key including Enter, digits or Tab; then the grid's
+// own defaults: h/l select a column (scrolling it into view), up/k and down
+// move the table row WHILE THE TABLE HAS FOCUS (a split layout's primary
+// pane, or the plain table view), digit keys switch views (1 is always the
+// table), Tab toggles focus between the table and a split secondary view, s
+// sorts by the selected column, Enter emits RowActivatedMsg, + emits
+// tui.AddToSidebarMsg, / opens the built-in filter.
 func (m *Model) Update(msg tea.Msg) (transcript.Block, tea.Cmd) {
 	keyMsg, ok := msg.(tea.KeyPressMsg)
 	if !ok {
@@ -26,9 +29,11 @@ func (m *Model) Update(msg tea.Msg) (transcript.Block, tea.Cmd) {
 		m.table, cmd = m.table.Update(msg)
 		return m, cmd
 	}
-	if i := int(m.view) - firstExtraView; i >= 0 && i < len(m.extraViews) && m.extraViews[i].Update != nil {
-		if cmd, handled := m.extraViews[i].Update(m, keyMsg); handled {
-			return m, cmd
+	if m.secondaryFocus {
+		if i := int(m.view) - firstExtraView; i >= 0 && i < len(m.extraViews) && m.extraViews[i].Update != nil {
+			if cmd, handled := m.extraViews[i].Update(m, keyMsg); handled {
+				return m, cmd
+			}
 		}
 	}
 	if m.keyHandler != nil {
@@ -50,14 +55,18 @@ func (m *Model) Update(msg tea.Msg) (transcript.Block, tea.Cmd) {
 	case "up", "k":
 		// bubble-table's own RowUp always wraps to the last row; the grid
 		// itself does not, matching h/l's clamped column navigation above.
-		if m.view == ViewTable {
+		// Gated on !secondaryFocus rather than m.view == ViewTable: a split
+		// layout's primary (table) pane keeps its own row cursor reachable
+		// even while a non-table view occupies the secondary pane, as long
+		// as secondary focus hasn't been Tab'd onto that view.
+		if !m.secondaryFocus {
 			if i := m.CurrentIndex(); i > 0 {
 				m.SelectRow(i - 1)
 			}
 			return m, nil
 		}
 	case "down":
-		if m.view == ViewTable {
+		if !m.secondaryFocus {
 			if i := m.CurrentIndex(); i >= 0 && i+1 < len(m.rows) {
 				m.SelectRow(i + 1)
 			}
@@ -87,15 +96,16 @@ func (m *Model) Update(msg tea.Msg) (transcript.Block, tea.Cmd) {
 		m.SetView(View(firstExtraView + n))
 		return m, nil
 	}
-	if m.view != ViewTable && m.secondaryFocus {
+	if m.secondaryFocus {
 		// A registered ExtraView with no Update of its own does not consume
 		// navigation keys while it holds secondary focus.
 		return m, nil
 	}
-	if m.view == ViewTable {
-		var cmd tea.Cmd
-		m.table, cmd = m.table.Update(msg)
-		return m, cmd
-	}
-	return m, nil
+	// The table has focus — the plain table view, or a split layout's
+	// primary pane while secondary focus hasn't been Tab'd onto the active
+	// non-table view — so any bubble-table key not already handled above
+	// (e.g. pgup/pgdown) still reaches it.
+	var cmd tea.Cmd
+	m.table, cmd = m.table.Update(msg)
+	return m, cmd
 }
