@@ -94,25 +94,25 @@ func userColors() (bg, border, fg color.Color) {
 }
 
 func assistantColors() (bg, border, fg color.Color) {
-	return pick(lipgloss.Color("#F1F1EC"), lipgloss.Color("#20232A")),
+	return pick(lipgloss.Color("#E9E9E1"), lipgloss.Color("#262A33")),
 		pick(lipgloss.Color("#A8A89C"), lipgloss.Color("#4B4F58")),
 		pick(lipgloss.Color("#1B1B18"), lipgloss.Color("#E5E5E1"))
 }
 
 func systemColors() (bg, border, fg color.Color) {
-	return pick(lipgloss.Color("#FBF3D8"), lipgloss.Color("#3A331A")),
+	return pick(lipgloss.Color("#F5E8BE"), lipgloss.Color("#3A331A")),
 		pick(lipgloss.Color("#C7A934"), lipgloss.Color("#9C8330")),
 		pick(lipgloss.Color("#4A3B00"), lipgloss.Color("#F1DE97"))
 }
 
 func errorColors() (bg, border, fg color.Color) {
-	return pick(lipgloss.Color("#FBE1DE"), lipgloss.Color("#3A1D1A")),
+	return pick(lipgloss.Color("#FBE1DE"), lipgloss.Color("#452421")),
 		pick(lipgloss.Color("#C6584A"), lipgloss.Color("#B5544A")),
 		pick(lipgloss.Color("#4A0F09"), lipgloss.Color("#F5C6BF"))
 }
 
 func blockColors() (bg, border, fg color.Color) {
-	return pick(lipgloss.Color("#EDEEF4"), lipgloss.Color("#1E222B")),
+	return pick(lipgloss.Color("#E3E5EF"), lipgloss.Color("#262B36")),
 		pick(lipgloss.Color("#9195A8"), lipgloss.Color("#454B5C")),
 		pick(lipgloss.Color("#181A21"), lipgloss.Color("#E3E5EE"))
 }
@@ -150,6 +150,18 @@ func AccentColor() color.Color { return pick(lipgloss.Color("#734B00"), lipgloss
 func barColors() (bg, fg color.Color) {
 	return pick(lipgloss.Color("#D8DCE6"), lipgloss.Color("#2E3440")),
 		pick(lipgloss.Color("#101820"), lipgloss.Color("#ECEFF4"))
+}
+
+// TerminalBackground is this package's working assumption for "the bare
+// terminal background a card/composer surface must read as distinct from"
+// — a typical terminal emulator default (not the most extreme possible
+// pure black/white, which would understate the real regression: founder
+// 2026-09-25, "the assistant card fill is indistinguishable from the
+// terminal background" in dark mode was reproducible against a common
+// near-black default like most terminals ship with, not against pure
+// black). Every SurfaceDeltaPairs() entry is checked against this.
+func TerminalBackground() color.Color {
+	return pick(lipgloss.Color("#FAFAFA"), lipgloss.Color("#1E1E1E"))
 }
 
 // SurfaceColors returns the neutral panel/grid surface background+
@@ -286,6 +298,39 @@ const CardPaddingRows = 1
 // grid.WithMaxVisibleRows(n), never by redefining this constant.
 const MaxInlineGridRows = 10
 
+// --- vertical margins --------------------------------------------------
+//
+// Founder ruling (2026-09-25, r9, "Margins (approved)"): a single blank
+// row between the top bar and the content below it (both the chat column
+// and, when split, the side panel column — one full-width blank row
+// achieves both at once, see chatshell's View()), a single blank row
+// between the last transcript card and the composer, and NO blank row
+// between the composer and the hints/status bar. Both blank rows collapse
+// to zero below MarginCollapseRows terminal rows, so a short terminal
+// never loses transcript space to decoration.
+
+// MarginRows is the number of blank rows chatshell inserts at each of the
+// two margin points above, when the terminal is tall enough (see
+// ContentMargins) — a single shared constant so every product's spacing
+// agrees, per this package's own no-per-product-styling rule.
+const MarginRows = 1
+
+// MarginCollapseRows is the terminal row count AT OR BELOW which
+// ContentMargins returns 0 — founder: "collapse both below 24 terminal
+// rows".
+const MarginCollapseRows = 24
+
+// ContentMargins returns MarginRows when the terminal is taller than
+// MarginCollapseRows, 0 otherwise — the one function chatshell calls at
+// both margin points (top-bar/content, and last-card/composer) so the
+// collapse rule lives in exactly one place.
+func ContentMargins(terminalRows int) int {
+	if terminalRows < MarginCollapseRows {
+		return 0
+	}
+	return MarginRows
+}
+
 // cardBarWidth is the 1-column left accent bar Card reserves on every
 // card (rendered in FocusColor() when focused, or the card's own
 // background — i.e. invisible — otherwise), so a card's OUTER width never
@@ -404,10 +449,19 @@ type Hint struct {
 func RenderHints(width int, hints []Hint, segments ...string) string {
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(AccentColor())
 	labelStyle := lipgloss.NewStyle().Foreground(MutedColor())
-	tokens := make([]string, 0, len(hints)+len(segments))
-	tokens = append(tokens, segments...)
+	tokens := make([]hintToken, 0, len(hints)+len(segments))
+	// Segments are plain, unstyled product strings (e.g. "F6/Shift+→
+	// workspace") — splittable at word boundaries when a whole segment
+	// doesn't fit any line, rather than mid-word truncated.
+	for _, seg := range segments {
+		tokens = append(tokens, hintToken{text: seg, splittable: true})
+	}
+	// A Hint's key/label pair renders as ONE already-styled token and must
+	// stay atomic: founder/coordinator (r9): "never cut a key/label pair".
+	// It goes on its own line rather than being split apart, even when the
+	// pair itself doesn't fit the width.
 	for _, h := range hints {
-		tokens = append(tokens, keyStyle.Render(h.Key)+" "+labelStyle.Render(h.Label))
+		tokens = append(tokens, hintToken{text: keyStyle.Render(h.Key) + " " + labelStyle.Render(h.Label), splittable: false})
 	}
 	lines := wrapTokens(tokens, max(1, width))
 	if len(lines) == 0 {
@@ -420,31 +474,74 @@ func RenderHints(width int, hints []Hint, segments ...string) string {
 	return strings.Join(styled, "\n")
 }
 
+// hintToken is one RenderHints token queued for wrapTokens: text plus
+// whether wrapTokens may split it into its individual space-separated
+// words when the whole token doesn't fit a line by itself.
+type hintToken struct {
+	text       string
+	splittable bool
+}
+
 // wrapTokens packs tokens onto as few lines as fit within maxWidth,
 // breaking to a new line only when the next token would not fit — ported
 // from DataTug's wrapStatusSegments (datatug-cli/pkg/chat/chatui.go,
-// before this package existed).
-func wrapTokens(tokens []string, maxWidth int) []string {
+// before this package existed). A token wider than maxWidth on its own is
+// placed on its own line; if it is ALSO splittable (a plain multi-word
+// segment, never a Hint's key/label pair), it is instead broken at word
+// boundaries and those words packed the same way — so a too-long segment
+// wraps onto more lines instead of being cut mid-word with an ellipsis
+// (founder/coordinator, r9: "F6/Shift+→ work…" truncating a segment was
+// the regression this fixes), while a non-splittable token (a Hint pair)
+// never loses its key or its label.
+func wrapTokens(tokens []hintToken, maxWidth int) []string {
 	const separator = "   "
 	lines := make([]string, 0, len(tokens))
 	current := ""
-	for _, token := range tokens {
-		token = ansi.Truncate(token, maxWidth, "…")
-		candidate := token
+	flush := func() {
 		if current != "" {
-			candidate = current + separator + token
+			lines = append(lines, current)
+			current = ""
+		}
+	}
+	place := func(word string) {
+		candidate := word
+		if current != "" {
+			candidate = current + separator + word
 		}
 		if current != "" && ansi.StringWidth(candidate) > maxWidth {
-			lines = append(lines, current)
-			current = token
-			continue
+			flush()
+			current = word
+			return
 		}
 		current = candidate
 	}
-	if current != "" {
-		lines = append(lines, current)
+	for _, tok := range tokens {
+		if !tok.splittable || ansi.StringWidth(tok.text) <= maxWidth {
+			place(tok.text)
+			continue
+		}
+		for _, word := range strings.Fields(tok.text) {
+			place(word)
+		}
 	}
+	flush()
 	return lines
+}
+
+// --- colour blending -------------------------------------------------
+
+// blend linearly mixes two colours' sRGB channels, t in [0,1] weighting b
+// (t=0 returns a, t=1 returns b) — used for a "one step off" tint that
+// isn't itself one of the named role/focus colours (see
+// composerFocusColors).
+func blend(a, b color.Color, t float64) color.Color {
+	ar, ag, ab, _ := a.RGBA()
+	br, bg, bb, _ := b.RGBA()
+	mix := func(x, y uint32) uint8 {
+		v := float64(x)*(1-t) + float64(y)*t
+		return uint8(v / 257) // 16-bit -> 8-bit
+	}
+	return color.RGBA{R: mix(ar, br), G: mix(ag, bg), B: mix(ab, bb), A: 0xFF}
 }
 
 // --- composer frame --------------------------------------------------
@@ -475,20 +572,45 @@ func ComposerFrameSize() (cols, rows int) {
 	return composerBarWidth + 2*composerPaddingCols, 2 * composerPaddingRows
 }
 
+// composerFocusTint is the mixing weight ComposerFocusColors blends
+// FocusColor() into the composer's unfocused surface by — a "slightly
+// stronger tint", not the full bright FocusColor() fill Card/
+// FocusSurfaceColors uses. Founder/coordinator correction (r9, on seeing
+// the composer rendered with FocusSurfaceColors like a Card): "a SUBTLE
+// filled area (a tint one step off the terminal background, like the
+// cards) ... focus = the thin left accent bar in the focus colour +
+// slightly stronger tint (NOT a full bright fill)" — a Card intentionally
+// goes full FocusSurfaceColors on focus (there's no better cue: an entire
+// message either has focus or doesn't), but the composer already reads as
+// focused via its left accent bar and the cursor inside it, so its own
+// fill only needs to nudge toward the accent, not become it.
+const composerFocusTint = 0.22
+
+// ComposerFocusColors returns the composer's FOCUSED fill: its own
+// unfocused SurfaceColors() background blended composerFocusTint of the
+// way toward FocusColor() (foreground unchanged — the blend is subtle
+// enough that SurfaceColors' foreground still meets bodyTextMinRatio
+// against it; verified by TestContrastMeetsWCAG's composer pairs).
+func ComposerFocusColors() (bg, fg color.Color) {
+	surfaceBG, surfaceFG := SurfaceColors()
+	return blend(surfaceBG, FocusColor(), composerFocusTint), surfaceFG
+}
+
 // ComposerFrame wraps a composer's rendered input view in the shared
-// filled background: SurfaceColors unfocused, FocusSurfaceColors plus a
-// left accent bar while focused — the same accent a focused card or a
-// selected panel row uses, so "the composer has focus" reads consistently
-// with every other zone. content is run through paintOver first: a bubbles
-// input's own View() carries its own ANSI styling (cursor cell, etc.)
-// including its own resets, which would otherwise cut this fill's
+// filled background: SurfaceColors unfocused, ComposerFocusColors (a
+// subtle tint toward FocusColor(), not the full bright fill a Card uses)
+// plus a left accent bar in FocusColor() while focused — so "the composer
+// has focus" reads primarily from the accent bar, with the fill only
+// nudged, never a "bright slab". content is run through paintOver first: a
+// bubbles input's own View() carries its own ANSI styling (cursor cell,
+// etc.) including its own resets, which would otherwise cut this fill's
 // background off partway through the line (the "lost composer background"
 // regression — see the paintOver doc above).
 func ComposerFrame(width int, content string, focused bool) string {
 	bg, fg := SurfaceColors()
 	barColor := bg
 	if focused {
-		bg, fg = FocusSurfaceColors()
+		bg, fg = ComposerFocusColors()
 		barColor = FocusColor()
 	}
 	style := lipgloss.NewStyle().
@@ -644,6 +766,57 @@ func ContrastPairs() []ContrastPair {
 		ContrastPair{Name: "focus border vs bar background", FG: FocusColor(), BG: barBG, MinimumRatio: nonTextMinRatio},
 	)
 
+	composerBG, composerFG := SurfaceColors()
+	focusComposerBG, focusComposerFG := ComposerFocusColors()
+	pairs = append(pairs,
+		ContrastPair{Name: "composer typed text (unfocused)", FG: composerFG, BG: composerBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "composer typed text (focused)", FG: focusComposerFG, BG: focusComposerBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "composer placeholder (unfocused)", FG: MutedColor(), BG: composerBG, MinimumRatio: placeholderMinRatio},
+		ContrastPair{Name: "composer placeholder (focused)", FG: MutedColor(), BG: focusComposerBG, MinimumRatio: placeholderMinRatio},
+		ContrastPair{Name: "focus bar vs composer fill (focused)", FG: FocusColor(), BG: focusComposerBG, MinimumRatio: nonTextMinRatio},
+	)
+
+	return pairs
+}
+
+// minSurfaceDelta is the minimum WCAG contrast ratio a card/composer
+// surface fill must have against TerminalBackground() — founder 2026-09-25
+// (r9 coordinator review): "the assistant card fill is indistinguishable
+// from the terminal background" in dark mode. Unlike bodyTextMinRatio/
+// nonTextMinRatio (both about reading TEXT), this is about the fill
+// itself being perceivable as a card/composer AT ALL against bare
+// terminal — a much lower bar (WCAG has no named threshold for this; 1.15
+// is this package's own floor, picked so the r9 regression — an ~1.06
+// ratio between the assistant dark fill and a common near-black terminal
+// default — fails loudly instead of shipping again).
+const minSurfaceDelta = 1.15
+
+// SurfaceDeltaPair names one card/composer surface fill and the minimum
+// contrast ratio (see Contrast) it must have against TerminalBackground().
+type SurfaceDeltaPair struct {
+	Name         string
+	Surface      color.Color
+	MinimumRatio float64
+}
+
+// SurfaceDeltaPairs returns every card-role and composer surface fill this
+// package paints directly on the terminal background, for the CURRENT Dark
+// variant — the source of truth TestSurfaceDistinctFromTerminalBackground
+// checks, so a card/composer tint that's crept too close to
+// TerminalBackground() (unreadable as "a card" at all, independent of its
+// text's own contrast) fails a test instead of shipping.
+func SurfaceDeltaPairs() []SurfaceDeltaPair {
+	pairs := make([]SurfaceDeltaPair, 0, 8)
+	for _, role := range []Role{RoleUser, RoleAssistant, RoleSystem, RoleError, RoleBlock} {
+		bg, _, _ := colorsFor(role)
+		pairs = append(pairs, SurfaceDeltaPair{Name: string(role) + " card fill vs terminal background", Surface: bg, MinimumRatio: minSurfaceDelta})
+	}
+	composerBG, _ := SurfaceColors()
+	focusComposerBG, _ := ComposerFocusColors()
+	pairs = append(pairs,
+		SurfaceDeltaPair{Name: "composer fill (unfocused) vs terminal background", Surface: composerBG, MinimumRatio: minSurfaceDelta},
+		SurfaceDeltaPair{Name: "composer fill (focused) vs terminal background", Surface: focusComposerBG, MinimumRatio: minSurfaceDelta},
+	)
 	return pairs
 }
 

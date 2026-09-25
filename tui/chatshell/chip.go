@@ -377,13 +377,14 @@ func (m *Model) chipsView(width int) string {
 // chipsTopY returns the Y coordinate (chatshell's own top-left-origin
 // coordinate frame, matching tea.Mouse's) of the first chip row, so
 // handleMouseClick can translate a click's Y into a row index: the
-// rendered top bar's height, plus the transcript's fixed viewport height
+// rendered top bar's height, plus the top-bar/content margin row (see
+// theme.ContentMargins), plus the transcript's fixed viewport height
 // (historyHeight), plus the slash-command menu's height when it's
 // currently showing -- exactly the content View() stacks above the chip
 // row(s), in order (see historyHeight's own doc for why each of these is
 // measured rather than assumed).
 func (m *Model) chipsTopY() int {
-	return m.topBarHeight() + m.historyHeight() + m.menuHeight()
+	return m.topBarHeight() + theme.ContentMargins(m.height) + m.historyHeight() + m.menuHeight()
 }
 
 // handleMouseClick handles a tea.MouseClickMsg: a click on a chip's "×"

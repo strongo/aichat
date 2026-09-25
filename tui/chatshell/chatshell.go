@@ -3,6 +3,7 @@ package chatshell
 import (
 	"context"
 	"errors"
+	"image/color"
 	"iter"
 	"reflect"
 	"strings"
@@ -1416,7 +1417,13 @@ func (m *Model) historyHeight() int {
 	if m.busy {
 		busySpinnerLine = 1
 	}
-	return max(1, m.height-m.topBarHeight()-m.menuHeight()-m.composerHeight()-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine)
+	// marginRows accounts for BOTH blank rows View() inserts when the
+	// terminal is tall enough (theme.ContentMargins): one between the top
+	// bar and the content below it, one between the last transcript card
+	// and the composer -- see View()'s own doc. Both collapse to 0 below
+	// theme.MarginCollapseRows terminal rows, same as here.
+	marginRows := 2 * theme.ContentMargins(m.height)
+	return max(1, m.height-m.topBarHeight()-m.menuHeight()-m.composerHeight()-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine-marginRows)
 }
 
 // composerHeight is the composer's total rendered row count: its own
@@ -1809,14 +1816,84 @@ func (m *Model) topBarView() string {
 // idempotent, so doing it unconditionally on every render is simpler and
 // more robust than hunting down every call site that can change chrome
 // height.
+// composerTextAreaStyles returns textarea styles that paint NO background
+// of their own: every StyleState field below sets at most a foreground
+// colour (never Background), so the composer's own ComposerFrame fill
+// (theme.SurfaceColors unfocused, theme.ComposerFocusColors focused) shows
+// through completely, composited via theme.PaintOver.
+//
+// This replaces bubbles' own textarea.DefaultStyles(), whose
+// Focused.CursorLine sets an OPAQUE Background (white in light mode, pure
+// black in dark mode) across the ENTIRE line the cursor sits on -- for a
+// single-line composer, that is the whole input. theme.PaintOver only
+// reasserts a fill after a bare ANSI reset; it cannot see through another
+// explicit background SGR the nested content emits, so that background
+// painted straight over the composer's own fill -- the "large bright
+// light-blue slab with a BLACK inner input line" regression a round-9
+// coordinator render caught (verbatim: typed/placeholder text was legible
+// only because it happened to sit on that unintended black band, not
+// because the composer's OWN fill was showing).
+//
+// Text/CursorLine/Placeholder foregrounds match whichever composer surface
+// is currently showing (unfocused vs focused), verified against
+// bodyTextMinRatio/placeholderMinRatio by theme.TestContrastMeetsWCAG's
+// composer pairs -- so typed text and the placeholder stay readable in
+// both focus states and both Dark variants without this package picking
+// its own colour literals (theme remains the one place that decides).
+func composerTextAreaStyles(focused bool) textarea.Styles {
+	_, blurredFG := theme.SurfaceColors()
+	_, focusedFG := theme.ComposerFocusColors()
+	placeholderFG := theme.MutedColor()
+
+	state := func(textFG color.Color) textarea.StyleState {
+		return textarea.StyleState{
+			Base:        lipgloss.NewStyle(),
+			Text:        lipgloss.NewStyle().Foreground(textFG),
+			CursorLine:  lipgloss.NewStyle().Foreground(textFG),
+			Placeholder: lipgloss.NewStyle().Foreground(placeholderFG),
+			Prompt:      lipgloss.NewStyle(),
+			EndOfBuffer: lipgloss.NewStyle(),
+			LineNumber:  lipgloss.NewStyle(),
+		}
+	}
+	cursorFG := blurredFG
+	if focused {
+		cursorFG = focusedFG
+	}
+	return textarea.Styles{
+		Blurred: state(blurredFG),
+		Focused: state(focusedFG),
+		Cursor:  textarea.CursorStyle{Color: cursorFG, Shape: tea.CursorBlock, Blink: true},
+	}
+}
+
+// View renders the chat screen. It re-applies resize() FIRST, on every
+// call (r2 review, B1) -- not only in response to WindowSizeMsg/F6/Ctrl+
+// Left/Right/a chip-list change, the only events that previously called
+// it -- because historyHeight() (and therefore how tall the transcript
+// SHOULD be) also depends on state that changes without going through any
+// of those: typing "/" opens the slash-command menu, SetStatus changes the
+// status segment's height, and SetBusy(true)/StartStream reserves the
+// spinner line. Without this, m.transcript's ACTUAL viewport size (set via
+// SetSize, and otherwise sticky) drifts from the CURRENT historyHeight()
+// value between renders -- both the total rendered line count (over- or
+// under-filling the screen) and chipsTopY's click math (computed fresh
+// from the CURRENT historyHeight() at click time, but answering for
+// whatever was ACTUALLY drawn by the last, possibly stale, render) go
+// wrong. Calling resize() here is cheap (it only sets sizes) and
+// idempotent, so doing it unconditionally on every render is simpler and
+// more robust than hunting down every call site that can change chrome
+// height.
 func (m *Model) View() tea.View {
 	m.resize()
+	inputFocused := m.focusRing.Zone() == focus.ZoneInput
+	m.input.SetStyles(composerTextAreaStyles(inputFocused))
 	top := m.topBarView()
 	history := m.transcript.View()
 	if m.busy {
 		history += "\n" + m.spinner.View() + " thinking…"
 	}
-	composer := theme.ComposerFrame(m.chatWidth(), m.input.View(), m.focusRing.Zone() == focus.ZoneInput)
+	composer := theme.ComposerFrame(m.chatWidth(), m.input.View(), inputFocused)
 	menu := m.commandMenuView()
 	chatParts := []string{history}
 	if menu != "" {
@@ -1827,6 +1904,13 @@ func (m *Model) View() tea.View {
 		// the slash-command menu (which sits directly above the input only
 		// while no chips are focused-adjacent) and before it.
 		chatParts = append(chatParts, chips)
+	}
+	// One blank row between the last transcript card and the composer
+	// (founder 2026-09-25 margins ruling), collapsing under
+	// theme.MarginCollapseRows terminal rows -- historyHeight() reserves
+	// the matching row(s), so this never over- or under-fills the screen.
+	for range theme.ContentMargins(m.height) {
+		chatParts = append(chatParts, "")
 	}
 	chatParts = append(chatParts, composer)
 	chat := lipgloss.JoinVertical(lipgloss.Left, chatParts...)
@@ -1839,8 +1923,17 @@ func (m *Model) View() tea.View {
 		// one from chatshell on top of it).
 		body = lipgloss.JoinHorizontal(lipgloss.Top, chat, side)
 	}
+	// One blank row between the top bar and the content below it, for
+	// BOTH columns at once -- a single full-width blank row here sits
+	// above the already-joined chat+side body, so one row of chatshell's
+	// own margin logic covers the "both columns" requirement without the
+	// side panel needing to know about margins itself.
+	topParts := []string{top}
+	for range theme.ContentMargins(m.height) {
+		topParts = append(topParts, "")
+	}
 	status := m.statusBarView()
-	content := lipgloss.JoinVertical(lipgloss.Left, top, body, status)
+	content := lipgloss.JoinVertical(lipgloss.Left, append(topParts, body, status)...)
 	if n := len(m.overlays); n > 0 {
 		content = m.renderOverlay(content, m.overlays[n-1])
 	}

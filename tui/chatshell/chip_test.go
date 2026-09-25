@@ -10,6 +10,7 @@ import (
 
 	"github.com/strongo/aichat/ai/session"
 	"github.com/strongo/aichat/tui/focus"
+	"github.com/strongo/aichat/tui/theme"
 )
 
 // chipHandler is a Handler + ChipObserver fake for exercising the
@@ -1041,7 +1042,7 @@ func TestChipsTopYAccountsForMultiLineTopBarAndMenu(t *testing.T) {
 	m.SetChips(threeChips())
 
 	withoutMenu := m.chipsTopY()
-	wantWithoutMenu := 2 /* two top-bar lines */ + m.historyHeight()
+	wantWithoutMenu := 2 /* two top-bar lines */ + theme.ContentMargins(m.height) /* top-bar/content margin row */ + m.historyHeight()
 	if withoutMenu != wantWithoutMenu {
 		t.Fatalf("chipsTopY() = %d, want %d", withoutMenu, wantWithoutMenu)
 	}

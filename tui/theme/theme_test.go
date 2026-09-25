@@ -317,6 +317,36 @@ func TestContrastMeetsWCAG(t *testing.T) {
 	}
 }
 
+// TestSurfaceDistinctFromTerminalBackground covers the r9 coordinator
+// regression: a card or composer fill that's technically WCAG-compliant
+// for its own TEXT can still be visually indistinguishable from the bare
+// terminal background as a FILL (founder: "the assistant card fill is
+// indistinguishable from the terminal background" in dark mode). Every
+// SurfaceDeltaPairs() entry must clear minSurfaceDelta against
+// TerminalBackground(), in both Dark variants.
+func TestSurfaceDistinctFromTerminalBackground(t *testing.T) {
+	prevDark := Dark
+	t.Cleanup(func() { SetDark(prevDark) })
+	for _, dark := range []bool{true, false} {
+		SetDark(dark)
+		variant := "dark"
+		if !dark {
+			variant = "light"
+		}
+		pairs := SurfaceDeltaPairs()
+		if len(pairs) == 0 {
+			t.Fatalf("[%s] SurfaceDeltaPairs returned none", variant)
+		}
+		term := TerminalBackground()
+		for _, p := range pairs {
+			ratio := Contrast(p.Surface, term)
+			if ratio < p.MinimumRatio {
+				t.Errorf("[%s] %s: delta %.3f:1 below minimum %.2f:1 (surface=%#v terminal=%#v)", variant, p.Name, ratio, p.MinimumRatio, p.Surface, term)
+			}
+		}
+	}
+}
+
 func TestContrastIsSymmetric(t *testing.T) {
 	white := lipgloss.Color("#FFFFFF")
 	black := lipgloss.Color("#000000")
@@ -328,5 +358,44 @@ func TestContrastIsSymmetric(t *testing.T) {
 	}
 	if got := Contrast(white, white); got < 0.99 || got > 1.01 {
 		t.Fatalf("Contrast(white, white) = %.2f, want 1", got)
+	}
+}
+
+func TestPaintOverExported(t *testing.T) {
+	out := PaintOver("plain\x1b[0mtext", lipgloss.Color("#112233"), lipgloss.Color("#EEEEEE"))
+	if !strings.Contains(plain(out), "plaintext") {
+		t.Fatalf("PaintOver dropped content: %q", out)
+	}
+	want := fillSGR(lipgloss.Color("#112233"), lipgloss.Color("#EEEEEE"))
+	if strings.Count(out, want) < 2 {
+		t.Fatalf("PaintOver did not reassert the fill after the embedded reset: %q", out)
+	}
+}
+
+func TestContentMarginsCollapsesBelowThreshold(t *testing.T) {
+	if got := ContentMargins(MarginCollapseRows - 1); got != 0 {
+		t.Fatalf("ContentMargins(%d) = %d, want 0 (below the collapse threshold)", MarginCollapseRows-1, got)
+	}
+	if got := ContentMargins(MarginCollapseRows); got != MarginRows {
+		t.Fatalf("ContentMargins(%d) = %d, want %d (at the threshold, not collapsed)", MarginCollapseRows, got, MarginRows)
+	}
+	if got := ContentMargins(MarginCollapseRows + 10); got != MarginRows {
+		t.Fatalf("ContentMargins(%d) = %d, want %d (well above the threshold)", MarginCollapseRows+10, got, MarginRows)
+	}
+}
+
+func TestRenderHintsSplitsAnOverWideSegmentOnWordBoundaries(t *testing.T) {
+	// A single plain segment wider than the whole line must wrap onto
+	// multiple lines, breaking only between words -- never mid-word with
+	// an ellipsis (the "F6/Shift+→ work…" regression this fixes).
+	out := RenderHints(12, nil, "F6/Shift+→ workspace switch")
+	flat := plain(out)
+	for _, want := range []string{"F6/Shift+→", "workspace", "switch"} {
+		if !strings.Contains(flat, want) {
+			t.Fatalf("word %q lost or cut mid-word while wrapping an over-wide segment:\n%s", want, flat)
+		}
+	}
+	if strings.Contains(flat, "…") {
+		t.Fatalf("expected no mid-word ellipsis truncation once a segment wraps on word boundaries:\n%s", flat)
 	}
 }
