@@ -1436,11 +1436,24 @@ func (m *Model) resize() {
 
 func (m *Model) splitEnabled() bool { return m.width >= splitMinWidth && m.panelVisible() }
 
+// chatWidth's total screen-row budget is m.width-1, not m.width-2: the
+// SAME single reserved column as every other outer edge in this package
+// (a card/composer's own blank focus-marker column IS its left margin;
+// see surfaceFill's doc). A "-2" budget here used to leave the RIGHT edge
+// 2 columns short of the terminal's own edge (1 too many) while the left
+// edge only ever looked inset by 1 (the card's own marker column, already
+// inside its width) -- founder 2026-09-25, seeing it in Warp: "Why there
+// is right margin on right of the screen?" (coordinator measured: the
+// side panel ended at column 118 of 120, a 2-column right margin against
+// the chat column's own 1-column left margin). Fixed at the source here
+// (and in sidebarWidth, which shares this same total budget) rather than
+// in theme.PanelFrame/Card, which already draw flush to whatever width
+// they're given.
 func (m *Model) chatWidth() int {
 	if !m.splitEnabled() {
-		return max(1, m.width-2)
+		return max(1, m.width-1)
 	}
-	inner := max(1, m.width-2)
+	inner := max(1, m.width-1)
 	return max(42, min(inner-24, inner*m.panelChatPercent()/100))
 }
 
@@ -1448,19 +1461,11 @@ func (m *Model) sidebarWidth() int {
 	if !m.splitEnabled() {
 		return 0
 	}
-	// The trailing "-1" this used to subtract dated back to
-	// theme.PanelFrame's own single-column "│" divider, reserved here on
-	// TOP of chatWidth()'s own budget. PanelFrame no longer draws
-	// anything of its own outside the OUTER width panelView already
-	// passes it (its 2-column gap+marker come out of THAT budget, via
-	// panelInnerWidth) -- so the panel's own outer width is simply
-	// whatever remains after chatWidth(), with no separate frame
-	// allowance here. Kept as -1 after this round-10 gap/marker redesign
-	// would have shrunk the panel's usable content by one extra column
-	// for no reason, tipping tabStripHeader from its full label set to
-	// the short one at borderline widths -- a real r10 regression this
-	// fixes.
-	return max(1, m.width-2-m.chatWidth())
+	// Shares chatWidth()'s own total budget (m.width-1, see its doc) --
+	// chat and panel together span m.width-1 columns, leaving exactly the
+	// same single reserved column on the right that chatWidth's own left
+	// margin (its card's blank marker column) mirrors on the left.
+	return max(1, m.width-1-m.chatWidth())
 }
 
 // historyHeight is the transcript viewport's fixed height: the terminal

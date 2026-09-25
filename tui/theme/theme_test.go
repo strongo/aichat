@@ -306,16 +306,65 @@ func TestPanelFrameFocusedVsUnfocused(t *testing.T) {
 	}
 }
 
+// TestPanelContentInsetMatchesCardTextInset covers the 2026-09-25
+// coordinator finding: panel header/rows started flush against the
+// panel's own surface first column ("Beacon", "● Project" touching the
+// edge) while every Card's own text sits CardPaddingCols in from ITS
+// surface edge. Panel content must now sit that same number of columns in
+// from the panel's OWN surface origin (the column right after
+// panelGapWidth's gap) as Card's text sits from ITS surface origin (the
+// column right after cardBarWidth's marker) -- the same text-column inset,
+// not just the same numeric constant.
+func TestPanelContentInsetMatchesCardTextInset(t *testing.T) {
+	const width = 30
+	cardLines := strings.Split(plain(Card(RoleUser, "", "Q", width, false)), "\n")
+	cardTextCol := -1
+	for _, line := range cardLines {
+		if idx := strings.IndexRune(line, 'Q'); idx >= 0 {
+			cardTextCol = idx
+			break
+		}
+	}
+	if cardTextCol < 0 {
+		t.Fatalf("card content %q missing marker rune", cardLines)
+	}
+	cardInset := cardTextCol - cardBarWidth
+
+	panelLines := strings.Split(plain(PanelFrame(width, 3, "", "Q", false)), "\n")
+	panelTextCol := -1
+	for _, line := range panelLines {
+		if idx := strings.IndexRune(line, 'Q'); idx >= 0 {
+			panelTextCol = idx
+			break
+		}
+	}
+	if panelTextCol < 0 {
+		t.Fatalf("panel content %q missing marker rune", panelLines)
+	}
+	panelInset := panelTextCol - panelGapWidth
+
+	if panelInset != cardInset {
+		t.Fatalf("panel content inset from its own surface origin = %d, card text inset from its own surface origin = %d, want equal", panelInset, cardInset)
+	}
+	if panelInset != CardPaddingCols {
+		t.Fatalf("panel content inset = %d, want CardPaddingCols (%d)", panelInset, CardPaddingCols)
+	}
+}
+
 // TestPanelFrameSize covers the r12 redesign (founder, verbatim, seeing
 // the rendered result in Warp: "side panel should be full height card"):
 // rows is now a CONSTANT 2 (the same vPad-vs-edges equalisation
 // ComposerFrameSize relies on), not 0 -- a caller's row budget must
 // reserve PanelFrame's own top/bottom overhead the same way it already
-// does for Card/ComposerFrame.
+// does for Card/ComposerFrame. cols is panelGapWidth's one divider column
+// plus panelPaddingCols on BOTH sides of the content (2026-09-25 fix,
+// same round as the outer-margin fix: cols used to claim 2 while
+// PanelFrame only ever drew 1 gap column and no content padding at all --
+// this now reflects what PanelFrame actually reserves, gap AND inset).
 func TestPanelFrameSize(t *testing.T) {
 	cols, rows := PanelFrameSize()
-	if cols != 2 || rows != 2 {
-		t.Fatalf("PanelFrameSize() = (%d, %d), want (2, 2)", cols, rows)
+	if want := panelGapWidth + 2*panelPaddingCols; cols != want || rows != 2 {
+		t.Fatalf("PanelFrameSize() = (%d, %d), want (%d, 2)", cols, rows, want)
 	}
 }
 
@@ -475,8 +524,8 @@ func containsBackgroundSGR(line string) bool {
 }
 
 func TestSelectedRow(t *testing.T) {
-	sel := SelectedRow("item", true)
-	unsel := SelectedRow("item", false)
+	sel := SelectedRow("item", true, 20)
+	unsel := SelectedRow("item", false, 20)
 	if sel == unsel {
 		t.Fatal("selected row identical to unselected")
 	}
@@ -485,6 +534,24 @@ func TestSelectedRow(t *testing.T) {
 	}
 	if !strings.HasPrefix(unsel, "  ") {
 		t.Fatalf("unselected row should be indented: %q", unsel)
+	}
+}
+
+// TestSelectedRowFillsFullWidth covers the 2026-09-25 fix: a selected
+// row's own highlight background must span its ENTIRE given width, not
+// just "› "+text's own character count -- otherwise a short row's
+// highlight reads as a narrow chip instead of a full-width selected bar,
+// unlike every other selected/highlighted surface this package draws
+// (grid's own rowStyle, Card's FocusSurfaceColors() fill).
+func TestSelectedRowFillsFullWidth(t *testing.T) {
+	const width = 24
+	sel := SelectedRow("x", true, width)
+	lines := strings.Split(sel, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected a single rendered line, got %d: %q", len(lines), sel)
+	}
+	if got := lipgloss.Width(lines[0]); got != width {
+		t.Fatalf("SelectedRow(width=%d) rendered width = %d, want %d", width, got, width)
 	}
 }
 
