@@ -95,6 +95,44 @@ func newTestShell(handler Handler) *Model {
 	return m
 }
 
+// TestInitRequestsBackgroundColorAndUpdateAppliesIt covers the r10
+// founder ruling: "derive surface tints from the ACTUAL terminal
+// background ... Chatshell applies the message; products do nothing." A
+// product never sends tea.BackgroundColorMsg itself, but Init's own
+// tea.RequestBackgroundColor should always be part of the batch it
+// returns, and Update must apply whatever answer arrives via
+// theme.SetTerminalBackground.
+func TestInitRequestsBackgroundColorAndUpdateAppliesIt(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("Init() returned a nil Cmd")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init()'s Cmd produced %T, want a tea.BatchMsg", msg)
+	}
+	// tea.RequestBackgroundColor's own Msg type (backgroundColorMsg) is
+	// unexported -- tea's runtime is what turns it into the real terminal
+	// query and, later, the real tea.BackgroundColorMsg answer this test
+	// applies below. The observable contract from here is just that
+	// Init's batch carries a SECOND command alongside textarea.Blink (the
+	// background request), which tea.RequestBackgroundColor itself IS
+	// (see Init's own doc).
+	if len(batch) < 2 {
+		t.Fatalf("Init()'s batch has %d commands, want >= 2 (textarea.Blink + tea.RequestBackgroundColor)", len(batch))
+	}
+
+	prev := theme.Dark
+	t.Cleanup(func() { theme.SetTerminalBackground(nil); theme.SetDark(prev) })
+	m.Update(tea.BackgroundColorMsg{Color: lipgloss.Color("#1e222b")})
+	if got := theme.TerminalBackground(); got != lipgloss.Color("#1e222b") {
+		t.Fatalf("theme.TerminalBackground() = %#v after BackgroundColorMsg, want the reported colour", got)
+	}
+}
+
 func TestEnterSubmitsAndAppendsUserMessage(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)

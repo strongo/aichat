@@ -87,50 +87,81 @@ func pick(light, dark color.Color) color.Color {
 }
 
 // --- role colours ----------------------------------------------------
+//
+// Founder 2026-09-25 (r10 coordinator review): "Derive surface tints from
+// the ACTUAL terminal background ... compute card/composer/bar surfaces
+// as small luminance shifts of the real background". A role's card
+// surface is no longer a fixed hex pair picked by hand for the dark/light
+// case — it's TerminalBackground() (the REAL reported background when
+// known, see SetTerminalBackground; the guessed default otherwise)
+// blended cardTintAmount of the way toward that role's fixed hue anchor,
+// so a card reads as "that role, tinted onto THIS terminal" whatever the
+// terminal's actual background turns out to be (a plain dark grey, a
+// bright white, or something hued like Solarized dark #002b36). Text
+// colour is picked for contrast against the COMPUTED bg (surfaceText),
+// not a fixed hex either, for the same reason.
 
-func userColors() (bg, border, fg color.Color) {
-	return pick(lipgloss.Color("#DCE8FA"), lipgloss.Color("#1C2B3A")),
-		pick(lipgloss.Color("#5B8FC7"), lipgloss.Color("#4A7FB5")),
-		pick(lipgloss.Color("#10243D"), lipgloss.Color("#E4EDFA"))
-}
-
-func assistantColors() (bg, border, fg color.Color) {
-	return pick(lipgloss.Color("#E9E9E1"), lipgloss.Color("#262A33")),
-		pick(lipgloss.Color("#A8A89C"), lipgloss.Color("#4B4F58")),
-		pick(lipgloss.Color("#1B1B18"), lipgloss.Color("#E5E5E1"))
-}
-
-func systemColors() (bg, border, fg color.Color) {
-	return pick(lipgloss.Color("#F5E8BE"), lipgloss.Color("#3A331A")),
-		pick(lipgloss.Color("#C7A934"), lipgloss.Color("#9C8330")),
-		pick(lipgloss.Color("#4A3B00"), lipgloss.Color("#F1DE97"))
-}
-
-func errorColors() (bg, border, fg color.Color) {
-	return pick(lipgloss.Color("#FBE1DE"), lipgloss.Color("#452421")),
-		pick(lipgloss.Color("#C6584A"), lipgloss.Color("#B5544A")),
-		pick(lipgloss.Color("#4A0F09"), lipgloss.Color("#F5C6BF"))
-}
-
-func blockColors() (bg, border, fg color.Color) {
-	return pick(lipgloss.Color("#E3E5EF"), lipgloss.Color("#262B36")),
-		pick(lipgloss.Color("#9195A8"), lipgloss.Color("#454B5C")),
-		pick(lipgloss.Color("#181A21"), lipgloss.Color("#E3E5EE"))
-}
-
-func colorsFor(role Role) (bg, border, fg color.Color) {
+// roleHue is the fixed tint each role blends toward TerminalBackground()
+// to produce its card surface — independent of light/dark; the blend
+// amount (cardTintAmount) plus surfaceText's contrast-safe foreground
+// picking handle both variants and any real background's own hue.
+func roleHue(role Role) color.Color {
 	switch role {
 	case RoleUser:
-		return userColors()
+		return lipgloss.Color("#4A7FB5")
 	case RoleSystem:
-		return systemColors()
+		return lipgloss.Color("#C7A934")
 	case RoleError:
-		return errorColors()
+		return lipgloss.Color("#B5544A")
 	case RoleBlock:
-		return blockColors()
-	default:
-		return assistantColors()
+		return lipgloss.Color("#8B93A8")
+	default: // RoleAssistant (and any unrecognised role)
+		return lipgloss.Color("#9A9488")
 	}
+}
+
+// cardTintAmount is how far a card surface blends from TerminalBackground()
+// toward its roleHue — tuned so the resulting delta against
+// TerminalBackground() clears minSurfaceDelta for every role against a
+// representative dark, light, AND hued (e.g. Solarized dark, #002b36)
+// terminal background; see TestSurfaceDistinctFromTerminalBackground,
+// which checks exactly this for several simulated backgrounds.
+const cardTintAmount = 0.20
+
+// surfaceText returns whichever of two safe, near-neutral candidates (a
+// light near-white, a dark near-black) has the HIGHER contrast against
+// bg — guarantees readable text on a surface tint derived from an
+// arbitrary real terminal background, instead of a fixed hex chosen for
+// only the two built-in dark/light guesses.
+func surfaceText(bg color.Color) color.Color {
+	light := lipgloss.Color("#F3F3EE")
+	dark := lipgloss.Color("#12120F")
+	if Contrast(light, bg) >= Contrast(dark, bg) {
+		return light
+	}
+	return dark
+}
+
+// ContrastText is surfaceText, exported for a caller that pairs text with
+// a background OTHER than one of this package's own derived surfaces —
+// e.g. tui/grid's "highlighted but unfocused" row, which used to pair a
+// role surface's own foreground with MutedColor() as the background: a
+// combination that's only safe in ONE Dark variant (MutedColor() itself
+// flips light/dark, but a role surface's foreground didn't flip to
+// match), which is what produced the r10 regression — a dark grid row
+// text on a dark MutedColor() background in light mode, unreadable. Any
+// caller pairing text with an arbitrary/foreign background should read
+// its colour from here instead of guessing.
+func ContrastText(bg color.Color) color.Color { return surfaceText(bg) }
+
+// colorsFor returns a role's card surface (bg), its hue anchor (border —
+// kept for a caller that still wants the role's identifying colour, e.g.
+// a future bordered variant; Card itself does not draw one), and a
+// contrast-safe foreground for that surface.
+func colorsFor(role Role) (bg, border, fg color.Color) {
+	hue := roleHue(role)
+	bg = blend(TerminalBackground(), hue, cardTintAmount)
+	return bg, hue, surfaceText(bg)
 }
 
 // FocusColor is the one accent colour used everywhere focus/selection is
@@ -153,15 +184,47 @@ func barColors() (bg, fg color.Color) {
 		pick(lipgloss.Color("#101820"), lipgloss.Color("#ECEFF4"))
 }
 
-// TerminalBackground is this package's working assumption for "the bare
-// terminal background a card/composer surface must read as distinct from"
-// — a typical terminal emulator default (not the most extreme possible
-// pure black/white, which would understate the real regression: founder
-// 2026-09-25, "the assistant card fill is indistinguishable from the
-// terminal background" in dark mode was reproducible against a common
-// near-black default like most terminals ship with, not against pure
-// black). Every SurfaceDeltaPairs() entry is checked against this.
+// realTerminalBackground is set by SetTerminalBackground once the terminal
+// has actually answered an OSC 11 query (chatshell.go, via bubbletea's
+// tea.RequestBackgroundColor()/BackgroundColorMsg) — nil until then, and
+// again nil for any terminal that never answers (most don't hang; a few
+// stay silent), in which case TerminalBackground() falls back to this
+// package's own guessed default below.
+var realTerminalBackground color.Color
+
+// SetTerminalBackground records the terminal's ACTUAL reported background
+// colour and derives Dark from ITS luminance — founder 2026-09-25 (r10
+// coordinator review, verbatim): "derive surface tints from the ACTUAL
+// terminal background ... Fallback to the current defaults when the
+// terminal doesn't answer. Chatshell applies the message; products do
+// nothing." A product never calls this itself: chatshell wires
+// tea.RequestBackgroundColor()/BackgroundColorMsg handling in
+// automatically (see chatshell.go's Init/Update). Passing nil clears it,
+// reverting TerminalBackground() to the guessed default and leaving Dark
+// as whatever it was already set to.
+func SetTerminalBackground(c color.Color) {
+	realTerminalBackground = c
+	if c != nil {
+		Dark = relativeLuminance(c) < 0.5
+	}
+}
+
+// TerminalBackground is "the bare terminal background a card/composer
+// surface reads its tint from, and must stay distinguishable against":
+// the terminal's own ACTUAL reported background (SetTerminalBackground)
+// when known, otherwise this package's guessed default for the current
+// Dark variant — a typical terminal emulator default (not the most
+// extreme possible pure black/white, which would understate the r9
+// regression this guess exists to catch: founder 2026-09-25, "the
+// assistant card fill is indistinguishable from the terminal background"
+// in dark mode was reproducible against a common near-black default like
+// most terminals ship with, not against pure black). Every
+// SurfaceDeltaPairs() entry is checked against this, and colorsFor blends
+// every card surface FROM it.
 func TerminalBackground() color.Color {
+	if realTerminalBackground != nil {
+		return realTerminalBackground
+	}
 	return pick(lipgloss.Color("#FAFAFA"), lipgloss.Color("#1E1E1E"))
 }
 
@@ -205,13 +268,23 @@ func colorProfileSupportsTrueColor() bool { return detectColorProfile() == color
 // match its own rendering choice to whichever mode is active.
 func HalfBlockEdgesActive() bool { return HalfBlockEdges && colorProfileSupportsTrueColor() }
 
-// HalfBlockEdge renders ONE half-block edge row, width cells wide, that
-// blends surfaceBG into TerminalBackground(): "▄" (foreground=surfaceBG,
-// background=TerminalBackground()) for the TOP edge — the surface's fill
-// appears to start half a line in — or "▀" (same colours) for the BOTTOM
-// edge. Exported so a caller building its own leading/trailing fill around
-// embedded content (chatshell's chip strip) can match Card/ComposerFrame's
-// own edge glyph/colour rule exactly, rather than re-deriving it.
+// HalfBlockEdge renders ONE half-block edge row, width cells wide: "▄"
+// (foreground=surfaceBG) for the TOP edge — the surface's fill appears to
+// start half a line in — or "▀" (same foreground) for the BOTTOM edge.
+// Deliberately sets NO background at all (SGR stays at the terminal's own
+// default, "49") — founder 2026-09-25 (r10 coordinator review, verbatim):
+// "Edge rows and any 'terminal background' cells must NOT set a
+// background at all (default bg, SGR 49) — only the fg = surface colour
+// on the ▄/▀ glyphs." Painting an explicit TerminalBackground() guess here
+// was the r10 regression: on a real terminal whose background differs
+// from that guess (a Warp theme, Solarized, ...), it showed as a visibly
+// wrong-coloured band above/below every card and the composer. Leaving
+// the background cell UNSET lets the real terminal's own background show
+// through exactly, always correct by construction — no guess needed for
+// the glyph's own "off" half at all. Exported so a caller building its
+// own leading/trailing fill around embedded content (chatshell's chip
+// strip) can match Card/ComposerFrame's own edge glyph/colour rule
+// exactly, rather than re-deriving it.
 func HalfBlockEdge(width int, surfaceBG color.Color, top bool) string {
 	glyph := "▀"
 	if top {
@@ -220,7 +293,7 @@ func HalfBlockEdge(width int, surfaceBG color.Color, top bool) string {
 	if width <= 0 {
 		return ""
 	}
-	return lipgloss.NewStyle().Foreground(surfaceBG).Background(TerminalBackground()).Render(strings.Repeat(glyph, width))
+	return lipgloss.NewStyle().Foreground(surfaceBG).Render(strings.Repeat(glyph, width))
 }
 
 // SurfaceColors returns the neutral panel/grid surface background+
@@ -232,7 +305,7 @@ func HalfBlockEdge(width int, surfaceBG color.Color, top bool) string {
 // it from here so a grid cell, a sidebar row and a card never disagree
 // about what "the surface" looks like.
 func SurfaceColors() (bg, fg color.Color) {
-	bg, _, fg = blockColors()
+	bg, _, fg = colorsFor(RoleBlock)
 	return bg, fg
 }
 
@@ -415,7 +488,42 @@ func InnerWidth(width int) int {
 // blank padding row on that side; otherwise (fallback) both sides always
 // get a full padding row regardless of topEdge/bottomEdge, matching this
 // package's original (pre-half-block) rendering exactly.
-func surfaceFill(bg, fg, barColor color.Color, barWidth, paddingCols int, content string, width int, topEdge, bottomEdge bool) string {
+// markerCell renders one focus-marker cell (or blank when unfocused/
+// unmarked): glyph in FocusColor(), NO background set at all — the
+// terminal's own default background shows through, since the marker sits
+// OUTSIDE the surface (see surfaceFill's own doc for why).
+func markerCell(glyph string, width int, marked bool) string {
+	if !marked {
+		return strings.Repeat(" ", width)
+	}
+	return lipgloss.NewStyle().Foreground(FocusColor()).Render(strings.Repeat(glyph, width))
+}
+
+// surfaceFill composes ONE filled surface block — a Card or a
+// ComposerFrame — from already-painted content: padded horizontally by
+// paddingCols at OUTER width, with a barWidth-column focus MARKER
+// (markerCell) reserved immediately to the LEFT of the surface — always
+// reserved (blank when unfocused, so focusing never shifts layout), never
+// part of the surface's own fill. Founder 2026-09-25 (r10 coordinator
+// review, verbatim, superseding an earlier same-day "in-surface accent
+// bar" instruction): "The focus accent is a narrow marker OUTSIDE the
+// surface, in the column immediately left of it, drawn on the terminal
+// background (no bg SGR): content rows '▌' fg = focus colour; top edge
+// row '▖' ...; bottom edge row '▘' ... The surface itself starts one
+// column to the right of the marker column; reserve that marker column
+// for every surface (blank when unfocused) so focusing doesn't shift
+// layout." One idiom for Card, ComposerFrame(NoTopEdge), and (chatshell's
+// own) the side panel.
+//
+// When HalfBlockEdgesActive(), topEdge/bottomEdge each request a
+// HalfBlockEdge row (with its OWN marker cell, '▖'/'▘') in place of a full
+// blank padding row on that side; otherwise (fallback) both sides always
+// get a full padding row regardless of topEdge/bottomEdge, each with the
+// SAME '▌' content-row marker (founder: "Fallback HalfBlockEdges=false:
+// marker '▌' on all rows of the surface including the full padding
+// rows"), matching this package's original (pre-half-block) rendering
+// otherwise unchanged.
+func surfaceFill(bg, fg color.Color, focused bool, barWidth, paddingCols int, content string, width int, topEdge, bottomEdge bool) string {
 	half := HalfBlockEdgesActive()
 	vPad := 1
 	if half {
@@ -428,21 +536,20 @@ func surfaceFill(bg, fg, barColor color.Color, barWidth, paddingCols int, conten
 		Padding(vPad, paddingCols).
 		Width(innerWidth).
 		Render(content)
-	bar := lipgloss.NewStyle().Background(barColor).Render(" ")
 	lines := strings.Split(rendered, "\n")
+	marker := markerCell("▌", barWidth, focused)
 	for i, line := range lines {
-		lines[i] = bar + line
+		lines[i] = marker + line
 	}
 	block := strings.Join(lines, "\n")
 	if !half {
 		return block
 	}
-	filler := lipgloss.NewStyle().Background(TerminalBackground()).Render(strings.Repeat(" ", barWidth))
 	if topEdge {
-		block = filler + HalfBlockEdge(width-barWidth, bg, true) + "\n" + block
+		block = markerCell("▖", barWidth, focused) + HalfBlockEdge(width-barWidth, bg, true) + "\n" + block
 	}
 	if bottomEdge {
-		block = block + "\n" + filler + HalfBlockEdge(width-barWidth, bg, false)
+		block = block + "\n" + markerCell("▘", barWidth, focused) + HalfBlockEdge(width-barWidth, bg, false)
 	}
 	return block
 }
@@ -454,16 +561,14 @@ func surfaceFill(bg, fg, barColor color.Color, barWidth, paddingCols int, conten
 // this one function.
 func Card(role Role, header, body string, width int, focused bool) string {
 	bg, _, fg := colorsFor(role)
-	barColor := bg // blends into the fill — invisible — when unfocused.
 	if focused {
 		bg, fg = FocusSurfaceColors()
-		barColor = FocusColor()
 	}
 	content := paintOver(body, bg, fg)
 	if header != "" {
 		content = lipgloss.NewStyle().Bold(true).Background(bg).Foreground(fg).Render(header) + "\n" + content
 	}
-	return surfaceFill(bg, fg, barColor, cardBarWidth, CardPaddingCols, content, width, true, true)
+	return surfaceFill(bg, fg, focused, cardBarWidth, CardPaddingCols, content, width, true, true)
 }
 
 // --- bars (top bar / hints-status bar) ------------------------------------
@@ -657,8 +762,97 @@ func ComposerFrameSize() (cols, rows int) {
 	return composerBarWidth + 2*composerPaddingCols, 2 * composerPaddingRows
 }
 
+// composerTintAmount is how far the composer's OWN unfocused fill blends
+// from TerminalBackground() toward the block hue — DELIBERATELY weaker
+// than cardTintAmount and computed separately (not SurfaceColors(), which
+// a grid cell/sidebar row/panel frame also read and needs the stronger
+// card-level tint to be visible as "a surface" in its own right): the
+// composer must stay within [minComposerSurfaceDelta,
+// maxComposerSurfaceDelta] even BEFORE the focus nudge below, while a
+// card's tint only has a floor (SurfaceDeltaPairs), never a ceiling.
+const composerTintAmount = 0.11
+
+// ComposerColors returns the composer's UNFOCUSED fill: TerminalBackground()
+// blended composerTintAmount toward the block hue, with a contrast-safe
+// foreground (surfaceText) — see the package doc on colorsFor for why
+// this derives from the REAL/guessed terminal background rather than a
+// fixed hex pair.
+func ComposerColors() (bg, fg color.Color) {
+	bg = blend(TerminalBackground(), roleHue(RoleBlock), composerTintAmount)
+	return bg, surfaceText(bg)
+}
+
+// chipTintAmount is how far an attachment chip's fill blends from
+// ComposerColors()' own background toward the block hue — deliberately
+// STRONGER than composerTintAmount so a chip clears minChipSurfaceDelta
+// against the composer surface it sits on (not just against
+// TerminalBackground(), which ComposerColors already separately clears):
+// founder 2026-09-25 (r10 coordinator review, verbatim): "Chips are there
+// ... but too subtle to notice (low contrast vs the composer edge/tint).
+// Make them clearly visible: chip surface a distinct step from the
+// composer surface".
+const chipTintAmount = 0.25
+
+// minChipSurfaceDelta is the minimum contrast ratio a chip's fill must
+// have against ComposerColors()' background — the composer-specific
+// analogue of minSurfaceDelta (a card's floor against
+// TerminalBackground()), checked by ChipDeltaPair/TestChipDistinctFromComposer.
+const minChipSurfaceDelta = 1.15
+
+// ChipColors returns an attachment chip's UNFOCUSED fill: ComposerColors'
+// own background blended chipTintAmount further toward the block hue,
+// with a contrast-safe foreground (surfaceText) — label text and the "×"
+// close glyph both read this pair, so both clear bodyTextMinRatio
+// (verified by ContrastPairs' chip entries).
+func ChipColors() (bg, fg color.Color) {
+	composerBG, _ := ComposerColors()
+	bg = blend(composerBG, roleHue(RoleBlock), chipTintAmount)
+	return bg, surfaceText(bg)
+}
+
+// ChipCloseColor returns the colour a chip's "×" close glyph reads in —
+// "muted, but still >= 4.5:1" (founder 2026-09-25, r10 coordinator
+// review): MutedColor() itself whenever it clears bodyTextMinRatio
+// against bg, otherwise the SAME full-contrast colour the chip's own
+// label text uses (surfaceText(bg)) — MutedColor() is a fixed pair picked
+// for the ORIGINAL (weaker) surface tints; a stronger chip fill can push
+// it under 4.5:1 for a given real terminal background, and this
+// guarantees compliance either way rather than assuming it always holds.
+func ChipCloseColor(bg color.Color) color.Color {
+	muted := MutedColor()
+	if Contrast(muted, bg) >= bodyTextMinRatio {
+		return muted
+	}
+	return surfaceText(bg)
+}
+
+// ChipDeltaPair names the attachment-chip fill and the minimum contrast
+// ratio it must have against ComposerColors()' background — for the
+// CURRENT Dark variant — the source of truth
+// TestChipDistinctFromComposer checks, mirroring SurfaceDeltaPairs' own
+// card-vs-terminal floor but for chip-vs-composer.
+type ChipDeltaPair struct {
+	Name         string
+	ComposerBG   color.Color
+	Surface      color.Color
+	MinimumRatio float64
+}
+
+// ChipDeltaPairs returns the one chip-vs-composer delta pair (unfocused
+// chip fill vs the unfocused composer background it sits on — a focused
+// chip uses FocusSurfaceColors(), already the maximum-contrast accent
+// pair and not a "blend toward invisible" risk the way the unfocused chip
+// is).
+func ChipDeltaPairs() []ChipDeltaPair {
+	composerBG, _ := ComposerColors()
+	chipBG, _ := ChipColors()
+	return []ChipDeltaPair{
+		{Name: "chip fill vs composer background", ComposerBG: composerBG, Surface: chipBG, MinimumRatio: minChipSurfaceDelta},
+	}
+}
+
 // composerFocusTint is the mixing weight ComposerFocusColors blends
-// FocusColor() into the composer's unfocused surface by — a "slightly
+// FocusColor() into the composer's unfocused fill by — a "slightly
 // stronger tint", not the full bright FocusColor() fill Card/
 // FocusSurfaceColors uses. Founder correction, twice over: first (r9)
 // "a SUBTLE filled area (a tint one step off the terminal background,
@@ -666,25 +860,23 @@ func ComposerFrameSize() (cols, rows int) {
 // colour + slightly stronger tint (NOT a full bright fill)"; then,
 // verbatim, more precisely: "the background of composer should just
 // slightly differ from overall/chat background ... Focus is shown by the
-// thin left accent bar (and at most a MARGINALLY stronger tint)". 0.04
+// thin left accent bar (and at most a MARGINALLY stronger tint)". 0.03
 // keeps the FOCUSED fill's own delta against TerminalBackground() inside
-// [minComposerSurfaceDelta, maxComposerSurfaceDelta] (~1.26:1 dark,
-// ~1.28:1 light) — barely past the UNFOCUSED fill's own ~1.18/1.20:1,
-// never the earlier 0.22 blend's ~1.8:1 "bright slab". A Card
-// intentionally goes full FocusSurfaceColors on focus (there's no better
-// cue: an entire message either has focus or doesn't), but the composer
-// already reads as focused via its left accent bar and the cursor inside
-// it, so its own fill only needs the smallest nudge toward the accent,
-// not become it.
-const composerFocusTint = 0.04
+// [minComposerSurfaceDelta, maxComposerSurfaceDelta] — barely past the
+// UNFOCUSED fill's own delta, never a "bright slab". A Card intentionally
+// goes full FocusSurfaceColors on focus (there's no better cue: an entire
+// message either has focus or doesn't), but the composer already reads as
+// focused via its left accent bar and the cursor inside it, so its own
+// fill only needs the smallest nudge toward the accent, not become it.
+const composerFocusTint = 0.03
 
-// ComposerFocusColors returns the composer's FOCUSED fill: its own
-// unfocused SurfaceColors() background blended composerFocusTint of the
-// way toward FocusColor() (foreground unchanged — the blend is subtle
-// enough that SurfaceColors' foreground still meets bodyTextMinRatio
-// against it; verified by TestContrastMeetsWCAG's composer pairs).
+// ComposerFocusColors returns the composer's FOCUSED fill: ComposerColors'
+// own unfocused background blended composerFocusTint of the way toward
+// FocusColor() (foreground unchanged — the blend is subtle enough that
+// ComposerColors' foreground still meets bodyTextMinRatio against it;
+// verified by TestContrastMeetsWCAG's composer pairs).
 func ComposerFocusColors() (bg, fg color.Color) {
-	surfaceBG, surfaceFG := SurfaceColors()
+	surfaceBG, surfaceFG := ComposerColors()
 	return blend(surfaceBG, FocusColor(), composerFocusTint), surfaceFG
 }
 
@@ -716,13 +908,11 @@ func ComposerFrameNoTopEdge(width int, content string, focused bool) string {
 }
 
 func composerFrame(width int, content string, focused, topEdge bool) string {
-	bg, fg := SurfaceColors()
-	barColor := bg
+	bg, fg := ComposerColors()
 	if focused {
 		bg, fg = ComposerFocusColors()
-		barColor = FocusColor()
 	}
-	return surfaceFill(bg, fg, barColor, composerBarWidth, composerPaddingCols, paintOver(content, bg, fg), width, topEdge, true)
+	return surfaceFill(bg, fg, focused, composerBarWidth, composerPaddingCols, paintOver(content, bg, fg), width, topEdge, true)
 }
 
 // --- panel / sidebar rows ------------------------------------------------
@@ -747,43 +937,40 @@ func PanelHeader(title string) string {
 	return lipgloss.NewStyle().Bold(true).Render(title)
 }
 
-// panelDividerWidth is the single vertical divider PanelFrame draws
-// between the transcript and the side panel — founder 2026-09-25: "side
-// panel may keep a frame line only where it separates the panel from the
-// transcript (a single vertical divider is fine) — no boxes around
-// boxes." One column, no border on the other three sides, no padding (a
-// panel's own content, e.g. tui/sidebar's header line, manages its own
-// spacing).
-const panelDividerWidth = 1
+// panelGapWidth is the plain gap PanelFrame now leaves between the
+// transcript and the side panel — founder 2026-09-25, latest ruling
+// (superseding the earlier "│" divider): "Let's remove border between
+// chat and side panels - margin is enough. Replace the '│' divider with a
+// gap: 2 columns of plain terminal background (no bg SGR, no glyph)
+// between the transcript column and the side panel; the side panel is
+// its own surface (panel tint derived from the real terminal background,
+// like cards), so the gap reads as the separation." One of the two
+// columns doubles as the panel's own focus MARKER column (see
+// markerCell/surfaceFill's shared doc) — reserved blank either way, so
+// focusing the panel never shifts its width.
+const panelGapWidth = 2
 
 // PanelFrameSize returns how many extra columns/rows PanelFrame adds
 // around its content, so a caller (chatshell's panel sizing) can size the
 // panel's own content and reserve the right amount of screen space —
 // mirroring ComposerFrameSize. Rows is always 0.
-func PanelFrameSize() (cols, rows int) { return panelDividerWidth, 0 }
+func PanelFrameSize() (cols, rows int) { return panelGapWidth, 0 }
 
-// PanelFrame draws the single divider between the transcript and a side
-// panel's (the default sidebar, or a product SidePanel) own content:
-// BorderColor(focused) — the same accent a focused card/composer uses —
-// so the side panel reads as "this has focus" consistently with every
-// other zone (founder 2026-09-25: "Same for ... side panel"). Founder
-// correction (same day, after seeing it rendered): "exactly ONE separator
-// column ... a single thin vertical line glyph, in the theme's muted
-// border colour ... no background fill, no stripes, no double lines."
-// PanelFrame draws exactly that — a foreground-only "│" glyph, one column,
-// no background of its own — never addLeftBar's filled-bg accent column
-// (right for a card/composer's focus accent, wrong here: a background-
-// filled divider is what read as a "striped grey band" against the
-// panel's own row backgrounds). The panel's own content (e.g. tui/
-// sidebar's own header line, or a product SidePanel's own tab strip)
-// supplies whatever header/label it wants and its OWN row backgrounds;
-// PanelFrame only supplies the divider and the
-// panel's background fill.
+// PanelFrame draws the gap between the transcript and a side panel's (the
+// default sidebar, or a product SidePanel) own content: panelGapWidth
+// columns, the rightmost reserved for the SAME focus marker idiom Card/
+// ComposerFrame use (a plain "▌" in FocusColor() when the panel has
+// focus, blank otherwise — no bar, no divider glyph, no background of
+// its own — see markerCell's own doc). The panel's own content (e.g.
+// tui/sidebar's own header line, or a product SidePanel's own tab strip)
+// supplies its own surface fill/row backgrounds and whatever header/label
+// it wants; PanelFrame only supplies the gap and the marker.
 func PanelFrame(width int, content string, focused bool) string {
-	divider := lipgloss.NewStyle().Foreground(BorderColor(focused)).Render("│")
+	blank := strings.Repeat(" ", panelGapWidth-1)
+	marker := markerCell("▌", 1, focused)
 	lines := strings.Split(content, "\n")
 	for i, line := range lines {
-		lines[i] = divider + line
+		lines[i] = blank + marker + line
 	}
 	return strings.Join(lines, "\n")
 }
@@ -870,7 +1057,7 @@ func ContrastPairs() []ContrastPair {
 		ContrastPair{Name: "focus border vs bar background", FG: FocusColor(), BG: barBG, MinimumRatio: nonTextMinRatio},
 	)
 
-	composerBG, composerFG := SurfaceColors()
+	composerBG, composerFG := ComposerColors()
 	focusComposerBG, focusComposerFG := ComposerFocusColors()
 	pairs = append(pairs,
 		ContrastPair{Name: "composer typed text (unfocused)", FG: composerFG, BG: composerBG, MinimumRatio: bodyTextMinRatio},
@@ -878,6 +1065,12 @@ func ContrastPairs() []ContrastPair {
 		ContrastPair{Name: "composer placeholder (unfocused)", FG: MutedColor(), BG: composerBG, MinimumRatio: placeholderMinRatio},
 		ContrastPair{Name: "composer placeholder (focused)", FG: MutedColor(), BG: focusComposerBG, MinimumRatio: placeholderMinRatio},
 		ContrastPair{Name: "focus bar vs composer fill (focused)", FG: FocusColor(), BG: focusComposerBG, MinimumRatio: nonTextMinRatio},
+	)
+
+	chipBG, chipFG := ChipColors()
+	pairs = append(pairs,
+		ContrastPair{Name: "chip label text", FG: chipFG, BG: chipBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "chip close glyph (muted) on chip fill", FG: ChipCloseColor(chipBG), BG: chipBG, MinimumRatio: bodyTextMinRatio},
 	)
 
 	return pairs
@@ -934,7 +1127,7 @@ func SurfaceDeltaPairs() []SurfaceDeltaPair {
 		bg, _, _ := colorsFor(role)
 		pairs = append(pairs, SurfaceDeltaPair{Name: string(role) + " card fill vs terminal background", Surface: bg, MinimumRatio: minSurfaceDelta})
 	}
-	composerBG, _ := SurfaceColors()
+	composerBG, _ := ComposerColors()
 	focusComposerBG, _ := ComposerFocusColors()
 	pairs = append(pairs,
 		SurfaceDeltaPair{Name: "composer fill (unfocused) vs terminal background", Surface: composerBG, MinimumRatio: minComposerSurfaceDelta, MaximumRatio: maxComposerSurfaceDelta},

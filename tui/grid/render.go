@@ -34,7 +34,8 @@ func rowStyle(highlighted, focused bool) lipgloss.Style {
 		bg, fg := theme.FocusSurfaceColors()
 		return lipgloss.NewStyle().Bold(true).Foreground(fg).Background(bg)
 	}
-	return lipgloss.NewStyle().Bold(true).Foreground(surfaceFG).Background(theme.MutedColor())
+	mutedBG := theme.MutedColor()
+	return lipgloss.NewStyle().Bold(true).Foreground(theme.ContrastText(mutedBG)).Background(mutedBG)
 }
 
 // View implements transcript.Block: a bordered card (title + view switcher,

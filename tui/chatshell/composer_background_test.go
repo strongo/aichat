@@ -89,7 +89,7 @@ func TestComposerPaintsExactlyOneBackground(t *testing.T) {
 					bg, _ := theme.ComposerFocusColors()
 					wantBG = bg
 				} else {
-					bg, _ := theme.SurfaceColors()
+					bg, _ := theme.ComposerColors()
 					wantBG = bg
 				}
 				m.input.SetStyles(composerTextAreaStyles(focused))

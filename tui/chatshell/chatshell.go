@@ -1026,7 +1026,19 @@ func (m *Model) updatePanel(msg tea.Msg) tea.Cmd {
 
 // --- tea.Model -----------------------------------------------------------
 
-func (m *Model) Init() tea.Cmd { return textarea.Blink }
+// Init starts the composer's cursor blink and asks the terminal for its
+// ACTUAL background colour (OSC 11, via bubbletea's own
+// tea.RequestBackgroundColor()/tea.BackgroundColorMsg) — founder
+// 2026-09-25 (r10 coordinator review, verbatim): "derive surface tints
+// from the ACTUAL terminal background ... Fallback to the current
+// defaults when the terminal doesn't answer. Chatshell applies the
+// message; products do nothing." See Update's tea.BackgroundColorMsg case
+// for where the answer, if any, gets applied (theme.SetTerminalBackground)
+// — a terminal that never answers simply leaves theme's own guessed
+// default in effect, exactly as before this feature existed.
+func (m *Model) Init() tea.Cmd {
+	return tea.Batch(textarea.Blink, tea.RequestBackgroundColor)
+}
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// A WindowSizeMsg always resizes the shell, even with an overlay open
@@ -1054,6 +1066,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case tea.BackgroundColorMsg:
+		// The terminal answered Init's tea.RequestBackgroundColor() (OSC
+		// 11) — apply it so every card/composer surface tint derives from
+		// the REAL background instead of theme's guessed default. See
+		// Init's own doc; a product does nothing further.
+		theme.SetTerminalBackground(msg.Color)
+		return m, nil
+
 	case tui.AddToSidebarMsg:
 		m.PinToSidebar(msg.Ref)
 		return m, nil
@@ -1920,18 +1940,25 @@ func (m *Model) View() tea.View {
 	if menu != "" {
 		chatParts = append(chatParts, menu)
 	}
+	// One blank row between the last transcript card and whatever comes
+	// next (founder 2026-09-25 margins ruling), collapsing under
+	// theme.MarginCollapseRows terminal rows -- historyHeight() reserves
+	// the matching row(s), so this never over- or under-fills the screen.
+	// Placed BEFORE the chip row (not between chips and the composer): a
+	// chip strip is logically part of the composer -- founder, r10,
+	// verbatim, on seeing a blank row land there instead: "it should be
+	// part of the composer. There is unexpected empty line between
+	// border/chips line and the text line" — the composer/chips block
+	// must sit flush together, whatever margin exists goes above ALL of
+	// it.
+	for range theme.ContentMargins(m.height) {
+		chatParts = append(chatParts, "")
+	}
 	if chips := m.chipsView(m.chatWidth()); chips != "" {
 		// Chips render above the input, closest to the composer -- after
 		// the slash-command menu (which sits directly above the input only
 		// while no chips are focused-adjacent) and before it.
 		chatParts = append(chatParts, chips)
-	}
-	// One blank row between the last transcript card and the composer
-	// (founder 2026-09-25 margins ruling), collapsing under
-	// theme.MarginCollapseRows terminal rows -- historyHeight() reserves
-	// the matching row(s), so this never over- or under-fills the screen.
-	for range theme.ContentMargins(m.height) {
-		chatParts = append(chatParts, "")
 	}
 	chatParts = append(chatParts, composer)
 	chat := lipgloss.JoinVertical(lipgloss.Left, chatParts...)

@@ -1042,7 +1042,7 @@ func TestChipsTopYAccountsForMultiLineTopBarAndMenu(t *testing.T) {
 	m.SetChips(threeChips())
 
 	withoutMenu := m.chipsTopY()
-	wantWithoutMenu := 2 /* two top-bar lines */ + theme.ContentMargins(m.height) /* top-bar/content margin row */ + m.historyHeight()
+	wantWithoutMenu := 2 /* two top-bar lines */ + 2*theme.ContentMargins(m.height) /* top-bar/content margin row + last-card/composer margin row, both now above the chip row */ + m.historyHeight()
 	if withoutMenu != wantWithoutMenu {
 		t.Fatalf("chipsTopY() = %d, want %d", withoutMenu, wantWithoutMenu)
 	}

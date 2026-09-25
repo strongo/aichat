@@ -287,6 +287,7 @@ func (m *Model) cycleChipFocus(forward bool) {
 type chipCell struct {
 	index int
 	text  string
+	label string // the (possibly truncated) label alone, no leading/trailing padding or close glyph -- lets chipsView style the label and the close glyph differently (founder, r10: the "×" reads "muted", the label text doesn't).
 	x     int
 }
 
@@ -330,6 +331,7 @@ func (m *Model) chipRows(width int) [][]chipCell {
 		rows[len(rows)-1] = append(rows[len(rows)-1], chipCell{
 			index: i,
 			text:  text,
+			label: label,
 			x:     used + ansi.StringWidth(label) + 2,
 		})
 		used += w
@@ -344,22 +346,29 @@ func (m *Model) chipsHeight(width int) int {
 	return len(m.chipRows(width))
 }
 
-// chipStyle/chipFocusedStyle render a chip pill as a FULL-HEIGHT solid
-// cell: theme.SurfaceColors() normal (the SAME surface the composer's own
-// unfocused fill uses, so an unselected chip reads as part of the same
-// surface family), theme.FocusSurfaceColors()-highlighted when focused
-// (Tab-cycled or about to be removed) — the SAME accent every other
-// focused/selected element uses (founder 2026-09-25). Founder, r9: "chip
-// cells are full-height cells with the chip background ... text >=
-// 4.5:1" — MutedColor()-on-SurfaceColors() and FocusSurfaceColors' own
-// pair are both already verified at bodyTextMinRatio by
-// theme.ContrastPairs, so this reuses existing, already-checked colours
-// rather than inventing a new "chip surface". Functions, not package
-// vars: theme.Dark can change at runtime (theme.SetDark), and a memoised
-// colour would keep rendering the stale variant forever after.
-func chipStyle() lipgloss.Style {
-	bg, _ := theme.SurfaceColors()
-	return lipgloss.NewStyle().Background(bg).Foreground(theme.MutedColor())
+// chipLabelStyle/chipCloseStyle/chipFocusedStyle render a chip pill as a
+// FULL-HEIGHT solid cell: theme.ChipColors() normal (a DISTINCT step
+// stronger than the composer surface it sits on, checked by
+// theme.ChipDeltaPairs/TestChipDistinctFromComposer — founder 2026-09-25,
+// r10 coordinator review, verbatim: "Chips are there ... but too subtle
+// to notice ... Make them clearly visible: chip surface a distinct step
+// from the composer surface"), theme.FocusSurfaceColors()-highlighted
+// when focused (Tab-cycled or about to be removed) — the SAME accent
+// every other focused/selected element uses. The label reads
+// theme.ChipColors()' own contrast-safe foreground; the "×" close glyph
+// reads theme.MutedColor() instead — "muted, but still >= 4.5:1"
+// (theme.ContrastPairs' own "chip close glyph" entry) — so it reads as a
+// secondary affordance without becoming unreadable. Functions, not
+// package vars: theme.Dark/the real terminal background can change at
+// runtime, and a memoised colour would keep rendering the stale variant
+// forever after.
+func chipLabelStyle() lipgloss.Style {
+	bg, fg := theme.ChipColors()
+	return lipgloss.NewStyle().Background(bg).Foreground(fg)
+}
+func chipCloseStyle() lipgloss.Style {
+	bg, _ := theme.ChipColors()
+	return lipgloss.NewStyle().Background(bg).Foreground(theme.ChipCloseColor(bg))
 }
 func chipFocusedStyle() lipgloss.Style {
 	bg, fg := theme.FocusSurfaceColors()
@@ -369,8 +378,9 @@ func chipFocusedStyle() lipgloss.Style {
 // chipEdgeFiller returns the single-cell separator/fill glyph chipsView
 // uses between pills and to pad a row's remaining width: theme.
 // HalfBlockEdge's own "▄" (foreground = the composer's unfocused surface
-// colour, background = theme.TerminalBackground()) when half-block edges
-// are active — founder, r9, verbatim: "Have a 1 char half height
+// colour, NO background set — r10: the real terminal background shows
+// through unpainted, see theme.HalfBlockEdge's own doc) when half-block
+// edges are active — founder, r9, verbatim: "Have a 1 char half height
 // separator between attachments" — or a plain space in fallback mode (no
 // half-block glyphs anywhere in that mode, matching Card/ComposerFrame's
 // own fallback).
@@ -378,20 +388,37 @@ func chipEdgeFiller(width int) string {
 	if !theme.HalfBlockEdgesActive() {
 		return strings.Repeat(" ", max(0, width))
 	}
-	composerBG, _ := theme.SurfaceColors()
+	composerBG, _ := theme.ComposerColors()
 	return theme.HalfBlockEdge(width, composerBG, true)
 }
 
+// renderChipCell renders one chip pill: focused (Tab-cycled or about to
+// be removed) gets ONE style across the whole cell (chipFocusedStyle, the
+// single accent colour); unfocused splits the label (chipLabelStyle) from
+// the close glyph (chipCloseStyle, muted) so the "×" reads as a secondary
+// affordance without losing its own >= 4.5:1 floor (see
+// chipLabelStyle's own doc).
+func renderChipCell(cell chipCell, focused bool) string {
+	if focused {
+		return chipFocusedStyle().Render(cell.text)
+	}
+	// cell.text is " " + label + " " + chipCloseGlyph + " " -- split at
+	// the boundary chipRows itself already computed (cell.label's own
+	// width), so this never re-derives it by re-scanning for the glyph.
+	labelPart := " " + cell.label + " "
+	closePart := strings.TrimPrefix(cell.text, labelPart)
+	return chipLabelStyle().Render(labelPart) + chipCloseStyle().Render(closePart)
+}
+
 // chipsView renders the current chips as one or more wrapped rows: pills
-// full-height solid cells (chipStyle/chipFocusedStyle), separated by
-// EXACTLY one half-block filler cell (chipEdgeFiller(1)) rather than a
-// blank space, with the row's remaining width past the last pill also
-// filled the same way -- so each row reads as a strip of tabs rising off
-// a half-block surface, the row immediately above the composer
-// effectively BEING its top edge (see chatshell.go's View(), which skips
-// ComposerFrame's own top edge whenever chips are present in half-block
-// mode: theme.ComposerFrameNoTopEdge). Returns "" when there are no
-// chips.
+// full-height solid cells (renderChipCell), separated by EXACTLY one
+// half-block filler cell (chipEdgeFiller(1)) rather than a blank space,
+// with the row's remaining width past the last pill also filled the same
+// way -- so each row reads as a strip of tabs rising off a half-block
+// surface, the row immediately above the composer effectively BEING its
+// top edge (see chatshell.go's View(), which skips ComposerFrame's own
+// top edge whenever chips are present in half-block mode:
+// theme.ComposerFrameNoTopEdge). Returns "" when there are no chips.
 func (m *Model) chipsView(width int) string {
 	rows := m.chipRows(width)
 	if len(rows) == 0 {
@@ -403,11 +430,7 @@ func (m *Model) chipsView(width int) string {
 		parts := make([]string, 0, len(row))
 		used := 0
 		for i, cell := range row {
-			style := chipStyle()
-			if cell.index == m.chipFocus {
-				style = chipFocusedStyle()
-			}
-			parts = append(parts, style.Render(cell.text))
+			parts = append(parts, renderChipCell(cell, cell.index == m.chipFocus))
 			used += ansi.StringWidth(cell.text)
 			if i < len(row)-1 {
 				used++ // the separator cell chipRows already reserved.
@@ -425,14 +448,18 @@ func (m *Model) chipsView(width int) string {
 // chipsTopY returns the Y coordinate (chatshell's own top-left-origin
 // coordinate frame, matching tea.Mouse's) of the first chip row, so
 // handleMouseClick can translate a click's Y into a row index: the
-// rendered top bar's height, plus the top-bar/content margin row (see
-// theme.ContentMargins), plus the transcript's fixed viewport height
+// rendered top bar's height, plus the transcript's fixed viewport height
 // (historyHeight), plus the slash-command menu's height when it's
-// currently showing -- exactly the content View() stacks above the chip
-// row(s), in order (see historyHeight's own doc for why each of these is
-// measured rather than assumed).
+// currently showing, plus TWO theme.ContentMargins(m.height) rows -- the
+// top-bar/content margin (above history) AND the last-card/composer
+// margin (above the chip row, which sits directly against the composer:
+// founder, r10, verbatim, on the margin instead landing BETWEEN the chip
+// row and the composer, "it should be part of the composer") -- exactly
+// the content View() stacks above the chip row(s), in order (see
+// historyHeight's own doc for why each of these is measured rather than
+// assumed).
 func (m *Model) chipsTopY() int {
-	return m.topBarHeight() + theme.ContentMargins(m.height) + m.historyHeight() + m.menuHeight()
+	return m.topBarHeight() + 2*theme.ContentMargins(m.height) + m.historyHeight() + m.menuHeight()
 }
 
 // handleMouseClick handles a tea.MouseClickMsg: a click on a chip's "×"

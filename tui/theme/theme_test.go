@@ -1,6 +1,8 @@
 package theme
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -195,7 +197,7 @@ func TestComposerFrameSize(t *testing.T) {
 func TestComposerFrameSurvivesNestedResetInContent(t *testing.T) {
 	nested := "\x1b[37m> \x1b[m\x1b[7;37mA\x1b[msk anything..."
 	out := ComposerFrame(40, nested, false)
-	bg, fg := SurfaceColors()
+	bg, fg := ComposerColors()
 	want := fillSGR(bg, fg)
 	// The nested fragment embeds two of its own bare resets ("\x1b[m")
 	// before its final visible text ("sk anything..."). Before paintOver,
@@ -233,29 +235,45 @@ func TestPanelFrameFocusedVsUnfocused(t *testing.T) {
 
 func TestPanelFrameSize(t *testing.T) {
 	cols, rows := PanelFrameSize()
-	if cols != 1 || rows != 0 {
-		t.Fatalf("PanelFrameSize() = (%d, %d), want (1, 0)", cols, rows)
+	if cols != 2 || rows != 0 {
+		t.Fatalf("PanelFrameSize() = (%d, %d), want (2, 0)", cols, rows)
 	}
 }
 
-// TestPanelFrameDividerIsASingleUnfilledGlyph covers a real regression:
-// PanelFrame used to reuse addLeftBar (a BACKGROUND-filled accent column,
-// right for a card/composer's focus accent) for the transcript/panel
-// divider too, which -- painted over the panel's own already-coloured row
-// backgrounds -- read as "a wide striped grey band", not a clean divider.
-// Founder correction: exactly one "│" glyph per line, coloured by
-// FOREGROUND only (BorderColor(focused)), no background SGR at all.
-func TestPanelFrameDividerIsASingleUnfilledGlyph(t *testing.T) {
-	for _, focused := range []bool{false, true} {
-		out := PanelFrame(30, "row one\nrow two", focused)
-		for i, line := range strings.Split(out, "\n") {
-			if got := strings.Count(ansi.Strip(line), "│"); got != 1 {
-				t.Fatalf("focused=%v line %d has %d '│' glyphs, want exactly 1: %q", focused, i, got, line)
-			}
-			if strings.Contains(line, "\x1b[4") { // any SGR background parameter (38..48 family starts with "4" for bg in both 256-colour "48;5;" and truecolor "48;2;")
-				t.Fatalf("focused=%v line %d carries a background SGR on the divider, want none: %q", focused, i, line)
-			}
+// TestPanelFrameIsAPlainGapWithAFocusMarker covers the r10 founder
+// ruling (superseding the earlier "│" divider): "Let's remove border
+// between chat and side panels - margin is enough. Replace the '│'
+// divider with a gap: 2 columns of plain terminal background (no bg SGR,
+// no glyph) ... Panel focus indication moves off the divider" onto the
+// SAME marker idiom Card/ComposerFrame use. Unfocused: two plain blank
+// columns, no glyph, no background SGR anywhere. Focused: one blank
+// column plus one "▌" marker column in FocusColor(), still no background
+// SGR — and the OUTER width is identical either way.
+func TestPanelFrameIsAPlainGapWithAFocusMarker(t *testing.T) {
+	unfocused := PanelFrame(30, "row one\nrow two", false)
+	focused := PanelFrame(30, "row one\nrow two", true)
+	for i, line := range strings.Split(unfocused, "\n") {
+		if strings.ContainsAny(line, "│▌▖▘") {
+			t.Fatalf("unfocused line %d has an unexpected glyph: %q", i, line)
 		}
+		if !strings.HasPrefix(line, "  ") {
+			t.Fatalf("unfocused line %d should start with a 2-column blank gap: %q", i, line)
+		}
+		assertNoBackgroundSGR(t, "unfocused panel gap", line[:2])
+	}
+	focusedLines := strings.Split(focused, "\n")
+	for i, line := range focusedLines {
+		if !strings.Contains(ansi.Strip(line), "▌") {
+			t.Fatalf("focused line %d missing the '▌' marker: %q", i, line)
+		}
+		marker := markerCell("▌", 1, true)
+		if !strings.HasPrefix(line, " "+marker) {
+			t.Fatalf("focused line %d should be one blank column then the marker: %q", i, line)
+		}
+		assertNoBackgroundSGR(t, "focused panel marker", marker)
+	}
+	if lipgloss.Width(strings.Split(unfocused, "\n")[0]) != lipgloss.Width(focusedLines[0]) {
+		t.Fatal("focusing the panel changed its rendered width")
 	}
 }
 
@@ -544,5 +562,249 @@ func TestHalfBlockEdgeNonPositiveWidth(t *testing.T) {
 	}
 	if got := HalfBlockEdge(-3, lipgloss.Color("#112233"), false); got != "" {
 		t.Fatalf("HalfBlockEdge(-3, ...) = %q, want empty", got)
+	}
+}
+
+// withTerminalBackground simulates a tea.BackgroundColorMsg having
+// arrived with hex (e.g. "#1e222b") — SetTerminalBackground plus restore.
+func withTerminalBackground(t *testing.T, hex string, fn func()) {
+	t.Helper()
+	prevReal, prevDark := realTerminalBackground, Dark
+	SetTerminalBackground(lipgloss.Color(hex))
+	t.Cleanup(func() { realTerminalBackground, Dark = prevReal, prevDark })
+	fn()
+}
+
+// TestSetTerminalBackgroundDerivesDarkFromLuminance covers
+// SetTerminalBackground's own Dark-derivation and TerminalBackground()'s
+// use of it once set.
+func TestSetTerminalBackgroundDerivesDarkFromLuminance(t *testing.T) {
+	withTerminalBackground(t, "#1e222b", func() {
+		if !Dark {
+			t.Fatal("expected Dark=true for a near-black background")
+		}
+		if got := TerminalBackground(); got != lipgloss.Color("#1e222b") {
+			t.Fatalf("TerminalBackground() = %#v, want the real reported background", got)
+		}
+	})
+	withTerminalBackground(t, "#fafafa", func() {
+		if Dark {
+			t.Fatal("expected Dark=false for a near-white background")
+		}
+	})
+	// nil clears it, reverting to the guessed default.
+	prev := realTerminalBackground
+	SetTerminalBackground(nil)
+	t.Cleanup(func() { realTerminalBackground = prev })
+	if realTerminalBackground != nil {
+		t.Fatal("SetTerminalBackground(nil) should clear realTerminalBackground")
+	}
+}
+
+// simulatedTerminalBackgrounds are the three real-world backgrounds the
+// founder's r10 review asked surfaces to be verified against: a common
+// dark default, a common light default, and an intentionally HUED one
+// (Solarized dark) that a fixed-hex-pair scheme would not have adapted to
+// at all.
+var simulatedTerminalBackgrounds = []string{"#1e222b", "#fafafa", "#002b36"}
+
+// TestSurfacesAdaptToRealTerminalBackground covers the r10 fix directly:
+// with a simulated tea.BackgroundColorMsg in effect, EVERY card role and
+// the composer (both focus states) must (a) actually use that real
+// background as their blend base — Contrast(surface, real) stays inside
+// the same bounds SurfaceDeltaPairs/ContrastPairs already enforce — and
+// (b) still meet bodyTextMinRatio for their own text. Run for a plain
+// dark, a plain light, and a HUED (Solarized) background.
+func TestSurfacesAdaptToRealTerminalBackground(t *testing.T) {
+	for _, hex := range simulatedTerminalBackgrounds {
+		withTerminalBackground(t, hex, func() {
+			for _, p := range SurfaceDeltaPairs() {
+				ratio := Contrast(p.Surface, TerminalBackground())
+				if ratio < p.MinimumRatio {
+					t.Errorf("[%s] %s: delta %.3f below minimum %.2f", hex, p.Name, ratio, p.MinimumRatio)
+				}
+				if p.MaximumRatio > 0 && ratio > p.MaximumRatio {
+					t.Errorf("[%s] %s: delta %.3f above maximum %.2f", hex, p.Name, ratio, p.MaximumRatio)
+				}
+			}
+			for _, p := range ContrastPairs() {
+				if ratio := Contrast(p.FG, p.BG); ratio < p.MinimumRatio {
+					t.Errorf("[%s] %s: contrast %.3f below minimum %.2f", hex, p.Name, ratio, p.MinimumRatio)
+				}
+			}
+		})
+	}
+}
+
+// TestHalfBlockEdgeRowsPaintNoBackground covers the r10 BLOCKING fix,
+// verbatim founder instruction: "Edge rows and any 'terminal background'
+// cells must NOT set a background at all (default bg, SGR 49) — only the
+// fg = surface colour on the ▄/▀ glyphs." Renders a Card and a
+// ComposerFrame with half-block edges active and asserts the FIRST and
+// LAST rendered lines (the edge rows) contain no background-setting SGR
+// component at all (no bare "48;" anywhere).
+func TestHalfBlockEdgeRowsPaintNoBackground(t *testing.T) {
+	withHalfBlockEdges(t, true, func() {
+		card := Card(RoleAssistant, "Assistant", "hello", 40, false)
+		cardLines := strings.Split(card, "\n")
+		assertNoBackgroundSGR(t, "card top edge", cardLines[0])
+		assertNoBackgroundSGR(t, "card bottom edge", cardLines[len(cardLines)-1])
+
+		composer := ComposerFrame(30, "type here", true)
+		composerLines := strings.Split(composer, "\n")
+		assertNoBackgroundSGR(t, "composer top edge", composerLines[0])
+		assertNoBackgroundSGR(t, "composer bottom edge", composerLines[len(composerLines)-1])
+	})
+}
+
+// assertNoBackgroundSGR fails if line contains any background-setting SGR
+// component ("48;..." 24-bit/256-colour, or a plain "4X"/"10X" standard
+// background code).
+func assertNoBackgroundSGR(t *testing.T, label, line string) {
+	t.Helper()
+	for _, seq := range regexp.MustCompile(`\x1b\[[0-9;]*m`).FindAllString(line, -1) {
+		body := strings.TrimSuffix(strings.TrimPrefix(seq, "\x1b["), "m")
+		parts := strings.Split(body, ";")
+		for i := 0; i < len(parts); i++ {
+			switch parts[i] {
+			case "38", "39":
+				// Foreground: "38;2;r;g;b" (24-bit) or "38;5;n" (256) --
+				// skip the whole component so its own numeric payload
+				// (which may coincidentally equal e.g. "43") is never
+				// misread as a standalone background code below.
+				if i+1 < len(parts) && parts[i+1] == "2" {
+					i += 4
+				} else if i+1 < len(parts) && parts[i+1] == "5" {
+					i += 2
+				}
+			case "48":
+				t.Fatalf("%s: unexpected background SGR %q in %q", label, seq, line)
+			case "40", "41", "42", "43", "44", "45", "46", "47",
+				"100", "101", "102", "103", "104", "105", "106", "107":
+				t.Fatalf("%s: unexpected background SGR %q in %q", label, seq, line)
+			}
+		}
+	}
+}
+
+// TestAccentBarSpansHalfBlockEdges covers the r10 coordinator correction:
+// "Accent bar must span the whole surface including the half-height
+// edges" — a FOCUSED card/composer's top/bottom edge rows must start with
+// barWidth columns rendered in FocusColor() (not the surface colour),
+// while an UNFOCUSED one's edge rows are uniform (the bar "blends in").
+// TestFocusMarkerSpansHalfBlockEdges covers the r10 coordinator's
+// SUPERSEDING correction (a narrow OUTSIDE marker, not an in-surface
+// accent bar): a FOCUSED card's top edge row starts with "▖" in
+// FocusColor(), its content rows with "▌" in FocusColor(), and its bottom
+// edge row with "▘" in FocusColor() — none of those marker cells carry
+// ANY background SGR (the terminal's own default shows through, since the
+// marker sits OUTSIDE the surface). An UNFOCUSED card's marker column is
+// blank (plain spaces) throughout, and the OUTER width is identical
+// either way (reserving the column, not shifting layout).
+func TestFocusMarkerSpansHalfBlockEdges(t *testing.T) {
+	withHalfBlockEdges(t, true, func() {
+		focused := Card(RoleAssistant, "Assistant", "hello world", 40, true)
+		unfocused := Card(RoleAssistant, "Assistant", "hello world", 40, false)
+		focusedLines := strings.Split(focused, "\n")
+		unfocusedLines := strings.Split(unfocused, "\n")
+		if len(focusedLines) != len(unfocusedLines) {
+			t.Fatalf("focused/unfocused line counts differ: %d vs %d", len(focusedLines), len(unfocusedLines))
+		}
+
+		topMarker := markerCell("▖", cardBarWidth, true)
+		if !strings.HasPrefix(focusedLines[0], topMarker) {
+			t.Fatalf("focused card's top edge should start with the '▖' marker %q, got %q", topMarker, focusedLines[0])
+		}
+		assertNoBackgroundSGR(t, "focused top marker", topMarker)
+
+		bottomMarker := markerCell("▘", cardBarWidth, true)
+		last := focusedLines[len(focusedLines)-1]
+		if !strings.HasPrefix(last, bottomMarker) {
+			t.Fatalf("focused card's bottom edge should start with the '▘' marker %q, got %q", bottomMarker, last)
+		}
+		assertNoBackgroundSGR(t, "focused bottom marker", bottomMarker)
+
+		contentMarker := markerCell("▌", cardBarWidth, true)
+		// lines[1] is the header row -- a content row. Only the MARKER
+		// cell itself (not the rest of the line, which legitimately
+		// carries the card's own FocusSurfaceColors() background) must be
+		// background-free.
+		if !strings.HasPrefix(focusedLines[1], contentMarker) {
+			t.Fatalf("focused card's content row should start with the '▌' marker %q, got %q", contentMarker, focusedLines[1])
+		}
+		assertNoBackgroundSGR(t, "focused content marker", contentMarker)
+
+		if strings.HasPrefix(unfocusedLines[0], topMarker) || strings.Contains(unfocusedLines[0], "▖") {
+			t.Fatalf("unfocused card's top edge should NOT show the focus marker: %q", unfocusedLines[0])
+		}
+		if lipgloss.Width(focusedLines[0]) != lipgloss.Width(unfocusedLines[0]) {
+			t.Fatalf("focusing changed the top edge's rendered width: focused=%d unfocused=%d", lipgloss.Width(focusedLines[0]), lipgloss.Width(unfocusedLines[0]))
+		}
+	})
+}
+
+// TestFocusMarkerFallbackCoversFullPaddingRows covers the fallback case:
+// HalfBlockEdges=false still marks every row of a focused surface
+// (including the full blank padding rows) with "▌", per founder,
+// verbatim: "Fallback HalfBlockEdges=false: marker '▌' on all rows of the
+// surface including the full padding rows."
+func TestFocusMarkerFallbackCoversFullPaddingRows(t *testing.T) {
+	withHalfBlockEdges(t, false, func() {
+		out := Card(RoleAssistant, "Assistant", "hello", 40, true)
+		lines := strings.Split(out, "\n")
+		if len(lines) < 3 {
+			t.Fatalf("expected padding rows in fallback mode: %q", out)
+		}
+		for i, line := range lines {
+			if !strings.Contains(line, "▌") {
+				t.Fatalf("fallback line %d missing the '▌' marker: %q", i, line)
+			}
+		}
+	})
+}
+
+// TestChipDistinctFromComposer covers the r10 coordinator correction:
+// "chip surface a distinct step from the composer surface" — checked
+// against BOTH the guessed default AND all three simulatedTerminalBackgrounds,
+// same as the card-vs-terminal floor.
+func TestChipDistinctFromComposer(t *testing.T) {
+	check := func(t *testing.T, label string) {
+		t.Helper()
+		for _, p := range ChipDeltaPairs() {
+			if ratio := Contrast(p.Surface, p.ComposerBG); ratio < p.MinimumRatio {
+				t.Errorf("[%s] %s: delta %.3f below minimum %.2f", label, p.Name, ratio, p.MinimumRatio)
+			}
+		}
+	}
+	for _, dark := range []bool{true, false} {
+		SetDark(dark)
+		check(t, fmt.Sprintf("dark=%v (guessed default)", dark))
+	}
+	for _, hex := range simulatedTerminalBackgrounds {
+		withTerminalBackground(t, hex, func() {
+			check(t, hex)
+		})
+	}
+}
+
+// TestBorderColorBothBranches covers BorderColor directly -- kept as
+// public API (a product may still want "the one border colour rule")
+// even though no aichat component itself calls it anymore after r10's
+// gap/marker redesigns.
+func TestBorderColorBothBranches(t *testing.T) {
+	if got := BorderColor(true); got != FocusColor() {
+		t.Fatalf("BorderColor(true) = %#v, want FocusColor()", got)
+	}
+	if got := BorderColor(false); got != MutedColor() {
+		t.Fatalf("BorderColor(false) = %#v, want MutedColor()", got)
+	}
+}
+
+// TestContrastTextMatchesSurfaceText covers ContrastText directly (its
+// own package's coverage doesn't see tui/grid's cross-package use of it).
+func TestContrastTextMatchesSurfaceText(t *testing.T) {
+	bg := lipgloss.Color("#333333")
+	if got, want := ContrastText(bg), surfaceText(bg); got != want {
+		t.Fatalf("ContrastText(%v) = %#v, want surfaceText's own %#v", bg, got, want)
 	}
 }
