@@ -1489,19 +1489,16 @@ func (m *Model) historyHeight() int {
 	if m.busy {
 		busySpinnerLine = 1
 	}
-	// marginRows accounts for all THREE blank rows View() inserts when the
+	// marginRows accounts for the TWO blank rows View() inserts when the
 	// terminal is tall enough (theme.ContentMargins): one between the top
 	// bar and the content below it, one between the last transcript card
-	// and the composer, and (r12) one between the composer and the
-	// status bar -- but only when statusBarVisible() (there's nothing to
-	// separate the composer FROM when there's no status bar at all -- see
-	// View()'s own doc, and statusBarVisible's). All collapse to 0 below
-	// theme.MarginCollapseRows terminal rows, same as here.
-	marginCount := 2
-	if m.statusBarVisible() {
-		marginCount = 3
-	}
-	marginRows := marginCount * theme.ContentMargins(m.height)
+	// and the composer. r12 briefly added a third, between the composer
+	// and the status bar; r14 (founder, verbatim: "should have no
+	// vertical margins") removed it again -- the status bar now sits
+	// directly under the composer's own bottom edge, no blank row, no
+	// statusBarVisible() branch needed here any more. Both collapse to 0
+	// below theme.MarginCollapseRows terminal rows, same as here.
+	marginRows := 2 * theme.ContentMargins(m.height)
 	return max(1, m.height-m.topBarHeight()-m.menuHeight()-m.composerHeight()-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine-marginRows)
 }
 
@@ -2058,25 +2055,20 @@ func (m *Model) View() tea.View {
 	for range theme.ContentMargins(m.height) {
 		topParts = append(topParts, "")
 	}
-	// A THIRD blank row, same collapse rule, now separates the composer
-	// from the status bar too -- founder, r12, verbatim, seeing the
-	// rendered result in Warp: "status line should have top margin ...
-	// It should be last line on screen" (superseding the r9 "no blank row
-	// between the composer and the hints/status bar" rule -- see theme's
-	// own vertical-margins doc). The status bar itself is the LAST part
-	// joined below, with nothing after it, so it always lands on the
-	// terminal's own last row -- but ONLY when there is one: with nothing
-	// to show at all (statusBarVisible() false), neither this margin row
-	// NOR a blank status placeholder is appended, so the COMPOSER's own
-	// bottom edge becomes the terminal's last row instead (founder, r12,
-	// same round: "with no hints, the composer's bottom edge must be the
-	// last screen line (no trailing empty rows)").
+	// The status bar sits DIRECTLY under the composer's own bottom edge --
+	// NO blank row between them -- and is the LAST part joined below, with
+	// nothing after it, so it always lands on the terminal's own last row.
+	// Founder, r14, verbatim, superseding r12's "blank row above the
+	// status bar" ruling: "Status panel should be aligned with composer
+	// border, not composer text and should have no vertical margins."
+	// With nothing to show at all (statusBarVisible() false), no blank
+	// status placeholder is appended either, so the COMPOSER's own bottom
+	// edge becomes the terminal's last row instead (founder, r12, same
+	// round: "with no hints, the composer's bottom edge must be the last
+	// screen line (no trailing empty rows)").
 	parts := append([]string{}, topParts...)
 	parts = append(parts, body)
 	if m.statusBarVisible() {
-		for range theme.ContentMargins(m.height) {
-			parts = append(parts, "")
-		}
 		parts = append(parts, m.statusBarView())
 	}
 	content := lipgloss.JoinVertical(lipgloss.Left, parts...)

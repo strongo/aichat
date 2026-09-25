@@ -120,7 +120,7 @@ func TestStatusLineHasNoBackgroundAndHintsInsetPadding(t *testing.T) {
 	if containsBackgroundSGR(out) {
 		t.Fatalf("StatusLine painted a background SGR: %q", out)
 	}
-	left, _ := HintsInset()
+	left, _ := StatusInset()
 	if !strings.HasPrefix(ansi.Strip(out), strings.Repeat(" ", left)+"hello") {
 		t.Fatalf("StatusLine = %q, want to start with %d blank columns then the content", out, left)
 	}
@@ -329,7 +329,14 @@ func TestPanelFrameSize(t *testing.T) {
 // gap column before the surface (and, unfocused, the surface's own
 // marker column too, since it renders blank) stays plain -- confirmed by
 // checking the reserved marker COLUMN specifically, not the whole line.
-func TestPanelFrameIsAFullHeightSurfaceWithAFocusMarker(t *testing.T) {
+// TestPanelFrameIsAFullHeightSurfaceWithATintedFocus covers the r12 full-
+// height-card redesign AND its r13 supersession (founder, verbatim:
+// "Side panel should NOT have left accent border treatment. Can we just
+// slightly change background?"): NO marker glyph ("▌"/"▖"/"▘") anywhere
+// in a focused panel any more -- focus is PanelFocusColors() vs
+// PanelColors() instead (see TestPanelFocusSurfaceDeltaIsSubtle for the
+// delta itself).
+func TestPanelFrameIsAFullHeightSurfaceWithATintedFocus(t *testing.T) {
 	const height = 4 // taller than the 1 line of content supplied below.
 	unfocused := PanelFrame(30, height, "", "row one", false)
 	focused := PanelFrame(30, height, "", "row one", true)
@@ -357,20 +364,49 @@ func TestPanelFrameIsAFullHeightSurfaceWithAFocusMarker(t *testing.T) {
 		t.Fatalf("frame missing its own content: %q", unfocused)
 	}
 
-	focusedHasMarker := false
-	for _, line := range focusedLines {
-		if strings.Contains(ansi.Strip(line), "▌") || strings.Contains(ansi.Strip(line), "▖") || strings.Contains(ansi.Strip(line), "▘") {
-			focusedHasMarker = true
+	for _, glyph := range []string{"▌", "▖", "▘"} {
+		if strings.Contains(ansi.Strip(focused), glyph) {
+			t.Fatalf("focused panel frame contains marker glyph %q, want none (r13: no left accent border): %q", glyph, focused)
+		}
+		if strings.Contains(ansi.Strip(unfocused), glyph) {
+			t.Fatalf("unfocused panel frame contains marker glyph %q, want none: %q", glyph, unfocused)
 		}
 	}
-	if !focusedHasMarker {
-		t.Fatalf("focused panel frame missing its own marker glyph anywhere: %q", focused)
-	}
-	if unfocusedLines[0] == focusedLines[0] {
-		t.Fatal("focused first row identical to unfocused -- expected the marker to change it")
+	if unfocusedLines[1] == focusedLines[1] {
+		t.Fatal("focused content row identical to unfocused -- expected the surface tint to change it")
 	}
 	if lipgloss.Width(unfocusedLines[0]) != lipgloss.Width(focusedLines[0]) {
 		t.Fatal("focusing the panel changed its rendered width")
+	}
+}
+
+// TestPanelFocusSurfaceDeltaIsSubtle covers the r13 redesign directly
+// (founder, verbatim: "delta small but perceptible"): PanelFocusColors()'
+// own background against PanelColors()' must land within
+// [minPanelFocusDelta, maxPanelFocusDelta], and both pairs' own text must
+// still clear bodyTextMinRatio -- checked in both theme.Dark variants and
+// against every simulatedTerminalBackgrounds entry (a real terminal's
+// reported background can be anything).
+func TestPanelFocusSurfaceDeltaIsSubtle(t *testing.T) {
+	check := func(t *testing.T) {
+		t.Helper()
+		unfocusedBG, unfocusedFG := PanelColors()
+		focusedBG, focusedFG := PanelFocusColors()
+		if delta := Contrast(focusedBG, unfocusedBG); delta < minPanelFocusDelta || delta > maxPanelFocusDelta {
+			t.Errorf("panel focus/unfocus surface delta = %.3f, want within [%.2f, %.2f]", delta, minPanelFocusDelta, maxPanelFocusDelta)
+		}
+		if c := Contrast(unfocusedFG, unfocusedBG); c < bodyTextMinRatio {
+			t.Errorf("unfocused panel text contrast = %.2f, want >= %.2f", c, bodyTextMinRatio)
+		}
+		if c := Contrast(focusedFG, focusedBG); c < bodyTextMinRatio {
+			t.Errorf("focused panel text contrast = %.2f, want >= %.2f", c, bodyTextMinRatio)
+		}
+	}
+	for _, dark := range []bool{true, false} {
+		withDark(t, dark, func() { check(t) })
+	}
+	for _, hex := range simulatedTerminalBackgrounds {
+		withTerminalBackground(t, hex, func() { check(t) })
 	}
 }
 
@@ -598,6 +634,15 @@ func TestContentMarginsCollapsesBelowThreshold(t *testing.T) {
 	}
 }
 
+func TestPadRightNoopWhenAlreadyWideEnough(t *testing.T) {
+	if got := padRight("already wide", 5); got != "already wide" {
+		t.Fatalf("padRight with content already >= width = %q, want it unchanged", got)
+	}
+	if got := padRight("hi", 5); got != "hi   " {
+		t.Fatalf("padRight(\"hi\", 5) = %q, want %q", got, "hi   ")
+	}
+}
+
 func TestRenderHintsSplitsAnOverWideSegmentOnWordBoundaries(t *testing.T) {
 	// A single plain segment wider than the whole line must wrap onto
 	// multiple lines, breaking only between words -- never mid-word with
@@ -619,6 +664,57 @@ func TestRenderHintsSplitsAnOverWideSegmentOnWordBoundaries(t *testing.T) {
 // Card's first and last rendered lines must be "▄"/"▀" glyphs coloured
 // foreground=the card's own surface fill, background=TerminalBackground()
 // -- not a full blank padding row.
+// TestSurfaceRowsAllSpanTheSameColumns covers the r13 founder report,
+// verbatim: "It looks like ask anything line has narrower background
+// then top and bottom lines" -- confirmed on both the composer and
+// message cards, the content rows' surface fill ending ~4 columns (2x
+// CardPaddingCols/composerPaddingCols) before the ▄/▀ edge rows. Root
+// cause: surfaceFill's own lipgloss Style used Width(width-barWidth-
+// 2*paddingCols) THEN ALSO applied Padding(vPad, paddingCols) inside that
+// already-narrowed box -- lipgloss's Width counts padding INSIDE the
+// width it's given (verified directly against the library), so the
+// padding ate a second time into a box that had already excluded it,
+// silently shrinking every content row 2*paddingCols short of the edge
+// rows' own width-barWidth span. Checks EVERY row surfaceFill returns
+// (content rows including their own right padding, AND the ▄/▀ edge
+// rows when HalfBlockEdgesActive()) has the IDENTICAL rendered display
+// width, for Card (single-line and multi-line body), ComposerFrame
+// (empty, one line, multi-line), ComposerFrameNoTopEdge, and PanelFrame
+// -- both with and without half-block edges active, since the padding
+// double-subtraction bug applied to the FALLBACK (plain padding row)
+// mode identically.
+func TestSurfaceRowsAllSpanTheSameColumns(t *testing.T) {
+	assertUniformWidth := func(t *testing.T, label, out string) {
+		t.Helper()
+		lines := strings.Split(out, "\n")
+		want := lipgloss.Width(lines[0])
+		for i, line := range lines {
+			if w := lipgloss.Width(line); w != want {
+				t.Errorf("%s: row %d width = %d, want %d (same as row 0) -- surface rows must all span the same columns:\n%s", label, i, w, want, out)
+			}
+		}
+	}
+	run := func(t *testing.T) {
+		t.Helper()
+		assertUniformWidth(t, "Card single-line", Card(RoleAssistant, "Assistant", "hello world", 40, false))
+		assertUniformWidth(t, "Card multi-line", Card(RoleAssistant, "Assistant", "line one\nline two\nline three", 40, false))
+		assertUniformWidth(t, "Card focused", Card(RoleAssistant, "Assistant", "hello world", 40, true))
+		assertUniformWidth(t, "ComposerFrame empty", ComposerFrame(40, "", false))
+		assertUniformWidth(t, "ComposerFrame one line", ComposerFrame(40, "Ask anything...", false))
+		assertUniformWidth(t, "ComposerFrame multi-line", ComposerFrame(40, "line one\nline two", false))
+		assertUniformWidth(t, "ComposerFrame focused", ComposerFrame(40, "Ask anything...", true))
+		assertUniformWidth(t, "ComposerFrameNoTopEdge", ComposerFrameNoTopEdge(40, "Ask anything...", false))
+		assertUniformWidth(t, "PanelFrame unfocused", PanelFrame(30, 4, "Panel", "row one\nrow two", false))
+		assertUniformWidth(t, "PanelFrame focused", PanelFrame(30, 4, "Panel", "row one\nrow two", true))
+	}
+	t.Run("half-block edges active", func(t *testing.T) {
+		withHalfBlockEdges(t, true, func() { run(t) })
+	})
+	t.Run("fallback mode", func(t *testing.T) {
+		withHalfBlockEdges(t, false, func() { run(t) })
+	})
+}
+
 func TestCardHalfBlockEdgesUseSurfaceAndTerminalColours(t *testing.T) {
 	withHalfBlockEdges(t, true, func() {
 		withDark(t, true, func() {

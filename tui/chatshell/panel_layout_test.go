@@ -121,3 +121,53 @@ func TestComposerIsLastScreenLineWithoutAStatusBar(t *testing.T) {
 		}
 	})
 }
+
+// TestStatusBarAlignsWithComposerSurfaceAndHasNoVerticalMargin covers the
+// r14 founder ruling, verbatim: "Status panel should be aligned with
+// composer border, not composer text and should have no vertical
+// margins" -- superseding r12's card-text alignment and its blank margin
+// row above the status bar. Checked with a hints provider active (the
+// only way there IS a status line to measure): (a) its first
+// non-blank column is the composer surface's own first column
+// (composerMarkerWidth -- the column right after the marker, where the
+// composer's own ▄/▀ edge begins), not the composer's TEXT column
+// (theme.ComposerTextColumn(), which is further right); (b) the row
+// immediately above the status line is the composer's own bottom ▀ edge
+// -- no blank row between them; (c) the status line is the terminal's
+// literal last row.
+func TestStatusBarAlignsWithComposerSurfaceAndHasNoVerticalMargin(t *testing.T) {
+	withTrueColorEnv(t, func() {
+		h := &fakeHandler{}
+		m := New(h, WithHintsProvider(func(int) ([]theme.Hint, []string) {
+			return []theme.Hint{{Key: "Enter", Label: "send"}}, nil
+		}))
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		lines := strings.Split(m.View().Content, "\n")
+
+		last := ansi.Strip(lines[len(lines)-1])
+		if !strings.Contains(last, "Enter") || !strings.Contains(last, "send") {
+			t.Fatalf("last screen line = %q, want the status/hints line", last)
+		}
+		firstNonBlank := 0
+		for i, r := range []rune(last) {
+			if r != ' ' {
+				firstNonBlank = i
+				break
+			}
+		}
+		if firstNonBlank != composerMarkerWidth {
+			t.Fatalf("status line's first non-blank column = %d, want %d (the composer surface's own first column, right after the marker)", firstNonBlank, composerMarkerWidth)
+		}
+		if textCol := theme.ComposerTextColumn(); firstNonBlank == textCol {
+			t.Fatalf("status line aligned to the composer TEXT column (%d), want the composer SURFACE column instead", textCol)
+		}
+
+		bottomEdgeRowIdx, ok := bottomEdgeRow(t, lines[:len(lines)-1], 0, m.chatWidth(), "▀")
+		if !ok {
+			t.Fatalf("no composer bottom edge found above the status line:\n%s", ansi.Strip(m.View().Content))
+		}
+		if bottomEdgeRowIdx != len(lines)-2 {
+			t.Fatalf("composer bottom edge is on row %d, want row %d (directly above the status line, row %d, with no blank row between them)", bottomEdgeRowIdx, len(lines)-2, len(lines)-1)
+		}
+	})
+}

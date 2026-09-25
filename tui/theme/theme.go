@@ -534,12 +534,26 @@ func surfaceFill(bg, fg color.Color, focused bool, barWidth, paddingCols int, co
 	if half {
 		vPad = 0
 	}
-	innerWidth := max(1, width-barWidth-2*paddingCols)
+	// boxWidth is the surface's OWN width, excluding only the outer
+	// marker column -- lipgloss's Style.Width already counts Padding
+	// INSIDE the width it's given (confirmed directly: Padding(0,2).
+	// Width(20).Render("hi") renders exactly 20 columns wide, padding
+	// included, not 20 columns of TEXT plus 4 more of padding). The
+	// previous width-barWidth-2*paddingCols here double-subtracted
+	// paddingCols -- once here, then AGAIN when Padding itself ate into
+	// that already-narrowed box -- shrinking every content row (and the
+	// composer's own text line) by 2*paddingCols columns short of the
+	// ▄/▀ edge rows, which already correctly spanned width-barWidth.
+	// Founder, r13, verbatim: "ask anything line has narrower background
+	// then top and bottom lines" (confirmed on both the composer and
+	// message cards, edges ~4 columns wider than content -- exactly
+	// 2*CardPaddingCols/2*composerPaddingCols).
+	boxWidth := max(1, width-barWidth)
 	rendered := lipgloss.NewStyle().
 		Background(bg).
 		Foreground(fg).
 		Padding(vPad, paddingCols).
-		Width(innerWidth).
+		Width(boxWidth).
 		Render(content)
 	lines := strings.Split(rendered, "\n")
 	marker := markerCell("▌", barWidth, focused)
@@ -578,16 +592,30 @@ func Card(role Role, header, body string, width int, focused bool) string {
 
 // --- bars (top bar / hints-status bar) ------------------------------------
 
-// HintsInset returns the LEFT/RIGHT column padding TopBar/StatusLine keep
-// from the terminal edge — the SAME columns a Card's own text keeps
+// HintsInset returns the LEFT/RIGHT column padding TopBar keeps from the
+// terminal edge — the SAME columns a Card's own text keeps
 // (cardBarWidth+CardPaddingCols on the left — where a card's own marker
 // column would sit, plus its padding; CardPaddingCols on the right) — so
-// a hint's key, and the top bar's title, both start in the same column a
-// card's text does (founder, r12, verbatim: "[status line] Should have
-// horizontal padding", coordinator's own restatement: "align its first
-// key with the card text column, same right inset"; item 3, same round:
-// give the top bar the same padding for the same alignment).
+// the top bar's title starts in the same column a card's text does
+// (founder, r12, verbatim: "[status line] Should have horizontal
+// padding", coordinator's own restatement: "align its first key with the
+// card text column, same right inset"; item 3, same round: give the top
+// bar the same padding for the same alignment). SUPERSEDED for the
+// hints/status bar itself, r14 (founder, verbatim: "Status panel should
+// be aligned with composer border, not composer text") — see
+// StatusInset, which StatusLine now uses instead.
 func HintsInset() (left, right int) { return cardBarWidth + CardPaddingCols, CardPaddingCols }
+
+// StatusInset returns the LEFT/RIGHT column padding StatusLine (the
+// hints/status bar) keeps — aligned to the composer's own SURFACE edge
+// (the column immediately after its marker column, where its own ▄/▀
+// edge itself begins and ends), NOT the card/composer TEXT column
+// HintsInset aligns the top bar to — founder, r14, verbatim: "Status
+// panel should be aligned with composer border, not composer text."
+// Right is 0: the status line's own right end reaches the composer
+// surface's right edge exactly, the same as the ▄/▀ edge (which spans
+// the full outer width minus only the marker column).
+func StatusInset() (left, right int) { return composerBarWidth, 0 }
 
 // insetLine pads content to width - left - right (truncating with an
 // ellipsis if it overflows) and surrounds it with left/right blank
@@ -617,18 +645,20 @@ func Bar(width int, content string) string {
 }
 
 // StatusLine renders ONE hints/status-bar row with NO background at all
-// (the terminal's own default background shows through, SGR 49) and the
-// same HintsInset() horizontal padding Bar/TopBar use — founder, r12,
-// verbatim, seeing the rendered result in Warp: "status line should have
-// top margin and have no background ... Should have horizontal padding."
-// content may already carry its own nested styling (RenderHints' per-hint
-// key/label colouring) — StatusLine adds none of its own beyond the
-// padding, so those spans' own colours are the only styling on the line;
-// unlike Bar, there is no fill to reassert after a nested reset (paintOver
-// exists to protect a BACKGROUND from an embedded reset — with none set
-// here, there is nothing for a reset to cut off).
+// (the terminal's own default background shows through, SGR 49) and
+// StatusInset()'s horizontal padding — founder, r12, verbatim, seeing the
+// rendered result in Warp: "status line should have top margin and have
+// no background ... Should have horizontal padding"; r14, verbatim,
+// superseding the alignment specifically: "Status panel should be
+// aligned with composer border, not composer text." content may already
+// carry its own nested styling (RenderHints' per-hint key/label
+// colouring) — StatusLine adds none of its own beyond the padding, so
+// those spans' own colours are the only styling on the line; unlike Bar,
+// there is no fill to reassert after a nested reset (paintOver exists to
+// protect a BACKGROUND from an embedded reset — with none set here, there
+// is nothing for a reset to cut off).
 func StatusLine(width int, content string) string {
-	left, right := HintsInset()
+	left, right := StatusInset()
 	padded, _ := insetLine(width, content, left, right)
 	return padded
 }
@@ -650,20 +680,20 @@ func padRight(content string, width int) string {
 }
 
 // hintsWrappedLine pads ONE already-wrapped RenderHints line to width with
-// HintsInset()'s left/right blank columns, WITHOUT truncating it — unlike
-// StatusLine, wrapTokens already guarantees this specific line fits its
-// own packing budget (width - HintsInset() columns), so truncating it
-// again here would be redundant at best; at worst, for the ONE deliberate
-// exception — a single hint pair or word wider than the whole line, which
-// wrapTokens still gives its own line rather than cutting (see
-// wrapTokens' own doc: "never cut a key/label pair" / "never truncated
-// mid-word with an ellipsis") — re-truncating here would silently defeat
-// that guarantee, and lipgloss's own Width() WRAPS rather than pads (see
-// padRight's own doc), which would defeat it differently. That one line
-// is simply allowed to render WIDER than width instead; a lost hint or a
-// mid-word cut is worse either way.
+// StatusInset()'s left/right blank columns, WITHOUT truncating it —
+// unlike StatusLine, wrapTokens already guarantees this specific line
+// fits its own packing budget (width - StatusInset() columns), so
+// truncating it again here would be redundant at best; at worst, for the
+// ONE deliberate exception — a single hint pair or word wider than the
+// whole line, which wrapTokens still gives its own line rather than
+// cutting (see wrapTokens' own doc: "never cut a key/label pair" /
+// "never truncated mid-word with an ellipsis") — re-truncating here
+// would silently defeat that guarantee, and lipgloss's own Width() WRAPS
+// rather than pads (see padRight's own doc), which would defeat it
+// differently. That one line is simply allowed to render WIDER than
+// width instead; a lost hint or a mid-word cut is worse either way.
 func hintsWrappedLine(width int, content string) string {
-	left, right := HintsInset()
+	left, right := StatusInset()
 	inner := max(1, width-left-right)
 	return strings.Repeat(" ", left) + padRight(content, inner) + strings.Repeat(" ", right)
 }
@@ -734,7 +764,7 @@ func RenderHints(width int, hints []Hint, segments ...string) string {
 	for _, h := range hints {
 		tokens = append(tokens, hintToken{text: keyStyle.Render(h.Key) + " " + labelStyle.Render(h.Label), splittable: false})
 	}
-	left, right := HintsInset()
+	left, right := StatusInset()
 	lines := wrapTokens(tokens, max(1, width-left-right))
 	if len(lines) == 0 {
 		return hintsWrappedLine(width, "")
@@ -1046,22 +1076,18 @@ func PanelHeader(title string) string {
 	return lipgloss.NewStyle().Bold(true).Render(title)
 }
 
-// panelGapWidth is the plain gap PanelFrame now leaves between the
-// transcript and the side panel — founder 2026-09-25, latest ruling
-// (superseding the earlier "│" divider): "Let's remove border between
-// chat and side panels - margin is enough. Replace the '│' divider with a
-// gap: 2 columns of plain terminal background (no bg SGR, no glyph)
-// between the transcript column and the side panel; the side panel is
-// its own surface (panel tint derived from the real terminal background,
-// like cards), so the gap reads as the separation." One of the two
-// columns doubles as the panel's own focus MARKER column (see
-// markerCell/surfaceFill's shared doc) — reserved blank either way, so
-// focusing the panel never shifts its width.
+// panelGapWidth is the plain gap PanelFrame leaves between the transcript
+// and the side panel — founder 2026-09-25 (superseding the earlier "│"
+// divider): "Let's remove border between chat and side panels - margin is
+// enough. Replace the '│' divider with a gap: 2 columns of plain terminal
+// background (no bg SGR, no glyph) between the transcript column and the
+// side panel; the side panel is its own surface... so the gap reads as
+// the separation." SUPERSEDED IN PART, r13 (founder, verbatim: "Side
+// panel should NOT have left accent border treatment. Can we just
+// slightly change background?"): the panel no longer reserves either of
+// these two columns as a focus MARKER — both stay permanently blank now,
+// panel focus is shown by PanelFocusColors() instead (see its own doc).
 const panelGapWidth = 2
-
-// panelBarWidth is the 1-column left accent bar PanelFrame reserves via
-// surfaceFill — see cardBarWidth's identical reasoning.
-const panelBarWidth = 1
 
 // PanelFrameSize returns how many extra columns/rows PanelFrame adds
 // around its content, so a caller (chatshell's panel sizing) can size the
@@ -1074,30 +1100,81 @@ const panelBarWidth = 1
 // budget never has to branch on which mode is active.
 func PanelFrameSize() (cols, rows int) { return panelGapWidth, 2 }
 
+// panelTintAmount is how far the panel's OWN unfocused fill blends from
+// TerminalBackground() toward the block hue — the SAME weight
+// SurfaceColors() itself uses (a panel reads as "the same kind of plain
+// neutral surface" a grid cell/sidebar row already is), kept as its own
+// named constant here (rather than calling SurfaceColors() directly) so
+// PanelColors/PanelFocusColors read as a single deliberate pair, not an
+// incidental reuse.
+const panelTintAmount = cardTintAmount
+
+// panelFocusTint is how far the panel's FOCUSED fill blends, from its own
+// UNFOCUSED fill (not from TerminalBackground() directly), toward the
+// block hue — founder, r13, verbatim: "Side panel should NOT have left
+// accent border treatment. Can we just slightly change background?"
+// Panel focus is now a subtle surface-tint shift instead of a marker
+// column: picked so the two panel surfaces' own contrast ratio against
+// EACH OTHER (not against terminal background) stays perceptible but
+// small — TestPanelFocusSurfaceDeltaIsSubtle checks it lands in
+// [minPanelFocusDelta, maxPanelFocusDelta] in both theme.Dark variants
+// and against every simulatedTerminalBackgrounds entry.
+const panelFocusTint = 0.12
+
+// minPanelFocusDelta/maxPanelFocusDelta bound PanelFocusColors()' own
+// background against PanelColors()' (see panelFocusTint's doc) — founder,
+// r13: "delta small but perceptible."
+const (
+	minPanelFocusDelta = 1.05
+	maxPanelFocusDelta = 1.2
+)
+
+// PanelColors returns the side panel's own UNFOCUSED surface background+
+// foreground pair — SurfaceColors() in every way but its own named
+// constant (panelTintAmount), so a change to one never silently retunes
+// the other even though they start out equal.
+func PanelColors() (bg, fg color.Color) {
+	bg = blend(TerminalBackground(), roleHue(RoleBlock), panelTintAmount)
+	return bg, surfaceText(bg)
+}
+
+// PanelFocusColors returns the side panel's FOCUSED surface pair: its own
+// unfocused bg (PanelColors()) blended a further panelFocusTint toward the
+// block hue — see panelFocusTint's own doc. Foreground is re-derived
+// (surfaceText) against the NEW bg, so it always clears bodyTextMinRatio
+// regardless of the tint shift.
+func PanelFocusColors() (bg, fg color.Color) {
+	unfocusedBG, _ := PanelColors()
+	bg = blend(unfocusedBG, roleHue(RoleBlock), panelFocusTint)
+	return bg, surfaceText(bg)
+}
+
 // PanelFrame renders side-panel content (SidePanel or the default
 // sidebar) as a single FULL-HEIGHT card surface, spanning EXACTLY height
 // rows of content (PanelFrameSize's own row overhead is added on top of
 // that, same as Card/ComposerFrame) — founder, r12 (Warp feedback,
-// verbatim, seeing the rendered result): "side panel should be full
-// height card." It reuses the SAME surfaceFill machinery Card/
-// ComposerFrame do: theme.SurfaceColors() fill (a plain neutral surface —
-// a panel has no per-role tint the way a message card does), the SAME
-// "▌"/"▖"/"▘" focus marker (spanning every row — content rows AND the
-// half-block/padding edge rows), and the SAME half-block top/bottom
-// edges when HalfBlockEdgesActive(). header renders bold as the surface's
-// own first content row (when non-empty); any row of the surface past
-// what header+content actually fill is left blank SURFACE, never
-// terminal background — founder, verbatim: "the empty space below its
-// content filled with the panel surface". content itself supplies only
-// its OWN per-row styling (e.g. tui/sidebar's SelectedRow highlight) —
-// the surrounding fill is entirely PanelFrame's job now, superseding the
-// earlier "content supplies its own surface fill" contract. A single
-// blank column of plain terminal background (no marker of its own) sits
-// before the surface, matching the gap panelGapWidth has always kept
-// between the transcript and the panel (see panelGapWidth's own doc) —
-// surfaceFill's own marker column is the OTHER of the two gap columns.
+// verbatim): "side panel should be full height card." It reuses the
+// surfaceFill machinery Card/ComposerFrame do for the fill itself and the
+// half-block top/bottom edges when HalfBlockEdgesActive() — but, unlike
+// Card/ComposerFrame, reserves NO focus-marker column at all (barWidth 0):
+// founder, r13, verbatim: "Side panel should NOT have left accent border
+// treatment... just slightly change background" — focused vs unfocused is
+// PanelFocusColors() vs PanelColors() instead (see their own docs). header
+// renders bold as the surface's own first content row (when non-empty);
+// any row of the surface past what header+content actually fill is left
+// blank SURFACE, never terminal background — founder, r12: "the empty
+// space below its content filled with the panel surface". content itself
+// supplies only its OWN per-row styling (e.g. tui/sidebar's SelectedRow
+// highlight, which still uses the single shared FocusSurfaceColors()
+// selection accent) — the surrounding fill is entirely PanelFrame's job.
+// A single blank column of plain terminal background sits before the
+// surface, matching panelGapWidth's own 2-column gap (now both columns
+// permanently blank, per panelGapWidth's own doc).
 func PanelFrame(width, height int, header, content string, focused bool) string {
-	bg, fg := SurfaceColors()
+	bg, fg := PanelColors()
+	if focused {
+		bg, fg = PanelFocusColors()
+	}
 	width, height = max(1, width), max(1, height)
 	lines := make([]string, height)
 	start := 0
@@ -1113,7 +1190,7 @@ func PanelFrame(width, height int, header, content string, focused bool) string 
 		lines[row] = line
 	}
 	body := paintOver(strings.Join(lines, "\n"), bg, fg)
-	card := surfaceFill(bg, fg, focused, panelBarWidth, 0, body, max(1, width-1), true, true)
+	card := surfaceFill(bg, fg, false, 0, 0, body, max(1, width-1), true, true)
 	cardLines := strings.Split(card, "\n")
 	for i, line := range cardLines {
 		cardLines[i] = " " + line
@@ -1201,6 +1278,13 @@ func ContrastPairs() []ContrastPair {
 		ContrastPair{Name: "muted text on surface (grid footer, unfocused chip)", FG: MutedColor(), BG: surfaceBG, MinimumRatio: bodyTextMinRatio},
 		ContrastPair{Name: "accent text on surface (grid selected-column cell)", FG: AccentColor(), BG: surfaceBG, MinimumRatio: bodyTextMinRatio},
 		ContrastPair{Name: "focus border vs surface background", FG: FocusColor(), BG: surfaceBG, MinimumRatio: nonTextMinRatio},
+	)
+
+	panelBG, panelFG := PanelColors()
+	focusedPanelBG, focusedPanelFG := PanelFocusColors()
+	pairs = append(pairs,
+		ContrastPair{Name: "panel body text (unfocused)", FG: panelFG, BG: panelBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "panel body text (focused)", FG: focusedPanelFG, BG: focusedPanelBG, MinimumRatio: bodyTextMinRatio},
 	)
 
 	focusBG, focusFG := FocusSurfaceColors()
