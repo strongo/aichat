@@ -42,9 +42,10 @@ import (
 )
 
 const (
-	PathChat     = "ai/chat"
-	PathDecision = "ai/decision"
-	PathUsage    = "ai/usage"
+	PathChat        = "ai/chat"
+	PathDecision    = "ai/decision"
+	PathUsage       = "ai/usage"
+	PathInteraction = "ai/interactions"
 
 	HeaderProduct  = "X-AI-Product"
 	ContentTypeSSE = "text/event-stream"

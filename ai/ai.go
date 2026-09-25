@@ -104,6 +104,10 @@ type ChatRequest struct {
 	// Product identifies the consuming product ("sneat", "datatug", ...) for
 	// cloud metering, limits and routing. BYOK adapters ignore it.
 	Product string `json:"product"`
+	// InteractionID correlates this call with a client-observed user turn.
+	// It is client supplied and must never be treated as authenticated identity.
+	InteractionID string         `json:"interactionId,omitempty"`
+	ClientContext *ClientContext `json:"clientContext,omitempty"`
 	// Model is a concrete model ID, ModelAuto, or "" (same as ModelAuto).
 	Model string `json:"model,omitempty"`
 	// System is the stable system prompt.

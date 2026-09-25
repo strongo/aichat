@@ -40,6 +40,9 @@ type Config struct {
 	// and is sent as the X-AI-Product header and ai.ChatRequest.Product /
 	// decision.Request.Product.
 	Product string
+	// ClientContext is included in both chat and decision requests unless
+	// the caller provides more specific context for a particular turn.
+	ClientContext *ai.ClientContext
 	// Token returns the bearer token for each request.
 	Token      func(context.Context) (string, error)
 	HTTPClient *http.Client
@@ -52,6 +55,14 @@ type Config struct {
 // that split is actually satisfied.
 type Client struct {
 	cfg Config
+}
+
+type interactionIDKey struct{}
+
+// WithInteractionID associates requests made during one user turn. The ID
+// remains client-supplied correlation metadata at the server trust boundary.
+func WithInteractionID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, interactionIDKey{}, id)
 }
 
 // New builds a Client. It panics if BaseURL or Token is unset, and
@@ -105,8 +116,14 @@ func (d decider) Decide(ctx context.Context, req decision.Request) (decision.Dec
 // cloudproto has no ctx of its own to make that distinction itself.
 func (c *Client) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, error] {
 	return func(yield func(ai.Event, error) bool) {
+		if req.InteractionID == "" {
+			req.InteractionID, _ = ctx.Value(interactionIDKey{}).(string)
+		}
 		if req.Product == "" {
 			req.Product = c.cfg.Product
+		}
+		if req.ClientContext == nil {
+			req.ClientContext = c.cfg.ClientContext
 		}
 		payload, err := json.Marshal(req)
 		if err != nil {
@@ -185,8 +202,14 @@ func toAIError(ctx context.Context, err error) *ai.Error {
 
 // decide implements the decision.Provider role.
 func (c *Client) decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
+	if req.InteractionID == "" {
+		req.InteractionID, _ = ctx.Value(interactionIDKey{}).(string)
+	}
 	if req.Product == "" {
 		req.Product = c.cfg.Product
+	}
+	if req.ClientContext == nil {
+		req.ClientContext = c.cfg.ClientContext
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -264,6 +287,35 @@ func (c *Client) Usage(ctx context.Context) (cloudproto.UsageResponse, error) {
 		return cloudproto.UsageResponse{}, fmt.Errorf("cloud: decode usage response: %w", err)
 	}
 	return ur, nil
+}
+
+// ReportInteraction sends one bounded, metadata-only client observation.
+// Callers should invoke it after the user turn; a failure must not alter the
+// result of an otherwise successful turn.
+func (c *Client) ReportInteraction(ctx context.Context, report cloudproto.InteractionReport) error {
+	if report.Product == "" {
+		report.Product = c.cfg.Product
+	}
+	if report.ClientContext == nil {
+		report.ClientContext = c.cfg.ClientContext
+	}
+	payload, err := json.Marshal(report)
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, cloudproto.PathInteraction, payload)
+	if err != nil {
+		return err
+	}
+	resp, err := c.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("cloud: interaction report: HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (c *Client) newRequest(ctx context.Context, path string, payload []byte) (*http.Request, error) {
