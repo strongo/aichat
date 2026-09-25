@@ -17,6 +17,7 @@ import (
 	"github.com/evertras/bubble-table/table"
 
 	"github.com/strongo/aichat/ai/session"
+	"github.com/strongo/aichat/tui/theme"
 )
 
 // sourceKey is a hidden bubble-table RowData key (it matches no column, so it
@@ -294,8 +295,11 @@ func WithoutViewSwitcher() Option {
 }
 
 // DefaultMaxVisibleRows is the page size a Model uses when WithMaxVisibleRows
-// is not supplied.
-const DefaultMaxVisibleRows = 12
+// is not supplied — theme.MaxInlineGridRows, the shared inline-grid default
+// every aichat product gets automatically (founder 2026-09-25); a product
+// overrides it per grid via WithMaxVisibleRows(n), never by shadowing this
+// constant.
+const DefaultMaxVisibleRows = theme.MaxInlineGridRows
 
 // Model is a transcript.EntityBlock: a result grid with a sortable/filterable
 // table, per-cell column selection, a scrollbar, style presets, and slots for
@@ -401,16 +405,7 @@ func (m *Model) rebuildTable() {
 		// Update, without a rebuildTable call. Only valid for the table
 		// this Model actually keeps navigating — see tableViewAt for the
 		// one-shot alternative a throwaway render-at-another-width needs.
-		if input.Index != m.table.GetHighlightedRowIndex() {
-			if m.focused {
-				return lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(lipgloss.Color("235"))
-			}
-			return lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(lipgloss.Color("232"))
-		}
-		if m.focused {
-			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57"))
-		}
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250")).Background(lipgloss.Color("239"))
+		return rowStyle(input.Index == m.table.GetHighlightedRowIndex(), m.focused)
 	})
 	if filterText != "" {
 		newTable = newTable.WithFilterInputValue(filterText)
@@ -469,11 +464,17 @@ func (m *Model) buildTable(width int, rowStyleFunc func(table.RowStyleFuncInput)
 		rows[i] = table.NewRow(data)
 	}
 	focused := m.focused
+	// currentStyle re-resolves the preset by NAME against theme's current
+	// colours (style.go) rather than using m.style directly — m.style may
+	// have been captured (WithStyle, a saved session's persisted style
+	// name) before a later theme.SetDark call, and its own BorderColor/
+	// HeaderStyle fields would otherwise still render the stale variant.
+	style := currentStyle(m.style.Name)
 	t := table.New(columns).
 		WithRows(rows).
-		WithBaseStyle(m.style.dividerStyle()).
-		WithBorderForeground(m.style.BorderColor).
-		HeaderStyle(m.style.HeaderStyle).
+		WithBaseStyle(style.dividerStyle()).
+		WithBorderForeground(style.BorderColor).
+		HeaderStyle(style.HeaderStyle).
 		WithMaxTotalWidth(m.tableWidthFor(width)).
 		WithPaginationWrapping(false).
 		WithOuterBorder(false).
@@ -800,6 +801,16 @@ func (m *Model) CurrentRow() (Row, bool) {
 func (m *Model) CapturesEsc() bool {
 	return m.table.GetIsFilterInputFocused()
 }
+
+// SelfFramed satisfies transcript.SelfFramed: a grid always draws its own
+// complete border (inline title/view-switcher in the top border, inline
+// footer in the bottom border, a scrollbar in the right border — see
+// tui/grid/render.go's card) matching this package's design language for
+// tabular/scrollable content, so transcript renders a grid's View
+// directly instead of wrapping it in the shared theme.Card fill (founder
+// 2026-09-25: "Grids are the exception ... drawn with its own ... border
+// and NO surrounding card fill or second frame").
+func (m *Model) SelfFramed() bool { return true }
 
 // SetFocused sets the grid's focus state directly, for a caller that renders
 // its own width/focus rather than going through the transcript.Block View

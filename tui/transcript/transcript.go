@@ -13,6 +13,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/strongo/aichat/ai/session"
+	"github.com/strongo/aichat/tui/theme"
 )
 
 // Role of a transcript entry.
@@ -39,6 +40,42 @@ type Block interface {
 type EntityBlock interface {
 	Block
 	Current() *session.EntityRef
+}
+
+// Titled is an optional Block capability: when implemented, its Title() is
+// shown as the header of the shared card transcript draws around the
+// Block's own View output (founder 2026-09-25: "Blocks ... should sit in
+// the same card frame" as a plain message), e.g. a grid's record-set name
+// or an HTTP response's method+URL. A Block that doesn't implement it
+// renders in an untitled card.
+type Titled interface {
+	Title() string
+}
+
+// Roled is an optional Block capability: when implemented, its Role()
+// selects which theme.Role the shared card renders it as (theme.RoleUser,
+// theme.RoleAssistant, ...) instead of the generic theme.RoleBlock — e.g. a
+// product's own focusable/editable user-message Block (DataTug's
+// userMessageBlock) that still wants the same accent a plain, non-Block
+// user message gets. A Block that doesn't implement it renders as
+// theme.RoleBlock.
+type Roled interface {
+	Role() theme.Role
+}
+
+// SelfFramed is an optional Block capability: when it reports true,
+// transcript renders the Block's own View directly, with NO theme.Card
+// fill wrapped around it at all — e.g. tui/grid.Model, which always draws
+// its own complete border (inline title/footer, a right-edge scrollbar)
+// matching this package's design language for tabular/scrollable content
+// (founder 2026-09-25: "Grids are the exception ... NO surrounding card
+// fill or second frame"; see spec/features/tui-kit's card-vs-grid framing
+// rule). A Block that doesn't implement it, or reports false, gets
+// wrapped in the shared theme.Card fill like any other message — the
+// right choice for prose-like content (e.g. an HTTP response's rendered
+// body, DataTug's own httpDocumentBlock).
+type SelfFramed interface {
+	SelfFramed() bool
 }
 
 // EscCapturer is an optional Block capability: when a focused block is in an
@@ -495,17 +532,7 @@ func (m *Model) Rebuild(scrollToBottom bool) {
 			blocks = append(blocks, e.renderOut)
 			continue
 		}
-		var out string
-		switch {
-		case e.Block != nil:
-			out = e.Block.View(width, focused)
-		case e.Role == RoleUser:
-			out = userCardView(e.Text, width, focused)
-		case e.Markdown && m.markdownRenderer != nil:
-			out = m.markdownRenderer(e.Text, width)
-		default:
-			out = plainMessageView(e.Role, e.Text, width)
-		}
+		out := m.renderEntry(e, width, focused)
 		e.renderOut, e.renderWidth, e.renderFocused, e.renderValid = out, width, focused, true
 		blocks = append(blocks, out)
 	}
@@ -521,18 +548,59 @@ func (m *Model) Rebuild(scrollToBottom bool) {
 // View renders the transcript viewport.
 func (m *Model) View() string { return m.viewport.View() }
 
-func userCardView(text string, width int, focused bool) string {
-	bar := "│"
-	style := lipgloss.NewStyle()
-	if focused {
-		style = style.Bold(true)
+// renderEntry renders one transcript entry as the shared card every aichat
+// product's messages, markdown responses and (prose-like) Blocks now
+// render as (founder 2026-09-25: "Message should be like a card in chat
+// of any app"; "The card defined not by border but by background"): a
+// coloured, FILLED-BACKGROUND box from tui/theme, distinct per role, with
+// a bold header and a clearly visible focus highlight (a background shift
+// plus a left accent bar — never a border) — never a scattered
+// lipgloss.NewStyle() literal here; every colour/padding decision lives in
+// tui/theme. A grid-like Block (SelfFramed) is the one exception: it
+// renders its own View directly, with no Card fill (see SelfFramed).
+func (m *Model) renderEntry(e *Entry, width int, focused bool) string {
+	switch {
+	case e.Block != nil:
+		if sf, ok := e.Block.(SelfFramed); ok && sf.SelfFramed() {
+			return e.Block.View(width, focused)
+		}
+		role := theme.RoleBlock
+		if r, ok := e.Block.(Roled); ok {
+			role = r.Role()
+		}
+		// A Roled Block (e.g. DataTug's userMessageBlock, RoleUser) defaults
+		// to theme.HeaderFor(role) — "You" for a user card, same as a plain
+		// (non-Block) user message — so a Block never renders header-less
+		// just because it happens to carry its content through the Block
+		// path rather than Entry.Text. Titled overrides this explicitly
+		// (e.g. an HTTP document's own title); RoleBlock's own HeaderFor is
+		// "" by design (an untitled, unroled Block stays header-less).
+		header := theme.HeaderFor(role)
+		if t, ok := e.Block.(Titled); ok {
+			header = t.Title()
+		}
+		body := e.Block.View(theme.InnerWidth(width), focused)
+		return theme.Card(role, header, body, width, focused)
+	case e.Role == RoleUser:
+		return theme.Card(theme.RoleUser, theme.HeaderFor(theme.RoleUser), e.Text, width, focused)
+	case e.Markdown && m.markdownRenderer != nil:
+		body := m.markdownRenderer(e.Text, theme.InnerWidth(width))
+		return theme.Card(theme.RoleAssistant, theme.HeaderFor(theme.RoleAssistant), body, width, focused)
+	case e.Role == RoleAssistant:
+		return theme.Card(theme.RoleAssistant, theme.HeaderFor(theme.RoleAssistant), e.Text, width, focused)
+	default:
+		// RoleSystem, including an "error: ..." message (AppendSystem is
+		// how chatshell reports both a plain status note and a stream/
+		// command error — see chatshell.handleStreamDone/cancelBusy) — the
+		// "error:" prefix is the one signal available here to give an
+		// error its own distinct, more alarming card colour instead of
+		// blending into ordinary system notices.
+		role := theme.RoleSystem
+		if strings.HasPrefix(e.Text, "error:") {
+			role = theme.RoleError
+		}
+		return theme.Card(role, theme.HeaderFor(role), e.Text, width, focused)
 	}
-	body := style.Width(max(1, width-2)).Render(text)
-	return bar + " You: " + "\n" + body
-}
-
-func plainMessageView(role Role, text string, width int) string {
-	return lipgloss.NewStyle().Width(max(1, width)).Render(string(role) + ": " + text)
 }
 
 // renderedLineCount is the number of on-screen lines block occupies once

@@ -1,6 +1,7 @@
 package chatshell
 
 import (
+	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -8,6 +9,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
+	"github.com/strongo/aichat/tui/theme"
 )
 
 // Chip is a product-neutral attachment shown as a removable pill above the
@@ -279,103 +281,249 @@ func (m *Model) cycleChipFocus(forward bool) {
 	}
 }
 
-// chipCell is one rendered chip pill within a wrapped row: index into
+// chipCell is one rendered chip pill within the chip row: index into
 // m.chips, the pill's rendered text (including its "×" close glyph), and x,
-// the column (within the row's own width) where a mouse click removes it --
-// the position of the "×" glyph itself.
+// the ABSOLUTE column (from the row's own start, i.e. including the
+// composer's marker column and leading edge-filler -- see chipRow) where a
+// mouse click removes it -- the position of the "×" glyph itself.
 type chipCell struct {
 	index int
 	text  string
+	label string // the (possibly truncated) label alone, no leading/trailing padding or close glyph -- lets chipsView style the label and the close glyph differently (founder, r10: the "×" reads "muted", the label text doesn't).
 	x     int
 }
 
 // chipCloseGlyph is appended, space-separated, to a chip's (possibly
-// truncated) label to form its pill text, e.g. "[Customer ×]".
+// truncated) label to form its pill text, e.g. " Customer × ".
 const chipCloseGlyph = "×"
 
-// chipRows lays out the current chips into rows that wrap at width (one
-// space between adjacent pills on the same row; a pill that would overflow
-// starts a new row instead), mirroring DataTug's attachmentRows. A single
-// chip wider than width still gets its own row (truncated, close glyph
-// preserved) rather than being dropped. Returns nil when there are no
-// chips.
-func (m *Model) chipRows(width int) [][]chipCell {
-	if len(m.chips) == 0 {
-		return nil
-	}
-	available := max(1, width)
-	rows := [][]chipCell{{}}
+// chipOverflowReserve is the width chipRow reserves at the row's end for a
+// trailing "+N" overflow pill (a notch cell plus " +NN " -- two-digit N is
+// the realistic ceiling for attachment counts) while deciding how many
+// chips fit -- founder, r11 (Warp feedback, verbatim): "keep one row: show
+// as many chips as fit plus a '+N' chip ... never overflow or clip
+// mid-chip."
+const chipOverflowReserve = 1 + 6
+
+// fitChips greedily lays out as many of m.chips as fit within available
+// columns (a single half-block cell of gap between adjacent pills -- see
+// chipEdgeFiller), stopping at the first chip that would overflow rather
+// than truncating it away; cell.x is absolute, offset by leading (the
+// composer's own marker + edge-filler columns that precede the row's first
+// chip -- see chipRow). A single chip wider than available still gets
+// placed (truncated, close glyph preserved) when it's the very first one,
+// rather than being dropped outright.
+//
+// Pill text is " label × " -- one space either side of the label, one
+// before the close glyph, one trailing (founder, r9: "one space either
+// side of the label"; no brackets).
+func fitChips(chips []Chip, leading, available int) []chipCell {
+	var cells []chipCell
 	used := 0
-	for i, c := range m.chips {
+	for i, c := range chips {
 		label := ansi.Truncate(c.Label, max(0, available-4), "")
-		text := "[" + label + " " + chipCloseGlyph + "]"
+		text := " " + label + " " + chipCloseGlyph + " "
 		w := ansi.StringWidth(text)
 		gap := 0
 		if used > 0 {
 			gap = 1
 		}
 		if used+gap+w > available && used > 0 {
-			rows = append(rows, []chipCell{})
-			used, gap = 0, 0
+			break
 		}
 		used += gap
-		rows[len(rows)-1] = append(rows[len(rows)-1], chipCell{
+		cells = append(cells, chipCell{
 			index: i,
 			text:  text,
-			x:     used + ansi.StringWidth(label) + 2,
+			label: label,
+			x:     leading + used + ansi.StringWidth(label) + 2,
 		})
 		used += w
 	}
-	return rows
+	return cells
 }
 
-// chipsHeight is the number of rows chipRows(width) lays out -- how many
-// extra lines the chip row(s) take above the input, so historyHeight can
+// chipRow lays out the current chips into the composer's ONE chip row --
+// it never wraps to a second row (founder, r11, verbatim: "If the chips
+// don't fit the width ... keep one row"). leading is how many columns
+// (the composer's own marker column plus its left edge-filler -- see
+// theme.ComposerTextColumn/ComposerChipLeadingFill) come before the row's
+// first chip cell; those columns, and the alignment they give the first
+// chip's label, are ALWAYS present, even with zero chips fitting.
+//
+// It first tries to fit every chip; if they all fit, there's no overflow.
+// Otherwise it redoes the fit reserving chipOverflowReserve columns at the
+// end for a "+N" pill, and whatever didn't make it into that narrower fit
+// becomes the overflow count -- always > 0 at that point: fitChips' per-
+// chip width is a non-decreasing function of available (a longer label
+// truncates to a LARGER cap at a LARGER available, and a chip within its
+// untruncated length renders at a constant width regardless), so a
+// strictly smaller available (chipOverflowReserve > 0) can only fit the
+// same chips or fewer, never more, than the unreserved pass already
+// couldn't. Returns nil, 0 when there are no chips.
+func (m *Model) chipRow(width int) (cells []chipCell, overflowN int) {
+	if len(m.chips) == 0 {
+		return nil, 0
+	}
+	leading := composerMarkerWidth + theme.ComposerChipLeadingFill()
+	available := max(0, width-leading)
+	cells = fitChips(m.chips, leading, available)
+	if len(cells) == len(m.chips) {
+		return cells, 0
+	}
+	reserved := max(0, available-chipOverflowReserve)
+	cells = fitChips(m.chips, leading, reserved)
+	return cells, len(m.chips) - len(cells)
+}
+
+// chipsHeight is 1 when there are chips to show (the composer's chip row
+// always fits on a single line -- see chipRow) and 0 otherwise -- how many
+// extra lines the chip row takes above the input, so historyHeight can
 // shrink to make room and grow back as chips are removed.
-func (m *Model) chipsHeight(width int) int {
-	return len(m.chipRows(width))
+func (m *Model) chipsHeight(_ int) int {
+	if len(m.chips) == 0 {
+		return 0
+	}
+	return 1
 }
 
-// chipStyle/chipFocusedStyle render a chip pill's text: dim/blue normal,
-// bold/inverted when focused (Tab-cycled or about to be removed).
-var (
-	chipStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("111"))
-	chipFocusedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57"))
-)
+// chipLabelStyle/chipCloseStyle/chipFocusedStyle render a chip pill as a
+// FULL-HEIGHT solid cell: theme.ChipColors() normal (a DISTINCT step
+// stronger than the composer surface it sits on, checked by
+// theme.ChipDeltaPairs/TestChipDistinctFromComposer — founder 2026-09-25,
+// r10 coordinator review, verbatim: "Chips are there ... but too subtle
+// to notice ... Make them clearly visible: chip surface a distinct step
+// from the composer surface"), theme.FocusSurfaceColors()-highlighted
+// when focused (Tab-cycled or about to be removed) — the SAME accent
+// every other focused/selected element uses. The label reads
+// theme.ChipColors()' own contrast-safe foreground; the "×" close glyph
+// reads theme.MutedColor() instead — "muted, but still >= 4.5:1"
+// (theme.ContrastPairs' own "chip close glyph" entry) — so it reads as a
+// secondary affordance without becoming unreadable. Functions, not
+// package vars: theme.Dark/the real terminal background can change at
+// runtime, and a memoised colour would keep rendering the stale variant
+// forever after.
+func chipLabelStyle() lipgloss.Style {
+	bg, fg := theme.ChipColors()
+	return lipgloss.NewStyle().Background(bg).Foreground(fg)
+}
+func chipCloseStyle() lipgloss.Style {
+	bg, _ := theme.ChipColors()
+	return lipgloss.NewStyle().Background(bg).Foreground(theme.ChipCloseColor(bg))
+}
+func chipFocusedStyle() lipgloss.Style {
+	bg, fg := theme.FocusSurfaceColors()
+	return lipgloss.NewStyle().Bold(true).Foreground(fg).Background(bg)
+}
 
-// chipsView renders the current chips as one or more wrapped rows, joined
-// with a blank line above nothing (each row is newline-joined; a space
-// separates pills on the same row). Returns "" when there are no chips.
-func (m *Model) chipsView(width int) string {
-	rows := m.chipRows(width)
-	if len(rows) == 0 {
+// chipEdgeFiller returns the single-cell separator/fill glyph chipsView
+// uses between pills and to pad a row's remaining width: theme.
+// HalfBlockEdge's own "▄" (foreground = the composer's unfocused surface
+// colour, NO background set — r10: the real terminal background shows
+// through unpainted, see theme.HalfBlockEdge's own doc) when half-block
+// edges are active — founder, r9, verbatim: "Have a 1 char half height
+// separator between attachments" — or a plain space in fallback mode (no
+// half-block glyphs anywhere in that mode, matching Card/ComposerFrame's
+// own fallback).
+func chipEdgeFiller(width int) string {
+	if !theme.HalfBlockEdgesActive() {
+		return strings.Repeat(" ", max(0, width))
+	}
+	composerBG, _ := theme.ComposerColors()
+	return theme.HalfBlockEdge(width, composerBG, true)
+}
+
+// renderChipCell renders one chip pill: focused (Tab-cycled or about to
+// be removed) gets ONE style across the whole cell (chipFocusedStyle, the
+// single accent colour); unfocused splits the label (chipLabelStyle) from
+// the close glyph (chipCloseStyle, muted) so the "×" reads as a secondary
+// affordance without losing its own >= 4.5:1 floor (see
+// chipLabelStyle's own doc).
+func renderChipCell(cell chipCell, focused bool) string {
+	if focused {
+		return chipFocusedStyle().Render(cell.text)
+	}
+	// cell.text is " " + label + " " + chipCloseGlyph + " " -- split at
+	// the boundary chipRows itself already computed (cell.label's own
+	// width), so this never re-derives it by re-scanning for the glyph.
+	labelPart := " " + cell.label + " "
+	closePart := strings.TrimPrefix(cell.text, labelPart)
+	return chipLabelStyle().Render(labelPart) + chipCloseStyle().Render(closePart)
+}
+
+// composerMarkerWidth mirrors theme's own unexported composerBarWidth --
+// the 1-column marker (▖ focused, blank otherwise) the composer's top edge
+// always starts with, chips included -- see theme.ComposerChipMarker.
+const composerMarkerWidth = 1
+
+// chipsView renders the composer's ONE chip row (see chipRow -- it never
+// wraps): the marker column (theme.ComposerChipMarker, matching whatever
+// the composer's own edges show), then theme.ComposerChipLeadingFill()
+// columns of plain edge-filler BEFORE the first chip -- so the composer's
+// own top-left corner is always rendered and the first chip's LABEL lands
+// on theme.ComposerTextColumn(), the same column the composer's own typed
+// text starts on (founder, r11, verbatim: "Attachment chips should have
+// margin on left so left top corner is always rendered. I think first
+// chip text should be aligned with text of the message") -- then each
+// pill as a full-height solid cell (renderChipCell), separated by EXACTLY
+// one half-block filler cell (chipEdgeFiller(1)), a trailing "+N" pill
+// (same chipLabelStyle) when chipRow reports an overflow count, and the
+// row's remaining width past the last cell filled the same way -- so the
+// row reads as a strip of tabs rising off a half-block surface, effectively
+// BEING the composer's top edge (see chatshell.go's View(), which skips
+// ComposerFrame's own top edge whenever chips are present in half-block
+// mode: theme.ComposerFrameNoTopEdge). composerFocused matches whatever
+// focus state the composer's own edges are rendered with (inputFocused in
+// View()), independent of which individual chip, if any, is itself
+// Tab-focused (cell.index == m.chipFocus, handled by renderChipCell).
+// Returns "" when there are no chips.
+func (m *Model) chipsView(width int, composerFocused bool) string {
+	if len(m.chips) == 0 {
 		return ""
 	}
-	lines := make([]string, 0, len(rows))
-	for _, row := range rows {
-		parts := make([]string, 0, len(row))
-		for _, cell := range row {
-			style := chipStyle
-			if cell.index == m.chipFocus {
-				style = chipFocusedStyle
-			}
-			parts = append(parts, style.Render(cell.text))
-		}
-		lines = append(lines, strings.Join(parts, " "))
+	cells, overflowN := m.chipRow(width)
+	leading := composerMarkerWidth + theme.ComposerChipLeadingFill()
+	line := theme.ComposerChipMarker(composerFocused) + chipEdgeFiller(theme.ComposerChipLeadingFill())
+	used := leading
+	writeSep := func() {
+		line += chipEdgeFiller(1)
+		used++
 	}
-	return strings.Join(lines, "\n")
+	for i, cell := range cells {
+		if i > 0 {
+			writeSep()
+		}
+		line += renderChipCell(cell, cell.index == m.chipFocus)
+		used += ansi.StringWidth(cell.text)
+	}
+	if overflowN > 0 {
+		if len(cells) > 0 {
+			writeSep()
+		}
+		pillText := " +" + strconv.Itoa(overflowN) + " "
+		line += chipLabelStyle().Render(pillText)
+		used += ansi.StringWidth(pillText)
+	}
+	if fill := max(0, width-used); fill > 0 {
+		line += chipEdgeFiller(fill)
+	}
+	return line
 }
 
 // chipsTopY returns the Y coordinate (chatshell's own top-left-origin
-// coordinate frame, matching tea.Mouse's) of the first chip row, so
-// handleMouseClick can translate a click's Y into a row index: the
+// coordinate frame, matching tea.Mouse's) of the chip row, so
+// handleMouseClick can tell a chip-row click apart from any other: the
 // rendered top bar's height, plus the transcript's fixed viewport height
 // (historyHeight), plus the slash-command menu's height when it's
-// currently showing -- exactly the content View() stacks above the chip
-// row(s), in order (see historyHeight's own doc for why each of these is
-// measured rather than assumed).
+// currently showing, plus TWO theme.ContentMargins(m.height) rows -- the
+// top-bar/content margin (above history) AND the last-card/composer
+// margin (above the chip row, which sits directly against the composer:
+// founder, r10, verbatim, on the margin instead landing BETWEEN the chip
+// row and the composer, "it should be part of the composer") -- exactly
+// the content View() stacks above the chip row (see historyHeight's own
+// doc for why each of these is measured rather than assumed).
 func (m *Model) chipsTopY() int {
-	return m.topBarHeight() + m.historyHeight() + m.menuHeight()
+	return m.topBarHeight() + 2*theme.ContentMargins(m.height) + m.historyHeight() + m.menuHeight()
 }
 
 // handleMouseClick handles a tea.MouseClickMsg: a click on a chip's "×"
@@ -395,18 +543,19 @@ func (m *Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 // resulting ChipObserver notification command. It reports ok=false (no
 // removal) while mouse reporting is off, the shell is busy (the composer,
 // chips included, is disabled while busy -- see handleInputKey), there are
-// no chips, msg isn't a left-button click, or msg's coordinates don't land
-// on any chip's close glyph.
+// no chips, msg isn't a left-button click, msg's Y isn't the chip row, or
+// msg's X doesn't land on any VISIBLE chip's close glyph -- a chip folded
+// into the trailing "+N" overflow pill isn't individually clickable, since
+// it isn't individually rendered.
 func (m *Model) chipCloseClick(msg tea.MouseClickMsg) (tea.Cmd, bool) {
 	if !m.mouseEnabled || m.busy || len(m.chips) == 0 || msg.Button != tea.MouseLeft {
 		return nil, false
 	}
-	rows := m.chipRows(m.chatWidth())
-	row := msg.Y - m.chipsTopY()
-	if row < 0 || row >= len(rows) {
+	if msg.Y != m.chipsTopY() {
 		return nil, false
 	}
-	for _, cell := range rows[row] {
+	cells, _ := m.chipRow(m.chatWidth())
+	for _, cell := range cells {
 		if msg.X == cell.x {
 			return m.removeChipAt(cell.index), true
 		}

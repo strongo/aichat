@@ -8,7 +8,35 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/evertras/bubble-table/table"
+
+	"github.com/strongo/aichat/tui/theme"
 )
+
+// rowStyle is the one place a grid row's background/foreground is decided:
+// the HIGHLIGHTED row (the cursor's own row) gets theme.FocusSurfaceColors()
+// while the grid is focused — the SAME accent a focused card/composer
+// border and a selected sidebar row use (founder 2026-09-25: "Use the
+// single theme focus/selection colour everywhere") — or theme.MutedColor()
+// or theme.SurfaceColors() for a dimmer, unfocused highlight; every OTHER
+// row uses theme.SurfaceColors() so it blends into the grid's own
+// surrounding card rather than a separately-coloured patch. Shared by
+// rebuildTable's and tableViewAt's own RowStyleFunc closures so the two
+// never drift apart.
+func rowStyle(highlighted, focused bool) lipgloss.Style {
+	surfaceBG, surfaceFG := theme.SurfaceColors()
+	if !highlighted {
+		if focused {
+			return lipgloss.NewStyle().Foreground(surfaceFG).Background(surfaceBG)
+		}
+		return lipgloss.NewStyle().Foreground(theme.MutedColor()).Background(surfaceBG)
+	}
+	if focused {
+		bg, fg := theme.FocusSurfaceColors()
+		return lipgloss.NewStyle().Bold(true).Foreground(fg).Background(bg)
+	}
+	mutedBG := theme.MutedColor()
+	return lipgloss.NewStyle().Bold(true).Foreground(theme.ContrastText(mutedBG)).Background(mutedBG)
+}
 
 // View implements transcript.Block: a bordered card (title + view switcher,
 // content, scrollbar down the right edge, a stats footer in the bottom
@@ -25,7 +53,9 @@ func (m *Model) View(width int, focused bool) string {
 	// card prepends a 2-cell focus bullet ("● "/"○ ") to the header label
 	// before laying it into the border, so the label itself must be built 2
 	// cells narrower than the card or the bullet pushes the rightmost view
-	// control (e.g. "3") out of the border and it gets clipped.
+	// control (e.g. "3") out of the border and it gets clipped. A grid
+	// always draws this card (see SelfFramed in grid.go) — transcript
+	// renders a grid's View directly, with no theme.Card wrap around it.
 	return m.card(m.headerLine(max(1, m.width-2)), m.body(m.width))
 }
 
@@ -41,9 +71,9 @@ func (m *Model) headerLine(width int) string {
 		// main's own header there is title-only.
 		title := ansi.Truncate(sanitize(m.title), max(1, width), "…")
 		if m.focused {
-			title = activeTitleStyle.Render(title)
+			title = activeTitleStyle().Render(title)
 		} else {
-			title = inactiveTitleStyle.Render(title)
+			title = inactiveTitleStyle().Render(title)
 		}
 		return padAnsiLine(title, width)
 	}
@@ -55,9 +85,9 @@ func (m *Model) headerLine(width int) string {
 	controls := strings.Join(labels, separator)
 	styled := make([]string, len(labels))
 	for i, label := range labels {
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+		style := lipgloss.NewStyle().Foreground(theme.MutedColor())
 		if View(i) == m.view {
-			style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231"))
+			style = lipgloss.NewStyle().Bold(true).Foreground(theme.FocusColor())
 		}
 		styled[i] = style.Render(label)
 	}
@@ -69,9 +99,9 @@ func (m *Model) headerLine(width int) string {
 	titleWidth := max(1, available-ansi.StringWidth(controls)-3)
 	title := ansi.Truncate(sanitize(m.title), titleWidth, "…")
 	if m.focused {
-		title = activeTitleStyle.Render(title)
+		title = activeTitleStyle().Render(title)
 	} else {
-		title = inactiveTitleStyle.Render(title)
+		title = inactiveTitleStyle().Render(title)
 	}
 	return padAnsiLine(title+" │ "+styledControls, width)
 }
@@ -311,16 +341,7 @@ func (m *Model) tableViewAt(width int) string {
 		// read: this table is rendered once, right here, and discarded —
 		// it is never separately navigated — so there is no "later" state
 		// for a dynamic read to need to catch up with.
-		if input.Index != highlighted {
-			if m.focused {
-				return lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(lipgloss.Color("235"))
-			}
-			return lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(lipgloss.Color("232"))
-		}
-		if m.focused {
-			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57"))
-		}
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250")).Background(lipgloss.Color("239"))
+		return rowStyle(input.Index == highlighted, m.focused)
 	})
 	if filterText != "" {
 		// This throwaway copy's own filter focus doesn't matter — it's
@@ -384,9 +405,9 @@ func (m *Model) secondaryCard(content string, width int) string {
 		label = m.extraViews[i].Label
 	}
 	focused := m.focused && m.secondaryFocus
-	titleStyle, borderStyle, bullet := inactiveTitleStyle, inactiveBorderStyle, "○ "
+	titleStyle, borderStyle, bullet := inactiveTitleStyle(), inactiveBorderStyle(), "○ "
 	if focused {
-		titleStyle, borderStyle, bullet = activeTitleStyle, activeBorderStyle, "● "
+		titleStyle, borderStyle, bullet = activeTitleStyle(), activeBorderStyle(), "● "
 	}
 	title := titleStyle.Render(bullet) + titleStyle.Render(label)
 	innerWidth := max(1, width-2)
@@ -429,31 +450,31 @@ func (m *Model) card(label, content string) string {
 	// re-truncation (if still needed) ends on real content or a clean "…".
 	title := strings.TrimRight(label, " ")
 	if m.focused {
-		title = activeTitleStyle.Render("● ") + title
+		title = activeTitleStyle().Render("● ") + title
 	} else {
-		title = inactiveTitleStyle.Render("○ ") + title
+		title = inactiveTitleStyle().Render("○ ") + title
 	}
 	topBorder := borderLine("╭", title, "╮", cardWidth)
 	if m.focused {
-		topBorder = selectedOutlineStyle.Render(topBorder)
+		topBorder = selectedOutlineStyle().Render(topBorder)
 	} else {
-		topBorder = inactiveBorderStyle.Render(topBorder)
+		topBorder = inactiveBorderStyle().Render(topBorder)
 	}
 	lines = append(lines, padAnsiLine(topBorder, cardWidth))
 	for lineIndex, line := range rawLines {
 		scrollbar := m.scrollbarLine(lineIndex, len(rawLines))
-		border := inactiveBorderStyle
+		border := inactiveBorderStyle()
 		if m.focused {
-			border = activeBorderStyle
+			border = activeBorderStyle()
 		}
 		lines = append(lines, padAnsiLine(border.Render("│")+padAnsiLine(line, innerWidth)+scrollbar, cardWidth))
 	}
-	footerLabel := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render(m.footer())
+	footerLabel := lipgloss.NewStyle().Bold(true).Foreground(theme.MutedColor()).Render(m.footer())
 	bottomBorder := borderLine("╰", footerLabel, "╯", cardWidth)
 	if m.focused {
-		bottomBorder = selectedOutlineStyle.Render(bottomBorder)
+		bottomBorder = selectedOutlineStyle().Render(bottomBorder)
 	} else {
-		bottomBorder = inactiveBorderStyle.Render(bottomBorder)
+		bottomBorder = inactiveBorderStyle().Render(bottomBorder)
 	}
 	lines = append(lines, padAnsiLine(bottomBorder, cardWidth))
 	return strings.Join(lines, "\n")
@@ -498,21 +519,21 @@ func (m *Model) scrollbarLine(line, trackHeight int) string {
 	visibleRows := max(0, pageEnd-pageStart+1)
 	if trackHeight == 0 || visibleRows == 0 || len(m.rows) <= visibleRows {
 		if m.focused {
-			return selectedOutlineStyle.Render("│")
+			return selectedOutlineStyle().Render("│")
 		}
-		return inactiveBorderStyle.Render("│")
+		return inactiveBorderStyle().Render("│")
 	}
 	thumbSize := max(1, trackHeight*visibleRows/len(m.rows))
 	maxStart := max(0, trackHeight-thumbSize)
 	start := m.table.GetHighlightedRowIndex() * maxStart / max(1, len(m.rows)-1)
 	if line >= start && line < start+thumbSize {
 		if m.focused {
-			return lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render("▐")
+			return lipgloss.NewStyle().Foreground(theme.FocusColor()).Render("▐")
 		}
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("242")).Render("▐")
+		return lipgloss.NewStyle().Foreground(theme.MutedColor()).Render("▐")
 	}
 	if m.focused {
-		return selectedOutlineStyle.Render("│")
+		return selectedOutlineStyle().Render("│")
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("237")).Render("│")
+	return lipgloss.NewStyle().Foreground(theme.MutedColor()).Render("│")
 }

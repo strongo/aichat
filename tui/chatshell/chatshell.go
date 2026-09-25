@@ -3,6 +3,7 @@ package chatshell
 import (
 	"context"
 	"errors"
+	"image/color"
 	"iter"
 	"reflect"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/strongo/aichat/tui/focus"
 	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
+	"github.com/strongo/aichat/tui/theme"
 	"github.com/strongo/aichat/tui/transcript"
 )
 
@@ -119,9 +121,22 @@ func WithCommands(commands []Command) Option {
 	return func(m *Model) { m.commands = commands }
 }
 
-// WithSidebarRenderer sets how sidebar entries render.
+// WithSidebarRenderer sets how sidebar entries render. Preserves any
+// title a WithSidebarTitle call already set (in either order) by reading
+// the previous m.sidebar's own Title() before replacing it wholesale.
 func WithSidebarRenderer(render sidebar.Renderer) Option {
-	return func(m *Model) { m.sidebar = sidebar.New(render) }
+	return func(m *Model) { m.sidebar = sidebar.New(render).WithTitle(m.sidebar.Title()) }
+}
+
+// WithSidebarTitle sets the default sidebar's header text (default
+// "Pinned") -- content only, e.g. a product's own name for its
+// working-context list (founder, r11, sneat-cli coordinator review: "any
+// product using the default sidebar" should be able to give it a proper
+// header instead of the internal "Sidebar" implementation name). A no-op
+// for a product using WithSidePanel instead -- a SidePanel supplies its
+// own header entirely.
+func WithSidebarTitle(title string) Option {
+	return func(m *Model) { m.sidebar = m.sidebar.WithTitle(title) }
 }
 
 // WithSidePanel installs a product SidePanel in place of the default
@@ -141,16 +156,50 @@ func WithGlobalKeys(fn GlobalKeysFunc) Option {
 	return func(m *Model) { m.globalKeys = fn }
 }
 
-// WithTopBar sets a product-rendered top bar, replacing the default bold
-// title line.
+// WithTopBar sets a product-rendered top bar, replacing the default themed
+// title line. Prefer WithTopBarProvider (content-only: title/context/menu
+// items, rendered through the shared theme.TopBar chrome) — WithTopBar
+// remains for a product that needs a top bar theme.TopBar can't express;
+// it fully replaces chatshell's own styling, so nothing here applies to it.
 func WithTopBar(render func(width int) string) Option {
 	return func(m *Model) { m.topBarFn = render }
 }
 
 // WithStatusBar sets a product-rendered status bar, replacing the default
-// SetStatus-driven status line(s).
+// SetStatus-driven status line(s). Prefer WithHintsProvider (content-only:
+// a Hint list plus trailing segments, rendered through the shared
+// theme.RenderHints chrome) — WithStatusBar remains for a product that
+// needs a status bar theme.RenderHints can't express; it fully replaces
+// chatshell's own styling, so nothing here applies to it.
 func WithStatusBar(render func(width int) string) Option {
 	return func(m *Model) { m.statusBarFn = render }
+}
+
+// TopBarProvider returns the top bar's CONTENT for width: a title, an
+// optional context string (e.g. the current project/space), and menu items
+// (with the active one marked) — chatshell renders it through the shared
+// theme.TopBar chrome every render, so the product supplies content only,
+// never colour. It takes priority over WithTopBar/the plain WithTitle
+// default when set.
+type TopBarProvider func(width int) (title, context string, items []theme.MenuItem)
+
+// WithTopBarProvider sets a content-only top bar (see TopBarProvider).
+func WithTopBarProvider(provide TopBarProvider) Option {
+	return func(m *Model) { m.topBarProvider = provide }
+}
+
+// HintsProvider returns the status/hints bar's CONTENT for width: the
+// current key hints (e.g. {"Enter", "send"}) plus optional trailing
+// segments (e.g. a product/session summary, a hyperlink) — chatshell
+// renders it through the shared theme.RenderHints chrome every render, so
+// the product supplies content only, never colour. It takes priority over
+// WithStatusBar/the plain SetStatus default when set.
+type HintsProvider func(width int) (hints []theme.Hint, segments []string)
+
+// WithHintsProvider sets a content-only status/hints bar (see
+// HintsProvider).
+func WithHintsProvider(provide HintsProvider) Option {
+	return func(m *Model) { m.hintsProvider = provide }
 }
 
 // WithContext sets the context streamed responses and Handler calls run
@@ -236,6 +285,8 @@ type Model struct {
 	globalKeys           GlobalKeysFunc
 	topBarFn             func(width int) string
 	statusBarFn          func(width int) string
+	topBarProvider       TopBarProvider
+	hintsProvider        HintsProvider
 	overlays             []Overlay
 
 	commands             []Command
@@ -940,12 +991,67 @@ func (m *Model) growPanelChat(delta int) {
 }
 
 // panelView renders the active sidebar-zone content (SidePanel or the
-// default sidebar) at width, focused as given.
+// default sidebar) wrapped in the shared theme.PanelFrame (founder
+// 2026-09-25: "Same for ... side panel" — a full frame, focus-bordered
+// when the zone has focus, matching every other bordered element): width
+// is the frame's OUTER width, so the content itself (and the height a
+// SidePanel is asked to lay out) is sized to PanelFrameSize's smaller
+// inner box via panelInnerWidth/panelInnerHeight — never the raw column
+// width chatshell allotted the whole sidebar zone.
 func (m *Model) panelView(width int, focused bool) string {
+	inner := m.panelInnerWidth(width)
+	innerHeight := m.panelInnerHeight()
+	var content string
 	if m.sidePanel != nil {
-		return m.sidePanel.View(width, m.historyHeight(), focused)
+		content = m.sidePanel.View(inner, innerHeight, focused)
+	} else {
+		content = m.sidebar.View(inner, focused)
 	}
-	return m.sidebar.View(width, focused)
+	// header is always "" here: both a SidePanel and the default sidebar
+	// already render their own header as their content's own first line
+	// (sidebar.Model.View's own theme.PanelHeader call) -- PanelFrame's
+	// header parameter exists for a future caller that wants PanelFrame to
+	// supply it instead, not used by chatshell today.
+	return theme.PanelFrame(width, innerHeight, "", content, focused)
+}
+
+// panelInnerWidth returns the content width available INSIDE
+// theme.PanelFrame for a panel of the given OUTER width.
+func (m *Model) panelInnerWidth(width int) int {
+	cols, _ := theme.PanelFrameSize()
+	return max(1, width-cols)
+}
+
+// chatColumnHeight is the TOTAL row count the chat column occupies in
+// View(): history (plus its trailing busy-spinner line when Busy()), the
+// open slash-command menu, the pre-chips/composer margin row, the chip
+// row, and the composer itself -- exactly what View() stacks into
+// chatParts before lipgloss.JoinHorizontal joins it with the side panel.
+// The side panel must span this SAME total (see panelInnerHeight), not
+// just historyHeight() alone -- founder, r12 coordinator review,
+// verbatim: "the panel spans the transcript area AND the composer rows
+// (the composer sits only in the left column)" -- the earlier
+// historyHeight()-only budget left the panel exactly composerHeight()+
+// theme.ContentMargins(m.height) rows short of the composer's own bottom
+// edge (a real regression the coordinator measured: "panel bottom edge
+// on row 25 while the composer's bottom edge is on row 29").
+func (m *Model) chatColumnHeight() int {
+	busySpinnerLine := 0
+	if m.busy {
+		busySpinnerLine = 1
+	}
+	return m.historyHeight() + busySpinnerLine + m.menuHeight() + theme.ContentMargins(m.height) + m.chipsHeight(m.chatWidth()) + m.composerHeight()
+}
+
+// panelInnerHeight returns the content height available INSIDE
+// theme.PanelFrame, given the frame's own top/bottom border rows —
+// chatColumnHeight() is the OUTER row budget the chat column and the
+// side panel column both match (View joins them side by side), so the
+// panel's own content must be that minus PanelFrameSize's row overhead
+// to keep the two columns' BOTTOM edges aligned.
+func (m *Model) panelInnerHeight() int {
+	_, rows := theme.PanelFrameSize()
+	return max(1, m.chatColumnHeight()-rows)
 }
 
 // updatePanel forwards msg to the active sidebar-zone content.
@@ -960,7 +1066,19 @@ func (m *Model) updatePanel(msg tea.Msg) tea.Cmd {
 
 // --- tea.Model -----------------------------------------------------------
 
-func (m *Model) Init() tea.Cmd { return textarea.Blink }
+// Init starts the composer's cursor blink and asks the terminal for its
+// ACTUAL background colour (OSC 11, via bubbletea's own
+// tea.RequestBackgroundColor()/tea.BackgroundColorMsg) — founder
+// 2026-09-25 (r10 coordinator review, verbatim): "derive surface tints
+// from the ACTUAL terminal background ... Fallback to the current
+// defaults when the terminal doesn't answer. Chatshell applies the
+// message; products do nothing." See Update's tea.BackgroundColorMsg case
+// for where the answer, if any, gets applied (theme.SetTerminalBackground)
+// — a terminal that never answers simply leaves theme's own guessed
+// default in effect, exactly as before this feature existed.
+func (m *Model) Init() tea.Cmd {
+	return tea.Batch(textarea.Blink, tea.RequestBackgroundColor)
+}
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// A WindowSizeMsg always resizes the shell, even with an overlay open
@@ -988,6 +1106,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case tea.BackgroundColorMsg:
+		// The terminal answered Init's tea.RequestBackgroundColor() (OSC
+		// 11) — apply it so every card/composer surface tint derives from
+		// the REAL background instead of theme's guessed default. See
+		// Init's own doc; a product does nothing further.
+		theme.SetTerminalBackground(msg.Color)
+		return m, nil
+
 	case tui.AddToSidebarMsg:
 		m.PinToSidebar(msg.Ref)
 		return m, nil
@@ -1035,11 +1161,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // matching a typical terminal's own default scroll step.
 const mouseWheelScrollLines = 3
 
-// splitSeparatorWidth is the width, in columns, of the " │ " divider View()
-// draws between the chat column and the side panel/sidebar when split
-// (see View, chatWidth/sidebarWidth) -- handleMouseWheel uses it to tell
-// whether a wheel event's X falls in the chat column or past the divider.
-const splitSeparatorWidth = 3
+// splitSeparatorWidth is 0: View() draws NO gap of its own between the
+// chat column and the side panel/sidebar when split (see View, chatWidth/
+// sidebarWidth) -- theme.PanelFrame draws the panel's own single-column
+// divider as the FIRST column of the side panel itself (founder
+// 2026-09-25: "no boxes around boxes" — one divider, not a chatshell gap
+// plus a PanelFrame border on top of it), so X == chatWidth() is already
+// the divider/side column, not a gap before it. handleMouseWheel uses
+// this to tell whether a wheel event's X falls in the chat column or the
+// side column.
+const splitSeparatorWidth = 0
 
 // handleMouseWheel scrolls the transcript viewport, UNLESS a product
 // SidePanel is installed and the event's X falls in its column (past the
@@ -1296,9 +1427,10 @@ func isCanceled(err error) bool {
 
 func (m *Model) resize() {
 	m.transcript.SetSize(m.chatWidth(), m.historyHeight())
-	m.input.SetWidth(max(1, m.chatWidth()-2))
+	composerCols, _ := theme.ComposerFrameSize()
+	m.input.SetWidth(max(1, m.chatWidth()-composerCols))
 	if m.sidePanel == nil && m.sidebar.Visible() {
-		m.sidebar.SetWidth(m.sidebarWidth())
+		m.sidebar.SetWidth(m.panelInnerWidth(m.sidebarWidth()))
 	}
 }
 
@@ -1316,23 +1448,36 @@ func (m *Model) sidebarWidth() int {
 	if !m.splitEnabled() {
 		return 0
 	}
-	return max(1, m.width-2-m.chatWidth()-1)
+	// The trailing "-1" this used to subtract dated back to
+	// theme.PanelFrame's own single-column "│" divider, reserved here on
+	// TOP of chatWidth()'s own budget. PanelFrame no longer draws
+	// anything of its own outside the OUTER width panelView already
+	// passes it (its 2-column gap+marker come out of THAT budget, via
+	// panelInnerWidth) -- so the panel's own outer width is simply
+	// whatever remains after chatWidth(), with no separate frame
+	// allowance here. Kept as -1 after this round-10 gap/marker redesign
+	// would have shrunk the panel's usable content by one extra column
+	// for no reason, tipping tabStripHeader from its full label set to
+	// the short one at borderline widths -- a real r10 regression this
+	// fixes.
+	return max(1, m.width-2-m.chatWidth())
 }
 
 // historyHeight is the transcript viewport's fixed height: the terminal
 // height minus every OTHER row View() stacks around it -- the top bar
 // (topBarHeight, which a product's own WithTopBar may render as more than
 // one line), the open slash-command menu (menuHeight, 0 when it isn't
-// showing), the chip row(s) (chipsHeight), the composer's own fixed single
-// line, the status line(s) (statusSegmentHeight), and -- while Busy() --
-// the spinner's own trailing "\n" + text line View() appends after the
-// transcript (r2 review, B1: that line was previously NOT reserved, so
-// View() rendered one line taller than m.height for the entire duration of
-// a stream) -- so that View()'s total rendered height always equals
-// m.height exactly (a pre-existing gap this REQ fixes: historyHeight
-// previously assumed a constant "4" rows of chrome, silently wrong once a
-// product's top bar wrapped to more than one line, the slash-command menu
-// was open, or busy, either under- or over-filling the screen).
+// showing), the chip row(s) (chipsHeight), the composer's own content line
+// plus its theme.ComposerFrame border rows (composerHeight), the status
+// line(s) (statusSegmentHeight), and -- while Busy() -- the spinner's own
+// trailing "\n" + text line View() appends after the transcript (r2
+// review, B1: that line was previously NOT reserved, so View() rendered
+// one line taller than m.height for the entire duration of a stream) -- so
+// that View()'s total rendered height always equals m.height exactly (a
+// pre-existing gap this REQ fixes: historyHeight previously assumed a
+// constant "4" rows of chrome, silently wrong once a product's top bar
+// wrapped to more than one line, the slash-command menu was open, or busy,
+// either under- or over-filling the screen).
 //
 // historyHeight is PURE (always computed fresh from current state) -- it is
 // View() re-applying it to m.transcript's actual viewport size, on EVERY
@@ -1344,7 +1489,42 @@ func (m *Model) historyHeight() int {
 	if m.busy {
 		busySpinnerLine = 1
 	}
-	return max(1, m.height-m.topBarHeight()-m.menuHeight()-1-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine)
+	// marginRows accounts for the TWO blank rows View() inserts when the
+	// terminal is tall enough (theme.ContentMargins): one between the top
+	// bar and the content below it, one between the last transcript card
+	// and the composer. r12 briefly added a third, between the composer
+	// and the status bar; r14 (founder, verbatim: "should have no
+	// vertical margins") removed it again -- the status bar now sits
+	// directly under the composer's own bottom edge, no blank row, no
+	// statusBarVisible() branch needed here any more. Both collapse to 0
+	// below theme.MarginCollapseRows terminal rows, same as here.
+	marginRows := 2 * theme.ContentMargins(m.height)
+	return max(1, m.height-m.topBarHeight()-m.menuHeight()-m.composerHeight()-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine-marginRows)
+}
+
+// composerHeight is the composer's total rendered row count: its own
+// single content line plus theme.ComposerFrame's top/bottom border rows.
+func (m *Model) composerHeight() int {
+	_, rows := theme.ComposerFrameSize()
+	if m.composerUsesChipsAsTopEdge() {
+		// The composer's own top edge row is omitted -- the chip row
+		// immediately above it (already counted by chipsHeight) performs
+		// that role instead (see View()'s doc and theme.
+		// ComposerFrameNoTopEdge).
+		rows--
+	}
+	return 1 + rows
+}
+
+// composerUsesChipsAsTopEdge reports whether View() will render the
+// composer via theme.ComposerFrameNoTopEdge with the chip strip acting as
+// its top half-block edge, instead of theme.ComposerFrame's own top edge
+// -- true exactly when there's at least one chip AND half-block edges are
+// actually active (theme.HalfBlockEdgesActive()); in fallback mode the
+// chip row still renders as its own separate line above a full
+// ComposerFrame, unchanged from before this feature existed.
+func (m *Model) composerUsesChipsAsTopEdge() bool {
+	return len(m.chips) > 0 && theme.HalfBlockEdgesActive()
 }
 
 // topBarHeight is the rendered top bar's line count -- 1 for the default
@@ -1363,12 +1543,31 @@ func (m *Model) menuHeight() int {
 	return strings.Count(menu, "\n") + 1
 }
 
+// statusBarVisible reports whether View() renders ANY status/hints
+// segment at all -- false only when there is truly nothing to show: no
+// WithHintsProvider, no legacy WithStatusBar, and SetStatus was never
+// given non-empty text. False means View() omits BOTH the pre-status
+// margin row and the status segment itself, so the composer's own bottom
+// edge becomes the terminal's literal last row -- founder, r12, verbatim,
+// seeing the rendered result in Warp: "with no hints, the composer's
+// bottom edge must be the last screen line (no trailing empty rows);
+// with hints, the hints are the last line(s)."
+func (m *Model) statusBarVisible() bool {
+	return m.hintsProvider != nil || m.statusBarFn != nil || m.status != ""
+}
+
 // statusSegmentHeight is how many rows View()'s status segment occupies:
-// the status text's own line count when SetStatus has been given
-// something, or 1 when it hasn't -- lipgloss.JoinVertical still renders one
+// 0 when statusBarVisible() is false (nothing to show at all -- see its
+// own doc), the status text's own line count when SetStatus has been
+// given something, or 1 for an active hints/status provider whose own
+// text happens to be empty -- lipgloss.JoinVertical still renders one
 // blank row for an EMPTY final segment, same as it would for a one-line
-// one, so an empty status is not "0 rows of chrome".
+// one, so an active-but-empty status is not "0 rows of chrome" (only a
+// genuinely ABSENT one is).
 func (m *Model) statusSegmentHeight() int {
+	if !m.statusBarVisible() {
+		return 0
+	}
 	if m.status == "" {
 		return 1
 	}
@@ -1380,6 +1579,36 @@ func (m *Model) statusLines() []string {
 		return nil
 	}
 	return strings.Split(m.status, "\n")
+}
+
+// statusBarView renders the status/hints bar, in priority order: a
+// WithHintsProvider content provider (rendered through the shared
+// theme.RenderHints chrome), else a legacy WithStatusBar full-string
+// function, else the plain SetStatus text wrapped in the shared theme.Bar
+// chrome -- every path, including the true default, now renders through
+// tui/theme (founder 2026-09-25).
+func (m *Model) statusBarView() string {
+	switch {
+	case m.hintsProvider != nil:
+		hints, segments := m.hintsProvider(m.width)
+		return theme.RenderHints(m.width, hints, segments...)
+	case m.statusBarFn != nil:
+		return m.statusBarFn(m.width)
+	default:
+		// theme.Bar truncates/pads a single line; a multi-line SetStatus
+		// value (e.g. a product reporting several status rows at once) gets
+		// the same chrome applied line by line, not truncated across the
+		// whole block.
+		lines := m.statusLines()
+		if len(lines) == 0 {
+			lines = []string{""}
+		}
+		styled := make([]string, len(lines))
+		for i, line := range lines {
+			styled[i] = theme.StatusLine(m.width, line)
+		}
+		return strings.Join(styled, "\n")
+	}
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1661,15 +1890,94 @@ func (m *Model) commandMenuMatches() []Command {
 	return matches
 }
 
-// topBarView renders the top bar: a product's WithTopBar function when set,
-// or the default bold title line. Factored out of View so chipsTopY (mouse
-// hit-testing) can measure its actual rendered height instead of assuming
-// one line -- a product's own top bar is free to render more than one.
+// topBarView renders the top bar, in priority order: a WithTopBarProvider
+// content provider (rendered through the shared theme.TopBar chrome), else
+// a legacy WithTopBar full-string function, else the default themed title
+// line (theme.TopBar with just WithTitle's title, no context/items) --
+// every path (including the true default, no options at all) now renders
+// through tui/theme, so the polished look is the default, not something a
+// product opts into (founder 2026-09-25). Factored out of View so
+// chipsTopY (mouse hit-testing) can measure its actual rendered height
+// instead of assuming one line -- a legacy WithTopBar function is free to
+// render more than one.
 func (m *Model) topBarView() string {
-	if m.topBarFn != nil {
+	switch {
+	case m.topBarProvider != nil:
+		title, context, items := m.topBarProvider(m.width)
+		return theme.TopBar(m.width, title, context, items)
+	case m.topBarFn != nil:
 		return m.topBarFn(m.width)
+	default:
+		return theme.TopBar(m.width, m.title, "", nil)
 	}
-	return lipgloss.NewStyle().Bold(true).Render(m.title)
+}
+
+// View renders the chat screen. It re-applies resize() FIRST, on every
+// call (r2 review, B1) -- not only in response to WindowSizeMsg/F6/Ctrl+
+// Left/Right/a chip-list change, the only events that previously called
+// it -- because historyHeight() (and therefore how tall the transcript
+// SHOULD be) also depends on state that changes without going through any
+// of those: typing "/" opens the slash-command menu, SetStatus changes the
+// status segment's height, and SetBusy(true)/StartStream reserves the
+// spinner line. Without this, m.transcript's ACTUAL viewport size (set via
+// SetSize, and otherwise sticky) drifts from the CURRENT historyHeight()
+// value between renders -- both the total rendered line count (over- or
+// under-filling the screen) and chipsTopY's click math (computed fresh
+// from the CURRENT historyHeight() at click time, but answering for
+// whatever was ACTUALLY drawn by the last, possibly stale, render) go
+// wrong. Calling resize() here is cheap (it only sets sizes) and
+// idempotent, so doing it unconditionally on every render is simpler and
+// more robust than hunting down every call site that can change chrome
+// height.
+// composerTextAreaStyles returns textarea styles that paint NO background
+// of their own: every StyleState field below sets at most a foreground
+// colour (never Background), so the composer's own ComposerFrame fill
+// (theme.SurfaceColors unfocused, theme.ComposerFocusColors focused) shows
+// through completely, composited via theme.PaintOver.
+//
+// This replaces bubbles' own textarea.DefaultStyles(), whose
+// Focused.CursorLine sets an OPAQUE Background (white in light mode, pure
+// black in dark mode) across the ENTIRE line the cursor sits on -- for a
+// single-line composer, that is the whole input. theme.PaintOver only
+// reasserts a fill after a bare ANSI reset; it cannot see through another
+// explicit background SGR the nested content emits, so that background
+// painted straight over the composer's own fill -- the "large bright
+// light-blue slab with a BLACK inner input line" regression a round-9
+// coordinator render caught (verbatim: typed/placeholder text was legible
+// only because it happened to sit on that unintended black band, not
+// because the composer's OWN fill was showing).
+//
+// Text/CursorLine/Placeholder foregrounds match whichever composer surface
+// is currently showing (unfocused vs focused), verified against
+// bodyTextMinRatio/placeholderMinRatio by theme.TestContrastMeetsWCAG's
+// composer pairs -- so typed text and the placeholder stay readable in
+// both focus states and both Dark variants without this package picking
+// its own colour literals (theme remains the one place that decides).
+func composerTextAreaStyles(focused bool) textarea.Styles {
+	_, blurredFG := theme.SurfaceColors()
+	_, focusedFG := theme.ComposerFocusColors()
+	placeholderFG := theme.MutedColor()
+
+	state := func(textFG color.Color) textarea.StyleState {
+		return textarea.StyleState{
+			Base:        lipgloss.NewStyle(),
+			Text:        lipgloss.NewStyle().Foreground(textFG),
+			CursorLine:  lipgloss.NewStyle().Foreground(textFG),
+			Placeholder: lipgloss.NewStyle().Foreground(placeholderFG),
+			Prompt:      lipgloss.NewStyle(),
+			EndOfBuffer: lipgloss.NewStyle(),
+			LineNumber:  lipgloss.NewStyle(),
+		}
+	}
+	cursorFG := blurredFG
+	if focused {
+		cursorFG = focusedFG
+	}
+	return textarea.Styles{
+		Blurred: state(blurredFG),
+		Focused: state(focusedFG),
+		Cursor:  textarea.CursorStyle{Color: cursorFG, Shape: tea.CursorBlock, Blink: true},
+	}
 }
 
 // View renders the chat screen. It re-applies resize() FIRST, on every
@@ -1691,18 +1999,37 @@ func (m *Model) topBarView() string {
 // height.
 func (m *Model) View() tea.View {
 	m.resize()
+	inputFocused := m.focusRing.Zone() == focus.ZoneInput
+	m.input.SetStyles(composerTextAreaStyles(inputFocused))
 	top := m.topBarView()
 	history := m.transcript.View()
 	if m.busy {
 		history += "\n" + m.spinner.View() + " thinking…"
 	}
-	composer := m.input.View()
+	composer := theme.ComposerFrame(m.chatWidth(), m.input.View(), inputFocused)
+	if m.composerUsesChipsAsTopEdge() {
+		composer = theme.ComposerFrameNoTopEdge(m.chatWidth(), m.input.View(), inputFocused)
+	}
 	menu := m.commandMenuView()
 	chatParts := []string{history}
 	if menu != "" {
 		chatParts = append(chatParts, menu)
 	}
-	if chips := m.chipsView(m.chatWidth()); chips != "" {
+	// One blank row between the last transcript card and whatever comes
+	// next (founder 2026-09-25 margins ruling), collapsing under
+	// theme.MarginCollapseRows terminal rows -- historyHeight() reserves
+	// the matching row(s), so this never over- or under-fills the screen.
+	// Placed BEFORE the chip row (not between chips and the composer): a
+	// chip strip is logically part of the composer -- founder, r10,
+	// verbatim, on seeing a blank row land there instead: "it should be
+	// part of the composer. There is unexpected empty line between
+	// border/chips line and the text line" — the composer/chips block
+	// must sit flush together, whatever margin exists goes above ALL of
+	// it.
+	for range theme.ContentMargins(m.height) {
+		chatParts = append(chatParts, "")
+	}
+	if chips := m.chipsView(m.chatWidth(), inputFocused); chips != "" {
 		// Chips render above the input, closest to the composer -- after
 		// the slash-command menu (which sits directly above the input only
 		// while no chips are focused-adjacent) and before it.
@@ -1713,13 +2040,38 @@ func (m *Model) View() tea.View {
 	body := chat
 	if m.splitEnabled() {
 		side := m.panelView(m.sidebarWidth(), m.focusRing.Zone() == focus.ZoneSidebar)
-		body = lipgloss.JoinHorizontal(lipgloss.Top, chat, " │ ", side)
+		// No manual glue between chat and side: theme.PanelFrame already
+		// draws the one divider between them (founder 2026-09-25: "no
+		// boxes around boxes" — a single vertical divider, not a second
+		// one from chatshell on top of it).
+		body = lipgloss.JoinHorizontal(lipgloss.Top, chat, side)
 	}
-	status := strings.Join(m.statusLines(), "\n")
-	if m.statusBarFn != nil {
-		status = m.statusBarFn(m.width)
+	// One blank row between the top bar and the content below it, for
+	// BOTH columns at once -- a single full-width blank row here sits
+	// above the already-joined chat+side body, so one row of chatshell's
+	// own margin logic covers the "both columns" requirement without the
+	// side panel needing to know about margins itself.
+	topParts := []string{top}
+	for range theme.ContentMargins(m.height) {
+		topParts = append(topParts, "")
 	}
-	content := lipgloss.JoinVertical(lipgloss.Left, top, body, status)
+	// The status bar sits DIRECTLY under the composer's own bottom edge --
+	// NO blank row between them -- and is the LAST part joined below, with
+	// nothing after it, so it always lands on the terminal's own last row.
+	// Founder, r14, verbatim, superseding r12's "blank row above the
+	// status bar" ruling: "Status panel should be aligned with composer
+	// border, not composer text and should have no vertical margins."
+	// With nothing to show at all (statusBarVisible() false), no blank
+	// status placeholder is appended either, so the COMPOSER's own bottom
+	// edge becomes the terminal's last row instead (founder, r12, same
+	// round: "with no hints, the composer's bottom edge must be the last
+	// screen line (no trailing empty rows)").
+	parts := append([]string{}, topParts...)
+	parts = append(parts, body)
+	if m.statusBarVisible() {
+		parts = append(parts, m.statusBarView())
+	}
+	content := lipgloss.JoinVertical(lipgloss.Left, parts...)
 	if n := len(m.overlays); n > 0 {
 		content = m.renderOverlay(content, m.overlays[n-1])
 	}

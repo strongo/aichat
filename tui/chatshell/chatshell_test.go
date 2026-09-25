@@ -10,6 +10,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
@@ -17,6 +18,7 @@ import (
 	"github.com/strongo/aichat/tui/focus"
 	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
+	"github.com/strongo/aichat/tui/theme"
 	"github.com/strongo/aichat/tui/transcript"
 )
 
@@ -91,6 +93,44 @@ func newTestShell(handler Handler) *Model {
 	m := New(handler)
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	return m
+}
+
+// TestInitRequestsBackgroundColorAndUpdateAppliesIt covers the r10
+// founder ruling: "derive surface tints from the ACTUAL terminal
+// background ... Chatshell applies the message; products do nothing." A
+// product never sends tea.BackgroundColorMsg itself, but Init's own
+// tea.RequestBackgroundColor should always be part of the batch it
+// returns, and Update must apply whatever answer arrives via
+// theme.SetTerminalBackground.
+func TestInitRequestsBackgroundColorAndUpdateAppliesIt(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h)
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("Init() returned a nil Cmd")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init()'s Cmd produced %T, want a tea.BatchMsg", msg)
+	}
+	// tea.RequestBackgroundColor's own Msg type (backgroundColorMsg) is
+	// unexported -- tea's runtime is what turns it into the real terminal
+	// query and, later, the real tea.BackgroundColorMsg answer this test
+	// applies below. The observable contract from here is just that
+	// Init's batch carries a SECOND command alongside textarea.Blink (the
+	// background request), which tea.RequestBackgroundColor itself IS
+	// (see Init's own doc).
+	if len(batch) < 2 {
+		t.Fatalf("Init()'s batch has %d commands, want >= 2 (textarea.Blink + tea.RequestBackgroundColor)", len(batch))
+	}
+
+	prev := theme.Dark
+	t.Cleanup(func() { theme.SetTerminalBackground(nil); theme.SetDark(prev) })
+	m.Update(tea.BackgroundColorMsg{Color: lipgloss.Color("#1e222b")})
+	if got := theme.TerminalBackground(); got != lipgloss.Color("#1e222b") {
+		t.Fatalf("theme.TerminalBackground() = %#v after BackgroundColorMsg, want the reported colour", got)
+	}
 }
 
 func TestEnterSubmitsAndAppendsUserMessage(t *testing.T) {
@@ -325,6 +365,22 @@ func TestOptionsConfigureModel(t *testing.T) {
 	view := m.sidebar.View(30, false)
 	if !strings.Contains(view, "R:X") {
 		t.Fatalf("sidebar renderer not applied: %q", view)
+	}
+}
+
+// TestWithSidebarTitleSetsHeaderRegardlessOfOptionOrder covers
+// WithSidebarTitle directly, in BOTH option orders -- WithSidebarRenderer
+// replaces m.sidebar wholesale, so it must preserve a title
+// WithSidebarTitle already set (see WithSidebarRenderer's own doc).
+func TestWithSidebarTitleSetsHeaderRegardlessOfOptionOrder(t *testing.T) {
+	renderer := func(ref session.EntityRef, width int) string { return ref.Title }
+	titleFirst := New(&fakeHandler{}, WithSidebarTitle("My Panel"), WithSidebarRenderer(renderer))
+	if got := titleFirst.sidebar.Title(); got != "My Panel" {
+		t.Fatalf("title-then-renderer: sidebar title = %q, want %q", got, "My Panel")
+	}
+	rendererFirst := New(&fakeHandler{}, WithSidebarRenderer(renderer), WithSidebarTitle("My Panel"))
+	if got := rendererFirst.sidebar.Title(); got != "My Panel" {
+		t.Fatalf("renderer-then-title: sidebar title = %q, want %q", got, "My Panel")
 	}
 }
 
@@ -1099,6 +1155,75 @@ func TestWithTopBarAndStatusBarOverrideDefaults(t *testing.T) {
 	}
 	if !strings.Contains(content, "STATUS") {
 		t.Error("expected product-rendered status bar in the view")
+	}
+}
+
+func TestWithTopBarProviderAndHintsProviderOverrideDefaults(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h,
+		WithTopBarProvider(func(width int) (string, string, []theme.MenuItem) {
+			return "TitleFromProvider", "CtxFromProvider", []theme.MenuItem{{Label: "Sessions", Active: true}}
+		}),
+		WithHintsProvider(func(width int) ([]theme.Hint, []string) {
+			return []theme.Hint{{Key: "Enter", Label: "send"}}, []string{"seg-one"}
+		}),
+	)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	content := ansi.Strip(m.View().Content)
+	for _, want := range []string{"TitleFromProvider", "CtxFromProvider", "Sessions", "Enter", "send", "seg-one"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("expected view to contain %q, got:\n%s", want, content)
+		}
+	}
+}
+
+func TestTopBarProviderTakesPriorityOverLegacyWithTopBar(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h,
+		WithTopBar(func(width int) string { return "LEGACY-TOP" }),
+		WithTopBarProvider(func(width int) (string, string, []theme.MenuItem) {
+			return "PROVIDER-TOP", "", nil
+		}),
+	)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	content := m.View().Content
+	if strings.Contains(content, "LEGACY-TOP") {
+		t.Error("legacy WithTopBar should be shadowed by WithTopBarProvider")
+	}
+	if !strings.Contains(content, "PROVIDER-TOP") {
+		t.Error("expected WithTopBarProvider content in the view")
+	}
+}
+
+func TestHintsProviderTakesPriorityOverLegacyWithStatusBar(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h,
+		WithStatusBar(func(width int) string { return "LEGACY-STATUS" }),
+		WithHintsProvider(func(width int) ([]theme.Hint, []string) {
+			return []theme.Hint{{Key: "K", Label: "provider-hint"}}, nil
+		}),
+	)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	content := ansi.Strip(m.View().Content)
+	if strings.Contains(content, "LEGACY-STATUS") {
+		t.Error("legacy WithStatusBar should be shadowed by WithHintsProvider")
+	}
+	if !strings.Contains(content, "provider-hint") {
+		t.Error("expected WithHintsProvider content in the view")
+	}
+}
+
+func TestDefaultTopBarAndStatusBarRenderThroughTheme(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithTitle("PlainTitle"))
+	m.SetStatus("plain status")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	content := ansi.Strip(m.View().Content)
+	if !strings.Contains(content, "PlainTitle") {
+		t.Error("expected default title in the view")
+	}
+	if !strings.Contains(content, "plain status") {
+		t.Error("expected default status text in the view")
 	}
 }
 
@@ -2002,6 +2127,24 @@ func TestHandleMarkdownRenderTickIgnoresStaleTick(t *testing.T) {
 	}
 	if m.markdownTickPending {
 		t.Fatal("handleMarkdownRenderTick should still clear markdownTickPending even when it no-ops on the render")
+	}
+}
+
+// TestStatusLinesAndStatusBarViewDefensiveEmptyBranches covers
+// statusLines()'s and statusBarView()'s own empty-status fallbacks
+// DIRECTLY: r12's statusBarVisible() gate means View() itself never
+// reaches them any more (with nothing to show at all, View() skips
+// calling statusBarView() entirely -- see statusBarVisible's own doc),
+// but both methods stay defensively correct for any OTHER caller that
+// might invoke them with an empty m.status.
+func TestStatusLinesAndStatusBarViewDefensiveEmptyBranches(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	if lines := m.statusLines(); lines != nil {
+		t.Fatalf("statusLines() with empty status = %v, want nil", lines)
+	}
+	if got := m.statusBarView(); got == "" {
+		t.Fatal("statusBarView() with empty status returned empty string, want a padded blank line")
 	}
 }
 

@@ -167,3 +167,23 @@ func TestCustomRenderer(t *testing.T) {
 		t.Fatalf("view = %q", v)
 	}
 }
+
+func TestWithTitleSetsHeaderTextAndTitleGetterReturnsIt(t *testing.T) {
+	m := New(nil)
+	if got := m.Title(); got != defaultTitle {
+		t.Fatalf("Title() = %q, want default %q", got, defaultTitle)
+	}
+	m.WithTitle("My Panel")
+	if got := m.Title(); got != "My Panel" {
+		t.Fatalf("Title() = %q, want %q", got, "My Panel")
+	}
+	if v := m.View(30, false); !strings.Contains(v, "My Panel") {
+		t.Fatalf("view = %q, want it to contain the custom title", v)
+	}
+	// An empty title is a no-op (keeps whatever title was already set),
+	// not a way to blank the header out.
+	m.WithTitle("")
+	if got := m.Title(); got != "My Panel" {
+		t.Fatalf("Title() after WithTitle(\"\") = %q, want unchanged %q", got, "My Panel")
+	}
+}
