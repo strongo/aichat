@@ -564,13 +564,20 @@ func (m *Model) renderEntry(e *Entry, width int, focused bool) string {
 		if sf, ok := e.Block.(SelfFramed); ok && sf.SelfFramed() {
 			return e.Block.View(width, focused)
 		}
-		header := ""
-		if t, ok := e.Block.(Titled); ok {
-			header = t.Title()
-		}
 		role := theme.RoleBlock
 		if r, ok := e.Block.(Roled); ok {
 			role = r.Role()
+		}
+		// A Roled Block (e.g. DataTug's userMessageBlock, RoleUser) defaults
+		// to theme.HeaderFor(role) — "You" for a user card, same as a plain
+		// (non-Block) user message — so a Block never renders header-less
+		// just because it happens to carry its content through the Block
+		// path rather than Entry.Text. Titled overrides this explicitly
+		// (e.g. an HTTP document's own title); RoleBlock's own HeaderFor is
+		// "" by design (an untitled, unroled Block stays header-less).
+		header := theme.HeaderFor(role)
+		if t, ok := e.Block.(Titled); ok {
+			header = t.Title()
 		}
 		body := e.Block.View(theme.InnerWidth(width), focused)
 		return theme.Card(role, header, body, width, focused)

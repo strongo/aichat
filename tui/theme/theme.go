@@ -210,6 +210,50 @@ func HeaderFor(role Role) string {
 	}
 }
 
+// --- compositing pre-styled nested content over a themed fill ------------
+//
+// A component this package wraps (a card's Block body, a bubbles input's
+// own View(), a side panel's own row rendering) often comes back already
+// carrying its OWN ANSI styling, including its own bare SGR resets
+// ("\x1b[m"). lipgloss's Style.Render wraps a line with a colour prefix
+// ONCE, at the start, and a reset at the end — it does not know about, and
+// so cannot survive, a reset embedded partway through nested content: from
+// that reset onward the terminal falls back to its own default colours
+// until the line ends, i.e. our themed background/foreground silently
+// disappears for the rest of the line. This was a real regression twice
+// over: the composer's filled background vanished right after the input's
+// own cursor-cell reset, and a side panel row's background vanished the
+// same way. fillSGR/paintOver below are the fix: reassert (bg, fg)
+// immediately after every reset found in nested content, so the fill
+// survives whatever the nested content does internally.
+
+// fillSGR returns the raw SGR escape sequence for a (bg, fg) pair — the
+// exact bytes paintOver reasserts after every embedded reset.
+func fillSGR(bg, fg color.Color) string {
+	return ansi.NewStyle().BackgroundColor(bg).ForegroundColor(fg).String()
+}
+
+// paintOver composites content — which may already carry its own nested
+// ANSI styling and resets — onto a (bg, fg) fill: prefixed with the fill's
+// SGR sequence, with that same sequence reasserted after every bare reset
+// content contains, and a final reset at the end. Card/ComposerFrame/
+// PanelFrame/Bar all run their nested content through this before handing
+// it to lipgloss for width/padding, so the fill can never be lost partway
+// through a line regardless of what the nested content does.
+func paintOver(content string, bg, fg color.Color) string {
+	prefix := fillSGR(bg, fg)
+	painted := strings.ReplaceAll(content, "\x1b[0m", "\x1b[0m"+prefix)
+	painted = strings.ReplaceAll(painted, ansi.ResetStyle, ansi.ResetStyle+prefix)
+	return prefix + painted + ansi.ResetStyle
+}
+
+// PaintOver is paintOver, exported for a product's OWN chrome that
+// composites pre-styled nested content (e.g. its own row highlighting)
+// onto a themed background outside of Card/ComposerFrame/PanelFrame/Bar —
+// a product should reach for this instead of re-deriving the same nested-
+// reset fix locally (see the package doc above these two functions).
+func PaintOver(content string, bg, fg color.Color) string { return paintOver(content, bg, fg) }
+
 // --- cards ---------------------------------------------------------------
 //
 // Founder ruling (2026-09-25, REPLACING the earlier bordered-card design):
@@ -268,9 +312,9 @@ func Card(role Role, header, body string, width int, focused bool) string {
 		bg, fg = FocusSurfaceColors()
 		barColor = FocusColor()
 	}
-	content := body
+	content := paintOver(body, bg, fg)
 	if header != "" {
-		content = lipgloss.NewStyle().Bold(true).Background(bg).Foreground(fg).Render(header) + "\n" + body
+		content = lipgloss.NewStyle().Bold(true).Background(bg).Foreground(fg).Render(header) + "\n" + content
 	}
 	fillStyle := lipgloss.NewStyle().
 		Background(bg).
@@ -305,7 +349,7 @@ func Bar(width int, content string) string {
 	bg, fg := barColors()
 	base := lipgloss.NewStyle().Bold(true).Foreground(fg)
 	truncated := ansi.Truncate(content, max(1, width), "…")
-	return lipgloss.NewStyle().Background(bg).Width(max(1, width)).Render(base.Render(truncated))
+	return lipgloss.NewStyle().Background(bg).Width(max(1, width)).Render(paintOver(base.Render(truncated), bg, fg))
 }
 
 // MenuItem is one top-bar menu entry/tab, e.g. DataTug's "Project: Foo
@@ -416,18 +460,30 @@ func wrapTokens(tokens []string, maxWidth int) []string {
 // or not it's focused).
 const composerBarWidth = 1
 
+// composerPaddingCols/Rows is the space, in columns/rows, kept between the
+// composer's fill edge and the input's own content — founder 2026-09-25:
+// "1 line padding above/below the text ... 2 cols left padding" (kept
+// symmetric left/right, same as Card's own padding language), so the
+// composer still reads as a filled box even when the input is empty.
+const composerPaddingCols = 2
+const composerPaddingRows = 1
+
 // ComposerFrameSize returns how many extra columns/rows ComposerFrame adds
 // around its content, so a caller (chatshell's resize/historyHeight) can
-// size the inner input and reserve the right amount of screen space. Rows
-// is always 0 — a filled background needs no extra rows, unlike the
-// earlier bordered design's top/bottom border lines.
-func ComposerFrameSize() (cols, rows int) { return composerBarWidth, 0 }
+// size the inner input and reserve the right amount of screen space.
+func ComposerFrameSize() (cols, rows int) {
+	return composerBarWidth + 2*composerPaddingCols, 2 * composerPaddingRows
+}
 
 // ComposerFrame wraps a composer's rendered input view in the shared
 // filled background: SurfaceColors unfocused, FocusSurfaceColors plus a
 // left accent bar while focused — the same accent a focused card or a
 // selected panel row uses, so "the composer has focus" reads consistently
-// with every other zone.
+// with every other zone. content is run through paintOver first: a bubbles
+// input's own View() carries its own ANSI styling (cursor cell, etc.)
+// including its own resets, which would otherwise cut this fill's
+// background off partway through the line (the "lost composer background"
+// regression — see the paintOver doc above).
 func ComposerFrame(width int, content string, focused bool) string {
 	bg, fg := SurfaceColors()
 	barColor := bg
@@ -435,8 +491,12 @@ func ComposerFrame(width int, content string, focused bool) string {
 		bg, fg = FocusSurfaceColors()
 		barColor = FocusColor()
 	}
-	style := lipgloss.NewStyle().Background(bg).Foreground(fg).Width(max(1, width-composerBarWidth))
-	return addLeftBar(style.Render(content), barColor)
+	style := lipgloss.NewStyle().
+		Background(bg).
+		Foreground(fg).
+		Padding(composerPaddingRows, composerPaddingCols).
+		Width(max(1, width-composerBarWidth))
+	return addLeftBar(style.Render(paintOver(content, bg, fg)), barColor)
 }
 
 // --- panel / sidebar rows ------------------------------------------------
@@ -480,15 +540,26 @@ func PanelFrameSize() (cols, rows int) { return panelDividerWidth, 0 }
 // panel's (the default sidebar, or a product SidePanel) own content:
 // BorderColor(focused) — the same accent a focused card/composer uses —
 // so the side panel reads as "this has focus" consistently with every
-// other zone (founder 2026-09-25: "Same for ... side panel"), without a
-// full box around it. The panel's own content (e.g. tui/sidebar's own
-// header line, or a product SidePanel's own tab strip) supplies whatever
-// header/label it wants; PanelFrame only supplies the divider and the
+// other zone (founder 2026-09-25: "Same for ... side panel"). Founder
+// correction (same day, after seeing it rendered): "exactly ONE separator
+// column ... a single thin vertical line glyph, in the theme's muted
+// border colour ... no background fill, no stripes, no double lines."
+// PanelFrame draws exactly that — a foreground-only "│" glyph, one column,
+// no background of its own — never addLeftBar's filled-bg accent column
+// (right for a card/composer's focus accent, wrong here: a background-
+// filled divider is what read as a "striped grey band" against the
+// panel's own row backgrounds). The panel's own content (e.g. tui/
+// sidebar's own header line, or a product SidePanel's own tab strip)
+// supplies whatever header/label it wants and its OWN row backgrounds;
+// PanelFrame only supplies the divider and the
 // panel's background fill.
 func PanelFrame(width int, content string, focused bool) string {
-	bg, fg := SurfaceColors()
-	style := lipgloss.NewStyle().Background(bg).Foreground(fg).Width(max(1, width-panelDividerWidth))
-	return addLeftBar(style.Render(content), BorderColor(focused))
+	divider := lipgloss.NewStyle().Foreground(BorderColor(focused)).Render("│")
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		lines[i] = divider + line
+	}
+	return strings.Join(lines, "\n")
 }
 
 // --- contrast (WCAG 2.x) --------------------------------------------------

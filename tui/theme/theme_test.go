@@ -158,8 +158,45 @@ func TestComposerFrameFocusedVsUnfocused(t *testing.T) {
 
 func TestComposerFrameSize(t *testing.T) {
 	cols, rows := ComposerFrameSize()
-	if cols != 1 || rows != 0 {
-		t.Fatalf("ComposerFrameSize() = (%d, %d), want (1, 0)", cols, rows)
+	if cols != 5 || rows != 2 {
+		t.Fatalf("ComposerFrameSize() = (%d, %d), want (5, 2) -- 1-col accent bar + 2 cols padding each side, 1 row padding above/below", cols, rows)
+	}
+}
+
+// TestComposerFrameSurvivesNestedResetInContent covers the real regression
+// this round: a bubbles textinput's own View() carries its own ANSI
+// styling, including its own bare resets (its cursor cell, its placeholder
+// styling) — before paintOver, that reset cut the composer's filled
+// background off partway through the line, so the composer rendered on
+// the bare terminal background instead of its themed fill ("lost composer
+// background"). Reproduce the same shape (styled fragment + reset + more
+// text) and assert the fill's background SGR is still present AFTER that
+// embedded reset, not just at the very start of the line.
+func TestComposerFrameSurvivesNestedResetInContent(t *testing.T) {
+	nested := "\x1b[37m> \x1b[m\x1b[7;37mA\x1b[msk anything..."
+	out := ComposerFrame(40, nested, false)
+	bg, fg := SurfaceColors()
+	want := fillSGR(bg, fg)
+	// The nested fragment embeds two of its own bare resets ("\x1b[m")
+	// before its final visible text ("sk anything..."). Before paintOver,
+	// the fill's background SGR appeared only ONCE, at the very start of
+	// the line -- after the first embedded reset, the rest of the line
+	// (including "sk anything...") rendered on the bare terminal
+	// background, not the fill (the real "lost composer background"
+	// regression). paintOver reasserts the fill after every reset, so it
+	// must now appear MORE THAN ONCE, with at least one occurrence AFTER
+	// the nested content's own last reset -- i.e. still in effect for the
+	// text that follows it.
+	if strings.Count(out, want) < 2 {
+		t.Fatalf("composer fill was not reasserted after the nested content's embedded reset (want the fill SGR %q to appear more than once): %q", want, out)
+	}
+	lastReset := strings.LastIndex(out, "\x1b[7;37mA\x1b[m")
+	if lastReset < 0 {
+		t.Fatalf("nested fragment not found verbatim in output: %q", out)
+	}
+	after := out[lastReset:]
+	if !strings.Contains(after, want) {
+		t.Fatalf("composer fill not reasserted after the nested content's cursor-cell reset: %q", after)
 	}
 }
 
@@ -178,6 +215,27 @@ func TestPanelFrameSize(t *testing.T) {
 	cols, rows := PanelFrameSize()
 	if cols != 1 || rows != 0 {
 		t.Fatalf("PanelFrameSize() = (%d, %d), want (1, 0)", cols, rows)
+	}
+}
+
+// TestPanelFrameDividerIsASingleUnfilledGlyph covers a real regression:
+// PanelFrame used to reuse addLeftBar (a BACKGROUND-filled accent column,
+// right for a card/composer's focus accent) for the transcript/panel
+// divider too, which -- painted over the panel's own already-coloured row
+// backgrounds -- read as "a wide striped grey band", not a clean divider.
+// Founder correction: exactly one "│" glyph per line, coloured by
+// FOREGROUND only (BorderColor(focused)), no background SGR at all.
+func TestPanelFrameDividerIsASingleUnfilledGlyph(t *testing.T) {
+	for _, focused := range []bool{false, true} {
+		out := PanelFrame(30, "row one\nrow two", focused)
+		for i, line := range strings.Split(out, "\n") {
+			if got := strings.Count(ansi.Strip(line), "│"); got != 1 {
+				t.Fatalf("focused=%v line %d has %d '│' glyphs, want exactly 1: %q", focused, i, got, line)
+			}
+			if strings.Contains(line, "\x1b[4") { // any SGR background parameter (38..48 family starts with "4" for bg in both 256-colour "48;5;" and truecolor "48;2;")
+				t.Fatalf("focused=%v line %d carries a background SGR on the divider, want none: %q", focused, i, line)
+			}
+		}
 	}
 }
 

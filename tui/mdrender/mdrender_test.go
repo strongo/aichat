@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	glamour "charm.land/glamour/v2"
+
+	"github.com/strongo/aichat/tui/theme"
 )
 
 func TestRenderBasicMarkdown(t *testing.T) {
@@ -69,8 +71,41 @@ func TestRenderTrimsWhitespace(t *testing.T) {
 	}
 }
 
-func TestStyleDefaultsToDark(t *testing.T) {
-	if Style != "dark" {
-		t.Fatalf("Style default = %q, want %q", Style, "dark")
+func TestStyleDefaultsToEmptyAutoTrackingTheme(t *testing.T) {
+	if Style != "" {
+		t.Fatalf("Style default = %q, want empty (auto, tracks theme.Dark)", Style)
+	}
+}
+
+// TestResolvedStyleTracksThemeDarkWhenStyleUnset covers the bug this
+// replaced: glamour defaulting to a dark style regardless of tui/theme's
+// current variant, which rendered assistant markdown near-invisible on a
+// light card (pale text on a light background). With Style left at its
+// default (""), resolvedStyle must follow theme.Dark on every call.
+func TestResolvedStyleTracksThemeDarkWhenStyleUnset(t *testing.T) {
+	prevDark := theme.Dark
+	t.Cleanup(func() { theme.Dark = prevDark })
+
+	theme.Dark = true
+	if got := resolvedStyle(); got != "dark" {
+		t.Fatalf("resolvedStyle() with theme.Dark=true = %q, want %q", got, "dark")
+	}
+
+	theme.Dark = false
+	if got := resolvedStyle(); got != "light" {
+		t.Fatalf("resolvedStyle() with theme.Dark=false = %q, want %q", got, "light")
+	}
+}
+
+// TestResolvedStyleHonoursExplicitOverride covers a caller pinning Style
+// regardless of theme.Dark (e.g. "notty"/"ascii" for a non-colour terminal).
+func TestResolvedStyleHonoursExplicitOverride(t *testing.T) {
+	prevStyle, prevDark := Style, theme.Dark
+	t.Cleanup(func() { Style, theme.Dark = prevStyle, prevDark })
+
+	Style = "ascii"
+	theme.Dark = false
+	if got := resolvedStyle(); got != "ascii" {
+		t.Fatalf("resolvedStyle() with explicit Style override = %q, want %q", got, "ascii")
 	}
 }

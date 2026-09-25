@@ -870,12 +870,41 @@ type roledBlock struct{ fakeBlock }
 
 func (b *roledBlock) Role() theme.Role { return theme.RoleUser }
 
+// TestRenderEntryBlockCardUsesRoledCapability covers a Roled-but-not-Titled
+// Block (e.g. DataTug's userMessageBlock): it must get its role's default
+// header ("You" for RoleUser) exactly like a plain, non-Block user message
+// does — a Block being the carrier for a message's content is an
+// implementation detail, not a reason to lose the role header (this was a
+// real bug: DataTug's user cards rendered with no "You" header at all).
 func TestRenderEntryBlockCardUsesRoledCapability(t *testing.T) {
 	m := New()
 	blk := &roledBlock{fakeBlock{label: "b"}}
 	out := m.renderEntry(&Entry{Block: blk}, 40, false)
-	want := theme.Card(theme.RoleUser, "", blk.View(theme.InnerWidth(40), false), 40, false)
+	want := theme.Card(theme.RoleUser, theme.HeaderFor(theme.RoleUser), blk.View(theme.InnerWidth(40), false), 40, false)
 	if out != want {
-		t.Fatalf("Roled block should render with its reported role: got %q, want %q", out, want)
+		t.Fatalf("Roled block should render with its reported role's default header: got %q, want %q", out, want)
+	}
+	if !strings.Contains(ansi.Strip(out), theme.HeaderFor(theme.RoleUser)) {
+		t.Fatalf("Roled block card missing its role's default header %q: %q", theme.HeaderFor(theme.RoleUser), out)
 	}
 }
+
+// TestRenderEntryBlockRoledStillHonoursExplicitTitled covers a Block that
+// implements BOTH Roled and Titled: Titled's explicit title wins over the
+// role's default header (an HTTP-document-shaped Block, say, with its own
+// title but rendered in a role's card colour).
+func TestRenderEntryBlockRoledStillHonoursExplicitTitled(t *testing.T) {
+	m := New()
+	blk := &roledTitledBlock{roledBlock{fakeBlock{label: "b"}}}
+	out := m.renderEntry(&Entry{Block: blk}, 40, false)
+	if !strings.Contains(ansi.Strip(out), "My Title") {
+		t.Fatalf("Titled should override the role's default header: %q", out)
+	}
+	if strings.Contains(ansi.Strip(out), theme.HeaderFor(theme.RoleUser)) {
+		t.Fatalf("Titled should replace, not add to, the role's default header: %q", out)
+	}
+}
+
+type roledTitledBlock struct{ roledBlock }
+
+func (b *roledTitledBlock) Title() string { return "My Title" }

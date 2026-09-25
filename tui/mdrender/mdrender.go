@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	glamour "charm.land/glamour/v2"
+
+	"github.com/strongo/aichat/tui/theme"
 )
 
 // TermRenderer is the narrow seam Render needs from *glamour.TermRenderer —
@@ -32,13 +34,28 @@ var NewTermRenderer = func(options ...glamour.TermRendererOption) (TermRenderer,
 }
 
 // Style selects glamour's built-in style by name (see
-// glamour.WithStandardStyle: "dark", "light", "notty", "ascii", ...).
-// Defaults to "dark", matching DataTug's original renderMarkdown. A product
-// that wants to follow theme.Dark can set this from theme.Dark itself (they
-// are deliberately not wired together here — glamour's "light"/"dark"
-// style names and this package's own terminal-background choice are
-// independent axes a product may want to control separately).
-var Style = "dark"
+// glamour.WithStandardStyle: "dark", "light", "notty", "ascii", ...). Empty
+// (the default) tracks tui/theme.Dark automatically — a card's background
+// comes from theme, so rendered markdown text must too, or it goes
+// near-invisible on a light card (a dark-styled renderer defaulting to pale
+// text over theme's light surface, the bug this replaced). Set Style
+// explicitly only to pin a specific glamour style regardless of theme.Dark
+// (e.g. "notty"/"ascii" for a non-colour terminal).
+var Style = ""
+
+// resolvedStyle returns the glamour style Render actually uses: Style
+// itself when the caller pinned one, otherwise "dark"/"light" from
+// tui/theme.Dark, read fresh on every call so a runtime theme.SetDark
+// takes effect on the very next render.
+func resolvedStyle() string {
+	if Style != "" {
+		return Style
+	}
+	if theme.Dark {
+		return "dark"
+	}
+	return "light"
+}
 
 // minWordWrap is the narrowest word-wrap width Render ever asks glamour
 // for, regardless of how small width is — matching DataTug's original
@@ -57,7 +74,7 @@ const wordWrapMargin = 4
 // mdrender.Render to chatshell.WithMarkdownRenderer / transcript.
 // WithMarkdownRenderer).
 func Render(text string, width int) string {
-	renderer, err := NewTermRenderer(glamour.WithStandardStyle(Style), glamour.WithWordWrap(max(minWordWrap, width-wordWrapMargin)))
+	renderer, err := NewTermRenderer(glamour.WithStandardStyle(resolvedStyle()), glamour.WithWordWrap(max(minWordWrap, width-wordWrapMargin)))
 	if err != nil {
 		return text
 	}
