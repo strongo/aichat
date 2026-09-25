@@ -18,6 +18,7 @@
 package theme
 
 import (
+	"fmt"
 	"image/color"
 	"math"
 	"os"
@@ -435,11 +436,15 @@ const MaxInlineGridRows = 10
 // Founder ruling (2026-09-25, r9, "Margins (approved)"): a single blank
 // row between the top bar and the content below it (both the chat column
 // and, when split, the side panel column — one full-width blank row
-// achieves both at once, see chatshell's View()), a single blank row
-// between the last transcript card and the composer, and NO blank row
-// between the composer and the hints/status bar. Both blank rows collapse
-// to zero below MarginCollapseRows terminal rows, so a short terminal
-// never loses transcript space to decoration.
+// achieves both at once, see chatshell's View()), and a single blank row
+// between the last transcript card and the composer. SUPERSEDED, r12
+// (founder, verbatim, seeing the rendered result in Warp): "status line
+// should have top margin ... It should be last line on screen" — a THIRD
+// blank row now separates the composer from the hints/status bar too (the
+// r9 "NO blank row" rule is dropped), and the status bar itself is pinned
+// to the terminal's own last row, nothing rendered below it. All three
+// blank rows collapse to zero below MarginCollapseRows terminal rows, so a
+// short terminal never loses transcript space to decoration.
 
 // MarginRows is the number of blank rows chatshell inserts at each of the
 // two margin points above, when the terminal is tall enough (see
@@ -573,18 +578,94 @@ func Card(role Role, header, body string, width int, focused bool) string {
 
 // --- bars (top bar / hints-status bar) ------------------------------------
 
+// HintsInset returns the LEFT/RIGHT column padding TopBar/StatusLine keep
+// from the terminal edge — the SAME columns a Card's own text keeps
+// (cardBarWidth+CardPaddingCols on the left — where a card's own marker
+// column would sit, plus its padding; CardPaddingCols on the right) — so
+// a hint's key, and the top bar's title, both start in the same column a
+// card's text does (founder, r12, verbatim: "[status line] Should have
+// horizontal padding", coordinator's own restatement: "align its first
+// key with the card text column, same right inset"; item 3, same round:
+// give the top bar the same padding for the same alignment).
+func HintsInset() (left, right int) { return cardBarWidth + CardPaddingCols, CardPaddingCols }
+
+// insetLine pads content to width - left - right (truncating with an
+// ellipsis if it overflows) and surrounds it with left/right blank
+// columns — the shared horizontal-inset shape Bar and StatusLine both
+// build on, so a hint/title's first character always lands on the same
+// column regardless of which of the two chromes is rendering it.
+func insetLine(width int, content string, left, right int) (padded string, inner int) {
+	inner = max(1, width-left-right)
+	truncated := ansi.Truncate(content, inner, "…")
+	return strings.Repeat(" ", left) + lipgloss.NewStyle().Width(inner).Render(truncated) + strings.Repeat(" ", right), inner
+}
+
 // Bar pads content to width and fills the remainder with the shared chrome
 // background, truncating with an ellipsis if content overflows — so a bar's
 // right edge always reaches the terminal edge, whatever a product supplied.
-// content may already contain nested lipgloss-styled spans (e.g.
-// RenderHints' per-hint colouring); Bar only sets the background/width
-// frame around it, not a foreground override, so those spans' own colours
-// survive.
+// content may already contain nested lipgloss-styled spans (e.g. TopBar's
+// per-item styling); Bar only sets the background/width frame and the
+// HintsInset() horizontal padding around it, not a foreground override, so
+// those spans' own colours survive. Used by TopBar only — see StatusLine
+// for the hints/status bar's own (backgroundless) chrome.
 func Bar(width int, content string) string {
 	bg, fg := barColors()
 	base := lipgloss.NewStyle().Bold(true).Foreground(fg)
-	truncated := ansi.Truncate(content, max(1, width), "…")
-	return lipgloss.NewStyle().Background(bg).Width(max(1, width)).Render(paintOver(base.Render(truncated), bg, fg))
+	left, right := HintsInset()
+	padded, _ := insetLine(width, base.Render(content), left, right)
+	return lipgloss.NewStyle().Background(bg).Width(max(1, width)).Render(paintOver(padded, bg, fg))
+}
+
+// StatusLine renders ONE hints/status-bar row with NO background at all
+// (the terminal's own default background shows through, SGR 49) and the
+// same HintsInset() horizontal padding Bar/TopBar use — founder, r12,
+// verbatim, seeing the rendered result in Warp: "status line should have
+// top margin and have no background ... Should have horizontal padding."
+// content may already carry its own nested styling (RenderHints' per-hint
+// key/label colouring) — StatusLine adds none of its own beyond the
+// padding, so those spans' own colours are the only styling on the line;
+// unlike Bar, there is no fill to reassert after a nested reset (paintOver
+// exists to protect a BACKGROUND from an embedded reset — with none set
+// here, there is nothing for a reset to cut off).
+func StatusLine(width int, content string) string {
+	left, right := HintsInset()
+	padded, _ := insetLine(width, content, left, right)
+	return padded
+}
+
+// padRight pads content with plain trailing spaces up to width, measured
+// by ansi.StringWidth (ANSI-aware, so embedded colour codes are never
+// counted as visible columns) — a no-op when content is already width or
+// wider. Deliberately NOT lipgloss's own Style.Width(): that wraps
+// content onto MULTIPLE lines once it exceeds the given width (it is a
+// wrapping primitive, not a non-destructive pad) — wrong here, and the
+// bug hintsWrappedLine below hit before switching to this: an atomic
+// over-wide hint token got split mid-word across two physical lines
+// instead of staying on its own single (over-wide) line.
+func padRight(content string, width int) string {
+	if w := ansi.StringWidth(content); w < width {
+		return content + strings.Repeat(" ", width-w)
+	}
+	return content
+}
+
+// hintsWrappedLine pads ONE already-wrapped RenderHints line to width with
+// HintsInset()'s left/right blank columns, WITHOUT truncating it — unlike
+// StatusLine, wrapTokens already guarantees this specific line fits its
+// own packing budget (width - HintsInset() columns), so truncating it
+// again here would be redundant at best; at worst, for the ONE deliberate
+// exception — a single hint pair or word wider than the whole line, which
+// wrapTokens still gives its own line rather than cutting (see
+// wrapTokens' own doc: "never cut a key/label pair" / "never truncated
+// mid-word with an ellipsis") — re-truncating here would silently defeat
+// that guarantee, and lipgloss's own Width() WRAPS rather than pads (see
+// padRight's own doc), which would defeat it differently. That one line
+// is simply allowed to render WIDER than width instead; a lost hint or a
+// mid-word cut is worse either way.
+func hintsWrappedLine(width int, content string) string {
+	left, right := HintsInset()
+	inner := max(1, width-left-right)
+	return strings.Repeat(" ", left) + padRight(content, inner) + strings.Repeat(" ", right)
 }
 
 // MenuItem is one top-bar menu entry/tab, e.g. DataTug's "Project: Foo
@@ -653,13 +734,14 @@ func RenderHints(width int, hints []Hint, segments ...string) string {
 	for _, h := range hints {
 		tokens = append(tokens, hintToken{text: keyStyle.Render(h.Key) + " " + labelStyle.Render(h.Label), splittable: false})
 	}
-	lines := wrapTokens(tokens, max(1, width))
+	left, right := HintsInset()
+	lines := wrapTokens(tokens, max(1, width-left-right))
 	if len(lines) == 0 {
-		return Bar(width, "")
+		return hintsWrappedLine(width, "")
 	}
 	styled := make([]string, len(lines))
 	for i, line := range lines {
-		styled[i] = Bar(width, line)
+		styled[i] = hintsWrappedLine(width, line)
 	}
 	return strings.Join(styled, "\n")
 }
@@ -760,6 +842,33 @@ const composerPaddingRows = 1
 // size the inner input and reserve the right amount of screen space.
 func ComposerFrameSize() (cols, rows int) {
 	return composerBarWidth + 2*composerPaddingCols, 2 * composerPaddingRows
+}
+
+// ComposerTextColumn returns the absolute column (0-based, from the
+// composer's own left edge — the marker column) where the composer's
+// typed text / placeholder starts: the marker column plus the left
+// padding. A caller drawing content ABOVE the input on the composer's own
+// surface (chatshell's chip strip) uses this to line its own content up
+// with that same column — founder, r11 (Warp feedback, verbatim): "I
+// think first chip text should be aligned with text of the message."
+func ComposerTextColumn() int { return composerBarWidth + composerPaddingCols }
+
+// ComposerChipLeadingFill returns how many "▄" edge-filler columns belong
+// between the composer's marker column and the first attachment chip's
+// own cell, so that chip's LABEL — which starts 1 column into the cell,
+// after the cell's own leading inner-padding space — lands exactly on
+// ComposerTextColumn(). It also guarantees the composer's own top-left
+// corner (marker + at least one edge-filler column) is always rendered
+// before any chip, never overdrawn by one — founder, r11: "Attachment
+// chips should have margin on left so left top corner is always
+// rendered."
+func ComposerChipLeadingFill() int { return composerPaddingCols - 1 }
+
+// ComposerChipMarker renders the same focus-marker cell (see markerCell)
+// the composer's own edges show, for a caller (chatshell's chip strip)
+// that draws the composer's top edge itself when chips are present.
+func ComposerChipMarker(focused bool) string {
+	return markerCell("▖", composerBarWidth, focused)
 }
 
 // composerTintAmount is how far the composer's OWN unfocused fill blends
@@ -950,29 +1059,66 @@ func PanelHeader(title string) string {
 // focusing the panel never shifts its width.
 const panelGapWidth = 2
 
+// panelBarWidth is the 1-column left accent bar PanelFrame reserves via
+// surfaceFill — see cardBarWidth's identical reasoning.
+const panelBarWidth = 1
+
 // PanelFrameSize returns how many extra columns/rows PanelFrame adds
 // around its content, so a caller (chatshell's panel sizing) can size the
 // panel's own content and reserve the right amount of screen space —
-// mirroring ComposerFrameSize. Rows is always 0.
-func PanelFrameSize() (cols, rows int) { return panelGapWidth, 0 }
+// mirroring ComposerFrameSize. rows is a CONSTANT 2 regardless of
+// HalfBlockEdgesActive() — the SAME vPad-vs-edges equalisation
+// ComposerFrameSize relies on (see surfaceFill's own doc): 1 padding row
+// top+bottom in fallback mode, or the top/bottom half-block edge rows in
+// half-block mode — either way exactly 2 extra rows, so a caller's row
+// budget never has to branch on which mode is active.
+func PanelFrameSize() (cols, rows int) { return panelGapWidth, 2 }
 
-// PanelFrame draws the gap between the transcript and a side panel's (the
-// default sidebar, or a product SidePanel) own content: panelGapWidth
-// columns, the rightmost reserved for the SAME focus marker idiom Card/
-// ComposerFrame use (a plain "▌" in FocusColor() when the panel has
-// focus, blank otherwise — no bar, no divider glyph, no background of
-// its own — see markerCell's own doc). The panel's own content (e.g.
-// tui/sidebar's own header line, or a product SidePanel's own tab strip)
-// supplies its own surface fill/row backgrounds and whatever header/label
-// it wants; PanelFrame only supplies the gap and the marker.
-func PanelFrame(width int, content string, focused bool) string {
-	blank := strings.Repeat(" ", panelGapWidth-1)
-	marker := markerCell("▌", 1, focused)
-	lines := strings.Split(content, "\n")
-	for i, line := range lines {
-		lines[i] = blank + marker + line
+// PanelFrame renders side-panel content (SidePanel or the default
+// sidebar) as a single FULL-HEIGHT card surface, spanning EXACTLY height
+// rows of content (PanelFrameSize's own row overhead is added on top of
+// that, same as Card/ComposerFrame) — founder, r12 (Warp feedback,
+// verbatim, seeing the rendered result): "side panel should be full
+// height card." It reuses the SAME surfaceFill machinery Card/
+// ComposerFrame do: theme.SurfaceColors() fill (a plain neutral surface —
+// a panel has no per-role tint the way a message card does), the SAME
+// "▌"/"▖"/"▘" focus marker (spanning every row — content rows AND the
+// half-block/padding edge rows), and the SAME half-block top/bottom
+// edges when HalfBlockEdgesActive(). header renders bold as the surface's
+// own first content row (when non-empty); any row of the surface past
+// what header+content actually fill is left blank SURFACE, never
+// terminal background — founder, verbatim: "the empty space below its
+// content filled with the panel surface". content itself supplies only
+// its OWN per-row styling (e.g. tui/sidebar's SelectedRow highlight) —
+// the surrounding fill is entirely PanelFrame's job now, superseding the
+// earlier "content supplies its own surface fill" contract. A single
+// blank column of plain terminal background (no marker of its own) sits
+// before the surface, matching the gap panelGapWidth has always kept
+// between the transcript and the panel (see panelGapWidth's own doc) —
+// surfaceFill's own marker column is the OTHER of the two gap columns.
+func PanelFrame(width, height int, header, content string, focused bool) string {
+	bg, fg := SurfaceColors()
+	width, height = max(1, width), max(1, height)
+	lines := make([]string, height)
+	start := 0
+	if header != "" {
+		lines[0] = lipgloss.NewStyle().Bold(true).Render(header)
+		start = 1
 	}
-	return strings.Join(lines, "\n")
+	for i, line := range strings.Split(content, "\n") {
+		row := start + i
+		if row >= height {
+			break
+		}
+		lines[row] = line
+	}
+	body := paintOver(strings.Join(lines, "\n"), bg, fg)
+	card := surfaceFill(bg, fg, focused, panelBarWidth, 0, body, max(1, width-1), true, true)
+	cardLines := strings.Split(card, "\n")
+	for i, line := range cardLines {
+		cardLines[i] = " " + line
+	}
+	return strings.Join(cardLines, "\n")
 }
 
 // --- contrast (WCAG 2.x) --------------------------------------------------
@@ -1033,6 +1179,19 @@ func ContrastPairs() []ContrastPair {
 		pairs = append(pairs,
 			ContrastPair{Name: string(role) + " card body/header text", FG: fg, BG: bg, MinimumRatio: bodyTextMinRatio},
 			ContrastPair{Name: string(role) + " focused card border vs card background", FG: FocusColor(), BG: bg, MinimumRatio: nonTextMinRatio},
+			// mdrender's own inline-code style reads Hex(AccentColor()) as
+			// its Code.Color, with NO background of its own (transparent —
+			// inherits whichever card it's rendered inside) — so the pair
+			// that must clear WCAG is AccentColor() against EVERY role's
+			// own card background, not a single fixed background. Founder,
+			// r12: "verify glamour's inline-code colour ... meets the
+			// >= 4.5:1 rule in both themes" (a real "10:00–10:15" code span
+			// rendering illegibly red was the report this replaces —
+			// glamour's own built-in "dark"/"light" styles pick a fixed
+			// ANSI-256 red/pink, color 203, that clears 4.5:1 against
+			// glamour's OWN dark code-background by only a hair and fails
+			// outright against its light one).
+			ContrastPair{Name: "inline code text (AccentColor) on " + string(role) + " card background", FG: AccentColor(), BG: bg, MinimumRatio: bodyTextMinRatio},
 		)
 	}
 
@@ -1051,10 +1210,20 @@ func ContrastPairs() []ContrastPair {
 
 	barBG, barFG := barColors()
 	pairs = append(pairs,
-		ContrastPair{Name: "top/status bar text", FG: barFG, BG: barBG, MinimumRatio: bodyTextMinRatio},
-		ContrastPair{Name: "hint key (AccentColor) on bar background", FG: AccentColor(), BG: barBG, MinimumRatio: bodyTextMinRatio},
-		ContrastPair{Name: "hint label (MutedColor) on bar background", FG: MutedColor(), BG: barBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "top bar text", FG: barFG, BG: barBG, MinimumRatio: bodyTextMinRatio},
 		ContrastPair{Name: "focus border vs bar background", FG: FocusColor(), BG: barBG, MinimumRatio: nonTextMinRatio},
+	)
+
+	// The hints/status bar itself paints NO background any more (theme.
+	// StatusLine — founder, r12, verbatim: "status line ... have no
+	// background") — its key/label text sits directly on whatever the
+	// terminal's own background is, so THIS is the pair that must clear
+	// WCAG now, not barColors()'s bg (which the status bar no longer
+	// uses at all).
+	termBG := TerminalBackground()
+	pairs = append(pairs,
+		ContrastPair{Name: "hint key (AccentColor) on terminal background", FG: AccentColor(), BG: termBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "hint label (MutedColor) on terminal background", FG: MutedColor(), BG: termBG, MinimumRatio: bodyTextMinRatio},
 	)
 
 	composerBG, composerFG := ComposerColors()
@@ -1134,6 +1303,17 @@ func SurfaceDeltaPairs() []SurfaceDeltaPair {
 		SurfaceDeltaPair{Name: "composer fill (focused) vs terminal background", Surface: focusComposerBG, MinimumRatio: minComposerSurfaceDelta, MaximumRatio: maxComposerSurfaceDelta},
 	)
 	return pairs
+}
+
+// Hex renders c as a "#rrggbb" string — for a caller that needs a plain
+// hex literal rather than a color.Color (e.g. mdrender's own glamour
+// ansi.StyleConfig, whose StylePrimitive.Color is a *string), so it can
+// still read every colour from this package rather than hard-coding one
+// of its own (this package's own no-hard-coded-literal rule, applied to
+// an external library's string-typed config).
+func Hex(c color.Color) string {
+	r, g, b, _ := c.RGBA()
+	return fmt.Sprintf("#%02x%02x%02x", r>>8, g>>8, b>>8)
 }
 
 // relativeLuminance computes a colour's WCAG 2.x relative luminance from

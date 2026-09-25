@@ -368,6 +368,22 @@ func TestOptionsConfigureModel(t *testing.T) {
 	}
 }
 
+// TestWithSidebarTitleSetsHeaderRegardlessOfOptionOrder covers
+// WithSidebarTitle directly, in BOTH option orders -- WithSidebarRenderer
+// replaces m.sidebar wholesale, so it must preserve a title
+// WithSidebarTitle already set (see WithSidebarRenderer's own doc).
+func TestWithSidebarTitleSetsHeaderRegardlessOfOptionOrder(t *testing.T) {
+	renderer := func(ref session.EntityRef, width int) string { return ref.Title }
+	titleFirst := New(&fakeHandler{}, WithSidebarTitle("My Panel"), WithSidebarRenderer(renderer))
+	if got := titleFirst.sidebar.Title(); got != "My Panel" {
+		t.Fatalf("title-then-renderer: sidebar title = %q, want %q", got, "My Panel")
+	}
+	rendererFirst := New(&fakeHandler{}, WithSidebarRenderer(renderer), WithSidebarTitle("My Panel"))
+	if got := rendererFirst.sidebar.Title(); got != "My Panel" {
+		t.Fatalf("renderer-then-title: sidebar title = %q, want %q", got, "My Panel")
+	}
+}
+
 func TestAppendHelpers(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)

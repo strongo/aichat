@@ -2,6 +2,7 @@ package chatshell
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -605,10 +606,10 @@ func TestClearTranscriptDropsComposerUndoAndChipFocus(t *testing.T) {
 func TestChipRowsEmptyWithoutChips(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
-	if rows := m.chipRows(80); rows != nil {
-		t.Fatalf("chipRows = %+v, want nil", rows)
+	if cells, overflow := m.chipRow(80); cells != nil || overflow != 0 {
+		t.Fatalf("chipRow = %+v, %d, want nil, 0", cells, overflow)
 	}
-	if v := m.chipsView(80); v != "" {
+	if v := m.chipsView(80, false); v != "" {
 		t.Fatalf("chipsView = %q, want empty", v)
 	}
 	if h := m.chipsHeight(80); h != 0 {
@@ -616,23 +617,31 @@ func TestChipRowsEmptyWithoutChips(t *testing.T) {
 	}
 }
 
-func TestChipRowsWrapAcrossMultipleRowsAtNarrowWidth(t *testing.T) {
+// TestChipRowNeverWrapsOverflowsInsteadAtNarrowWidth locks in the r11
+// redesign (founder, verbatim: "keep one row: show as many chips as fit
+// plus a '+N' chip ... never overflow or clip mid-chip"): a width too
+// narrow for all three chips folds whatever doesn't fit into a trailing
+// "+N" count rather than wrapping to a second row.
+func TestChipRowNeverWrapsOverflowsInsteadAtNarrowWidth(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
 	m.SetChips(threeChips())
-	rows := m.chipRows(12) // narrow enough that each chip needs its own row
-	if len(rows) < 2 {
-		t.Fatalf("chipRows(12) = %+v, want at least 2 rows", rows)
+	cells, overflow := m.chipRow(24) // narrow enough that not all 3 fit
+	if len(cells)+overflow != 3 {
+		t.Fatalf("chipRow(24) cells=%+v overflow=%d, want cells+overflow == 3", cells, overflow)
 	}
-	total := 0
-	for _, row := range rows {
-		total += len(row)
+	if overflow == 0 {
+		t.Fatalf("chipRow(24) overflow = 0, want > 0 at this width (regression: wrapped instead of overflowing)")
 	}
-	if total != 3 {
-		t.Fatalf("total chips across rows = %d, want 3", total)
+	if h := m.chipsHeight(24); h != 1 {
+		t.Fatalf("chipsHeight(24) = %d, want 1 (chip row never wraps to a second line)", h)
 	}
-	if h := m.chipsHeight(12); h != len(rows) {
-		t.Fatalf("chipsHeight(12) = %d, want %d", h, len(rows))
+	view := m.chipsView(24, false)
+	if !strings.Contains(view, "+"+strconv.Itoa(overflow)) {
+		t.Fatalf("chipsView(24) = %q, want a %q overflow pill", view, "+"+strconv.Itoa(overflow))
+	}
+	if w := ansi.StringWidth(view); w != 24 {
+		t.Fatalf("chipsView(24) width = %d, want 24 (never overflow the terminal)", w)
 	}
 }
 
@@ -640,12 +649,12 @@ func TestChipRowsTruncatesOverlongLabel(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
 	m.SetChips([]Chip{{ID: "a", Label: strings.Repeat("x", 200)}})
-	rows := m.chipRows(20)
-	if len(rows) != 1 || len(rows[0]) != 1 {
-		t.Fatalf("chipRows = %+v", rows)
+	cells, _ := m.chipRow(20)
+	if len(cells) != 1 {
+		t.Fatalf("chipRow = %+v", cells)
 	}
-	if !strings.Contains(rows[0][0].text, chipCloseGlyph) {
-		t.Fatalf("truncated chip lost its close glyph: %q", rows[0][0].text)
+	if !strings.Contains(cells[0].text, chipCloseGlyph) {
+		t.Fatalf("truncated chip lost its close glyph: %q", cells[0].text)
 	}
 }
 
@@ -654,7 +663,7 @@ func TestChipsViewHighlightsFocusedChip(t *testing.T) {
 	m := newTestShell(h)
 	m.SetChips(threeChips())
 	m.chipFocus = 1
-	view := m.chipsView(80)
+	view := m.chipsView(80, false)
 	if !strings.Contains(view, "Customer") || !strings.Contains(view, "Invoice") || !strings.Contains(view, "Order") {
 		t.Fatalf("chipsView = %q, missing a label", view)
 	}
@@ -676,13 +685,15 @@ func TestHistoryHeightShrinksAsChipRowsAppearAndGrowsBackAsTheyClear(t *testing.
 	}
 }
 
-// TestComposerShrinksAsWrappedAttachmentsAreRemoved (m2, r2 review) is an
-// exact port of DataTug's own test of the same name
-// (origin/main:pkg/chat/workspace_test.go): width 62, three long chip
-// labels wrapping across two rows, the third (second-row) chip removed
-// grows historyHeight by exactly 1, and clearing every remaining chip grows
-// it by exactly 2 (from the original 2-row baseline).
-func TestComposerShrinksAsWrappedAttachmentsAreRemoved(t *testing.T) {
+// TestComposerShrinksOnceAsChipsAppearAndGrowsBackWhenTheyClear supersedes
+// the old DataTug-ported "wraps across two rows" test: r11 replaced
+// multi-row chip wrapping with a single row + "+N" overflow (founder,
+// verbatim: "keep one row"), so historyHeight now only ever changes by
+// ONE row's worth (0 -> 1) as chips appear, regardless of how many chips
+// there are or whether some of them overflow into "+N" -- removing chips
+// one at a time, even down through the overflow threshold, never changes
+// it again until the very last chip is gone.
+func TestComposerShrinksOnceAsChipsAppearAndGrowsBackWhenTheyClear(t *testing.T) {
 	h := &fakeHandler{}
 	m := New(h)
 	m.Update(tea.WindowSizeMsg{Width: 62, Height: 30})
@@ -691,34 +702,34 @@ func TestComposerShrinksAsWrappedAttachmentsAreRemoved(t *testing.T) {
 		{ID: "2", Label: "Second customer table"},
 		{ID: "3", Label: "Third customer table"},
 	}
+	before := m.historyHeight()
 	m.SetChips(chips)
 	width := m.chatWidth()
-	if got := len(m.chipRows(width)); got != 2 {
-		t.Fatalf("chip rows = %d, want 2", got)
+	if got := m.chipsHeight(width); got != 1 {
+		t.Fatalf("chipsHeight = %d, want 1 (single row, never wraps)", got)
 	}
-	initialHeight := m.historyHeight()
-	if !strings.Contains(m.chipsView(width), "Third customer table") {
-		t.Fatal("wrapped chip is not visible")
+	during := m.historyHeight()
+	if during != before-1 {
+		t.Fatalf("historyHeight() = %d, want %d (exactly one row reserved for chips)", during, before-1)
 	}
-	lastChip := m.chipRows(width)[1][0]
-	if lastChip.index != 2 {
-		t.Fatalf("second-row chip index = %d, want 2 (Third customer table)", lastChip.index)
+	if !strings.Contains(m.chipsView(width, false), "First customer table") {
+		t.Fatal("first chip is not visible")
 	}
 
 	m.SetChips(chips[:2])
-	if got := len(m.chipRows(width)); got != 1 {
-		t.Fatalf("chip rows after removing the third chip = %d, want 1", got)
+	if got := m.chipsHeight(width); got != 1 {
+		t.Fatalf("chipsHeight after removing the third chip = %d, want 1", got)
 	}
-	if got := m.historyHeight(); got != initialHeight+1 {
-		t.Fatalf("history height after removing the second-row chip = %d, want %d", got, initialHeight+1)
+	if got := m.historyHeight(); got != during {
+		t.Fatalf("history height after removing one of several chips = %d, want unchanged at %d", got, during)
 	}
 
 	m.SetChips(nil)
-	if got := len(m.chipRows(width)); got != 0 {
-		t.Fatalf("chip rows after clearing chips = %d, want 0", got)
+	if got := m.chipsHeight(width); got != 0 {
+		t.Fatalf("chipsHeight after clearing chips = %d, want 0", got)
 	}
-	if got := m.historyHeight(); got != initialHeight+2 {
-		t.Fatalf("history height after clearing chips = %d, want %d", got, initialHeight+2)
+	if got := m.historyHeight(); got != before {
+		t.Fatalf("history height after clearing chips = %d, want it to recover to %d", got, before)
 	}
 }
 
@@ -913,16 +924,15 @@ func chipMouseSetup(t *testing.T) (*chipHandler, *Model) {
 	return h, m
 }
 
-// chipCellFor finds the rendered cell for chip index in row 0 (all three
-// short labels fit on one row at chatWidth() for a 120-wide shell).
+// chipCellFor finds the rendered cell for chip index (all three short
+// labels fit on the composer's one chip row at chatWidth() for a
+// 120-wide shell).
 func chipCellFor(t *testing.T, m *Model, index int) chipCell {
 	t.Helper()
-	rows := m.chipRows(m.chatWidth())
-	for _, row := range rows {
-		for _, cell := range row {
-			if cell.index == index {
-				return cell
-			}
+	cells, _ := m.chipRow(m.chatWidth())
+	for _, cell := range cells {
+		if cell.index == index {
+			return cell
 		}
 	}
 	t.Fatalf("no rendered cell for chip %d", index)
@@ -1109,12 +1119,19 @@ func TestSyncFocusClearsChipFocusOnZoneChange(t *testing.T) {
 // report them (m3, r1/r2 review: every × lookup in this replay locates the
 // glyph by scanning the ACTUAL rendered output, never via the internal
 // chipsTopY/chipRows helpers under test elsewhere).
+//
+// The column is measured with ansi.StringWidth over the substring BEFORE
+// the match, not a byte offset (strings.Index) and not a rune count --
+// display columns are what a real mouse click reports, and r11's marker
+// column (▖, a multi-byte-but-single-column glyph) now routinely precedes
+// the first chip, so a byte offset would overcount it.
 func findCloseGlyph(t *testing.T, m *Model) (x, y int) {
 	t.Helper()
 	view := m.View().Content
 	for row, line := range strings.Split(view, "\n") {
-		if col := strings.Index(ansi.Strip(line), chipCloseGlyph); col >= 0 {
-			return col, row
+		plain := ansi.Strip(line)
+		if idx := strings.Index(plain, chipCloseGlyph); idx >= 0 {
+			return ansi.StringWidth(plain[:idx]), row
 		}
 	}
 	t.Fatalf("rendered view has no %q glyph:\n%s", chipCloseGlyph, view)
@@ -1129,7 +1146,7 @@ func TestReplayDataTugComposerAttachmentChipsCanBeFocusedClearedAndRestored(t *t
 	m.SetChips([]Chip{customer})
 	m.input.SetValue("Top 5 rows")
 
-	if !strings.Contains(m.chipsView(m.chatWidth()), "Customer") {
+	if !strings.Contains(m.chipsView(m.chatWidth(), false), "Customer") {
 		t.Fatal("attached Customer chip is not inside the chip row")
 	}
 
@@ -1220,7 +1237,7 @@ func TestChipsRenderAsHalfBlockEdgeWithSingleCellSeparator(t *testing.T) {
 			m := newTestShell(h)
 			m.SetChips(threeChips()[:n])
 
-			view := m.chipsView(m.chatWidth())
+			view := m.chipsView(m.chatWidth(), false)
 			plain := ansi.Strip(view)
 			// n pills joined by n-1 single "▄" separators, plus a
 			// trailing fill run -- never a plain space anywhere between
@@ -1297,4 +1314,90 @@ func TestComposerFallsBackToOwnTopEdgeWithoutChips(t *testing.T) {
 			t.Fatal("expected composerUsesChipsAsTopEdge() false with no chips")
 		}
 	})
+}
+
+// --- r11: chip corner + text-column alignment + overflow --------------------
+
+// TestChipRowCornerAlwaysPrecedesFirstChip locks in the r11 redesign
+// (founder, Warp feedback, verbatim: "Attachment chips should have margin
+// on left so left top corner is always rendered"): with 1 or 3 chips, the
+// row's marker column and its leading edge-filler column(s) are always
+// there, focused or not, and a chip cell never starts before them.
+func TestChipRowCornerAlwaysPrecedesFirstChip(t *testing.T) {
+	leading := composerMarkerWidth + theme.ComposerChipLeadingFill()
+	for _, n := range []int{1, 3} {
+		for _, focused := range []bool{false, true} {
+			t.Run(fmt.Sprintf("chips=%d/focused=%v", n, focused), func(t *testing.T) {
+				h := &fakeHandler{}
+				m := newTestShell(h)
+				m.SetChips(threeChips()[:n])
+				row := ansi.Strip(m.chipsView(m.chatWidth(), focused))
+				runes := []rune(row)
+				if len(runes) <= leading {
+					t.Fatalf("chipsView too short for the corner: %q", row)
+				}
+				wantMarker := ' '
+				if focused {
+					wantMarker = '▖'
+				}
+				if runes[0] != wantMarker {
+					t.Fatalf("marker column = %q, want %q (n=%d focused=%v)", string(runes[0]), string(wantMarker), n, focused)
+				}
+				for col := 1; col < leading; col++ {
+					if runes[col] == '×' {
+						t.Fatalf("column %d already inside a chip cell, want plain corner fill before column %d: %q", col, leading, row)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestComposerOwnTopEdgeCornerAlwaysRendersWithoutChips is the 0-chip half
+// of the same guarantee: with no chips (half-block edges active -- the
+// mode this "▖ top edge" language is specific to; see surfaceFill's own
+// doc: fallback mode has no separate top-edge row at all), chatshell
+// falls back to the composer's OWN top edge (theme.ComposerFrame, not
+// theme.ComposerFrameNoTopEdge -- see
+// TestComposerFallsBackToOwnTopEdgeWithoutChips), whose first row always
+// starts with the SAME marker column theme.ComposerChipMarker draws for
+// the chip row, so there is no visible discontinuity switching between
+// the two.
+func TestComposerOwnTopEdgeCornerAlwaysRendersWithoutChips(t *testing.T) {
+	withTrueColorEnv(t, func() {
+		for _, focused := range []bool{false, true} {
+			frame := theme.ComposerFrame(40, "hello", focused)
+			row := ansi.Strip(strings.Split(frame, "\n")[0])
+			runes := []rune(row)
+			wantMarker := ' '
+			if focused {
+				wantMarker = '▖'
+			}
+			if len(runes) == 0 || runes[0] != wantMarker {
+				t.Fatalf("focused=%v: composer top edge = %q, want to start with %q", focused, row, string(wantMarker))
+			}
+		}
+	})
+}
+
+// TestFirstChipLabelAlignsWithComposerTextColumn locks in the r11
+// alignment fix (founder, verbatim: "I think first chip text should be
+// aligned with text of the message"): the first chip's LABEL starts in
+// exactly the same column the composer's own typed text does
+// (theme.ComposerTextColumn()).
+func TestFirstChipLabelAlignsWithComposerTextColumn(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	m.SetChips(threeChips())
+	row := ansi.Strip(m.chipsView(m.chatWidth(), false))
+	runes := []rune(row)
+	col := theme.ComposerTextColumn()
+	label := []rune(threeChips()[0].Label) // "Customer"
+	if col+len(label) > len(runes) {
+		t.Fatalf("row too short: %q", row)
+	}
+	got := string(runes[col : col+len(label)])
+	if got != string(label) {
+		t.Fatalf("text at ComposerTextColumn()=%d = %q, want the first chip's label %q: %q", col, got, string(label), row)
+	}
 }

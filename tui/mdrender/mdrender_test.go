@@ -17,6 +17,22 @@ func TestRenderBasicMarkdown(t *testing.T) {
 	}
 }
 
+// TestRenderHonoursPinnedNonThemeStyle covers Render's "default" branch
+// directly (a Style pinned to something other than glamour's tracked
+// "dark"/"light", e.g. "ascii" for a non-colour terminal): it must still
+// go through glamour.WithStandardStyle(style) verbatim, not this
+// package's own dark/light code-colour override, which only applies to
+// the two auto-tracked variants.
+func TestRenderHonoursPinnedNonThemeStyle(t *testing.T) {
+	prevStyle := Style
+	t.Cleanup(func() { Style = prevStyle })
+	Style = "ascii"
+	out := Render("inline `code` span", 80)
+	if !strings.Contains(out, "code") {
+		t.Fatalf("Render with a pinned non-theme style missing expected content: %q", out)
+	}
+}
+
 func TestRenderNarrowWidthClampsToMinWordWrap(t *testing.T) {
 	// Width so small that width-wordWrapMargin would go negative/below
 	// minWordWrap; Render must not panic and must still produce output.

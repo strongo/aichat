@@ -109,6 +109,33 @@ func TestBarTruncatesAndFillsWidth(t *testing.T) {
 	_ = Bar(-3, "x")
 }
 
+// TestStatusLineHasNoBackgroundAndHintsInsetPadding covers StatusLine
+// directly (chatshell's legacy plain-SetStatus default path is the only
+// other caller, in a different package/test binary, so this package's
+// own coverage needs its own call) — founder, r12, verbatim: "status
+// line should have ... no background ... Should have horizontal
+// padding."
+func TestStatusLineHasNoBackgroundAndHintsInsetPadding(t *testing.T) {
+	out := StatusLine(20, "hello")
+	if containsBackgroundSGR(out) {
+		t.Fatalf("StatusLine painted a background SGR: %q", out)
+	}
+	left, _ := HintsInset()
+	if !strings.HasPrefix(ansi.Strip(out), strings.Repeat(" ", left)+"hello") {
+		t.Fatalf("StatusLine = %q, want to start with %d blank columns then the content", out, left)
+	}
+	if w := lipgloss.Width(out); w != 20 {
+		t.Fatalf("StatusLine width = %d, want 20", w)
+	}
+	// Overflowing content still truncates with an ellipsis (unlike
+	// RenderHints' own already-wrapped lines -- see hintsWrappedLine's
+	// own doc for why THAT path must not).
+	overflow := StatusLine(10, "this is far too long to fit")
+	if !strings.Contains(overflow, "…") {
+		t.Fatalf("StatusLine overflow = %q, want an ellipsis", overflow)
+	}
+}
+
 func TestTopBarComposesTitleContextItems(t *testing.T) {
 	out := TopBar(80, "DataTug", "Project: Foo", []MenuItem{{Label: "Sessions", Active: true}, {Label: "Help"}})
 	if !strings.Contains(plain(out), "DataTug") || !strings.Contains(plain(out), "Project: Foo") || !strings.Contains(plain(out), "Sessions") || !strings.Contains(plain(out), "Help") {
@@ -155,14 +182,26 @@ func TestRenderHintsWrapsOntoMultipleLinesWhenTooNarrow(t *testing.T) {
 		t.Fatalf("expected RenderHints to wrap onto multiple lines at width 24, got 1:\n%s", out)
 	}
 	flat := plain(out)
-	for _, want := range []string{"session summary line", "navigate", "send", "quit"} {
+	// r12's HintsInset() padding narrows RenderHints' own packing budget
+	// below the nominal width, so a plain multi-word segment like "session
+	// summary line" may now itself wrap across lines (each individual WORD
+	// is still checked, not the exact joined phrase -- wrapTokens is free
+	// to place its words on different lines, just never lose or cut one).
+	for _, want := range []string{"session", "summary", "line", "navigate", "send", "quit"} {
 		if !strings.Contains(flat, want) {
 			t.Errorf("wrapped hints dropped %q:\n%s", want, flat)
 		}
 	}
+	left, right := HintsInset()
 	for i, line := range lines {
-		if w := lipgloss.Width(line); w != 24 {
-			t.Errorf("wrapped line %d width = %d, want 24: %q", i, w, line)
+		w := lipgloss.Width(line)
+		// Every line is exactly 24 UNLESS it holds a single atomic token
+		// (a hint's key/label pair, or a lone word) wider than the inset
+		// packing budget on its own -- wrapTokens still gives it its own
+		// line rather than cutting it (see wrapTokens' own doc), so that
+		// one line is allowed to render WIDER than 24 instead.
+		if w != 24 && w <= 24-left-right {
+			t.Errorf("wrapped line %d width = %d, want 24 (or wider, only for an atomic over-wide token): %q", i, w, line)
 		}
 	}
 }
@@ -182,6 +221,40 @@ func TestComposerFrameSize(t *testing.T) {
 	cols, rows := ComposerFrameSize()
 	if cols != 5 || rows != 2 {
 		t.Fatalf("ComposerFrameSize() = (%d, %d), want (5, 2) -- 1-col accent bar + 2 cols padding each side, 1 row padding above/below", cols, rows)
+	}
+}
+
+// TestComposerTextColumnAndChipLeadingFillAgreeWithComposerFrameSize locks
+// in the r11 chip-alignment constants directly against composerBarWidth/
+// composerPaddingCols (via their one existing public witness,
+// ComposerFrameSize) rather than repeating the literal 1/2 values, so a
+// future change to either constant can't silently desync ComposerTextColumn/
+// ComposerChipLeadingFill from what the composer itself actually renders.
+func TestComposerTextColumnAndChipLeadingFillAgreeWithComposerFrameSize(t *testing.T) {
+	cols, _ := ComposerFrameSize() // barWidth + 2*paddingCols
+	barWidth := 1                  // composerBarWidth's only other public witness (surfaceFill's marker column) is always 1 column.
+	paddingCols := (cols - barWidth) / 2
+	if got := ComposerTextColumn(); got != barWidth+paddingCols {
+		t.Fatalf("ComposerTextColumn() = %d, want %d (marker + left padding)", got, barWidth+paddingCols)
+	}
+	if got := ComposerChipLeadingFill(); got != paddingCols-1 {
+		t.Fatalf("ComposerChipLeadingFill() = %d, want %d (left padding - 1, since a chip's own leading space covers the last column)", got, paddingCols-1)
+	}
+}
+
+// TestComposerChipMarkerMatchesTopEdgeMarker locks in that
+// ComposerChipMarker renders the SAME "▖" top-edge marker cell
+// ComposerFrame's own top edge draws (blank when unfocused, ▖ in
+// FocusColor() when focused) -- see markerCell's own doc -- so a chip
+// row substituting for the composer's top edge (chatshell's
+// composerUsesChipsAsTopEdge) shows no visible discontinuity.
+func TestComposerChipMarkerMatchesTopEdgeMarker(t *testing.T) {
+	for _, focused := range []bool{false, true} {
+		got := ComposerChipMarker(focused)
+		want := markerCell("▖", composerBarWidth, focused)
+		if got != want {
+			t.Fatalf("focused=%v: ComposerChipMarker() = %q, want %q (same as the composer's own top-edge marker)", focused, got, want)
+		}
 	}
 }
 
@@ -223,8 +296,8 @@ func TestComposerFrameSurvivesNestedResetInContent(t *testing.T) {
 }
 
 func TestPanelFrameFocusedVsUnfocused(t *testing.T) {
-	unfocused := PanelFrame(30, "panel content", false)
-	focused := PanelFrame(30, "panel content", true)
+	unfocused := PanelFrame(30, 3, "", "panel content", false)
+	focused := PanelFrame(30, 3, "", "panel content", true)
 	if unfocused == focused {
 		t.Fatal("focused panel frame identical to unfocused")
 	}
@@ -233,48 +306,136 @@ func TestPanelFrameFocusedVsUnfocused(t *testing.T) {
 	}
 }
 
+// TestPanelFrameSize covers the r12 redesign (founder, verbatim, seeing
+// the rendered result in Warp: "side panel should be full height card"):
+// rows is now a CONSTANT 2 (the same vPad-vs-edges equalisation
+// ComposerFrameSize relies on), not 0 -- a caller's row budget must
+// reserve PanelFrame's own top/bottom overhead the same way it already
+// does for Card/ComposerFrame.
 func TestPanelFrameSize(t *testing.T) {
 	cols, rows := PanelFrameSize()
-	if cols != 2 || rows != 0 {
-		t.Fatalf("PanelFrameSize() = (%d, %d), want (2, 0)", cols, rows)
+	if cols != 2 || rows != 2 {
+		t.Fatalf("PanelFrameSize() = (%d, %d), want (2, 2)", cols, rows)
 	}
 }
 
-// TestPanelFrameIsAPlainGapWithAFocusMarker covers the r10 founder
-// ruling (superseding the earlier "│" divider): "Let's remove border
-// between chat and side panels - margin is enough. Replace the '│'
-// divider with a gap: 2 columns of plain terminal background (no bg SGR,
-// no glyph) ... Panel focus indication moves off the divider" onto the
-// SAME marker idiom Card/ComposerFrame use. Unfocused: two plain blank
-// columns, no glyph, no background SGR anywhere. Focused: one blank
-// column plus one "▌" marker column in FocusColor(), still no background
-// SGR — and the OUTER width is identical either way.
-func TestPanelFrameIsAPlainGapWithAFocusMarker(t *testing.T) {
-	unfocused := PanelFrame(30, "row one\nrow two", false)
-	focused := PanelFrame(30, "row one\nrow two", true)
-	for i, line := range strings.Split(unfocused, "\n") {
-		if strings.ContainsAny(line, "│▌▖▘") {
-			t.Fatalf("unfocused line %d has an unexpected glyph: %q", i, line)
-		}
-		if !strings.HasPrefix(line, "  ") {
-			t.Fatalf("unfocused line %d should start with a 2-column blank gap: %q", i, line)
-		}
-		assertNoBackgroundSGR(t, "unfocused panel gap", line[:2])
-	}
+// TestPanelFrameIsAFullHeightSurfaceWithAFocusMarker supersedes the r10
+// "plain gap, no background" test: r12 (founder, verbatim: "side panel
+// should be full height card") makes PanelFrame a genuine filled surface
+// (theme.SurfaceColors(), like Card), not a bare gap -- so every content
+// row (AND any row past what content actually supplied, up to height)
+// now DOES carry the surface's own background SGR, deliberately the
+// opposite of the r10 "no background SGR anywhere" assertion. The ONE
+// gap column before the surface (and, unfocused, the surface's own
+// marker column too, since it renders blank) stays plain -- confirmed by
+// checking the reserved marker COLUMN specifically, not the whole line.
+func TestPanelFrameIsAFullHeightSurfaceWithAFocusMarker(t *testing.T) {
+	const height = 4 // taller than the 1 line of content supplied below.
+	unfocused := PanelFrame(30, height, "", "row one", false)
+	focused := PanelFrame(30, height, "", "row one", true)
+
+	unfocusedLines := strings.Split(unfocused, "\n")
 	focusedLines := strings.Split(focused, "\n")
-	for i, line := range focusedLines {
-		if !strings.Contains(ansi.Strip(line), "▌") {
-			t.Fatalf("focused line %d missing the '▌' marker: %q", i, line)
-		}
-		marker := markerCell("▌", 1, true)
-		if !strings.HasPrefix(line, " "+marker) {
-			t.Fatalf("focused line %d should be one blank column then the marker: %q", i, line)
-		}
-		assertNoBackgroundSGR(t, "focused panel marker", marker)
+	_, rows := PanelFrameSize()
+	wantLines := height + rows
+	if len(unfocusedLines) != wantLines || len(focusedLines) != wantLines {
+		t.Fatalf("rendered %d/%d lines, want %d (height=%d + PanelFrameSize rows=%d)", len(unfocusedLines), len(focusedLines), wantLines, height, rows)
 	}
-	if lipgloss.Width(strings.Split(unfocused, "\n")[0]) != lipgloss.Width(focusedLines[0]) {
+
+	// Only the MIDDLE `height` rows are checked here -- the top/bottom
+	// overhead rows (PanelFrameSize's own rows=2) carry no background AT
+	// ALL in half-block mode by design (see HalfBlockEdge's own doc: the
+	// glyph's fg IS the surface colour; there is no separate bg to set),
+	// so this assertion is specifically about the CONTENT area, not the
+	// edges.
+	for i := 1; i < 1+height; i++ {
+		if !containsBackgroundSGR(unfocusedLines[i]) {
+			t.Fatalf("unfocused content row %d carries no background SGR at all (want the panel's own surface fill, even past its own content): %q", i, unfocusedLines[i])
+		}
+	}
+	if !strings.Contains(plain(unfocused), "row one") {
+		t.Fatalf("frame missing its own content: %q", unfocused)
+	}
+
+	focusedHasMarker := false
+	for _, line := range focusedLines {
+		if strings.Contains(ansi.Strip(line), "▌") || strings.Contains(ansi.Strip(line), "▖") || strings.Contains(ansi.Strip(line), "▘") {
+			focusedHasMarker = true
+		}
+	}
+	if !focusedHasMarker {
+		t.Fatalf("focused panel frame missing its own marker glyph anywhere: %q", focused)
+	}
+	if unfocusedLines[0] == focusedLines[0] {
+		t.Fatal("focused first row identical to unfocused -- expected the marker to change it")
+	}
+	if lipgloss.Width(unfocusedLines[0]) != lipgloss.Width(focusedLines[0]) {
 		t.Fatal("focusing the panel changed its rendered width")
 	}
+}
+
+// TestPanelFrameHeaderRendersBoldAsFirstRow covers PanelFrame's header
+// parameter directly (chatshell itself never passes one today -- both
+// SidePanel and the default sidebar render their own title as their own
+// content's first line -- but the parameter is still part of PanelFrame's
+// own public contract and must work standalone).
+func TestPanelFrameHeaderRendersBoldAsFirstRow(t *testing.T) {
+	out := PanelFrame(30, 3, "My Panel", "row one", false)
+	lines := strings.Split(out, "\n")
+	if !strings.Contains(lines[1], "My Panel") {
+		t.Fatalf("header row = %q, want it to contain %q", lines[1], "My Panel")
+	}
+	if !strings.Contains(lines[1], "\x1b[1") {
+		t.Fatalf("header row not bold: %q", lines[1])
+	}
+	if !strings.Contains(lines[2], "row one") {
+		t.Fatalf("content row = %q, want it to contain %q", lines[2], "row one")
+	}
+}
+
+// TestPanelFrameDropsContentPastItsOwnHeight covers the height-overflow
+// branch: content taller than the height budget is silently clipped at
+// height (a caller's own row budget, e.g. chatshell's panelInnerHeight,
+// is the authority on how tall the panel's content area is — PanelFrame
+// itself must never render MORE rows than it was asked for, matching
+// Card/ComposerFrame's own "never taller than requested" contract).
+func TestPanelFrameDropsContentPastItsOwnHeight(t *testing.T) {
+	out := PanelFrame(30, 2, "", "row one\nrow two\nrow three", false)
+	lines := strings.Split(out, "\n")
+	_, rows := PanelFrameSize()
+	if want := 2 + rows; len(lines) != want {
+		t.Fatalf("rendered %d lines, want %d (height=2 + PanelFrameSize rows=%d)", len(lines), want, rows)
+	}
+	if strings.Contains(plain(out), "row three") {
+		t.Fatalf("content past height=2 was not dropped: %q", out)
+	}
+}
+
+// containsBackgroundSGR reports whether line contains ANY background SGR
+// token, mirroring assertNoBackgroundSGR's own parsing (skipping a "38;2;
+// r;g;b"/"38;5;n" foreground component's own numeric payload so it's
+// never misread as a standalone background code) but inverted -- used by
+// TestPanelFrameIsAFullHeightSurfaceWithAFocusMarker to assert the
+// OPPOSITE of what the pre-r12 gap design guaranteed.
+func containsBackgroundSGR(line string) bool {
+	for _, seq := range regexp.MustCompile(`\x1b\[[0-9;]*m`).FindAllString(line, -1) {
+		body := strings.TrimSuffix(strings.TrimPrefix(seq, "\x1b["), "m")
+		parts := strings.Split(body, ";")
+		for i := 0; i < len(parts); i++ {
+			switch parts[i] {
+			case "38", "39":
+				if i+1 < len(parts) && parts[i+1] == "2" {
+					i += 4
+				} else if i+1 < len(parts) && parts[i+1] == "5" {
+					i += 2
+				}
+			case "48", "40", "41", "42", "43", "44", "45", "46", "47",
+				"100", "101", "102", "103", "104", "105", "106", "107":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestSelectedRow(t *testing.T) {
@@ -332,6 +493,18 @@ func TestSetDarkAndPickBothBranches(t *testing.T) {
 type fakeColor string
 
 func (c fakeColor) RGBA() (r, g, b, a uint32) { return 0, 0, 0, 0 }
+
+func TestHexRendersLowercaseRRGGBB(t *testing.T) {
+	if got := Hex(lipgloss.Color("#1A5FC7")); got != "#1a5fc7" {
+		t.Fatalf("Hex(#1A5FC7) = %q, want %q", got, "#1a5fc7")
+	}
+	if got := Hex(lipgloss.Color("#000000")); got != "#000000" {
+		t.Fatalf("Hex(#000000) = %q, want %q", got, "#000000")
+	}
+	if got := Hex(lipgloss.Color("#ffffff")); got != "#ffffff" {
+		t.Fatalf("Hex(#ffffff) = %q, want %q", got, "#ffffff")
+	}
+}
 
 func TestContrastMeetsWCAG(t *testing.T) {
 	prevDark := Dark

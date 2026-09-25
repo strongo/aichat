@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	glamour "charm.land/glamour/v2"
+	"charm.land/glamour/v2/ansi"
+	"charm.land/glamour/v2/styles"
 
 	"github.com/strongo/aichat/tui/theme"
 )
@@ -67,6 +69,30 @@ const minWordWrap = 20
 // against a card's border.
 const wordWrapMargin = 4
 
+// codeStyleOverride returns a copy of glamour's own built-in dark/light
+// StyleConfig with ONE change: inline `code` no longer carries glamour's
+// own fixed colour+background (ANSI-256 color 203, a red/pink, on
+// glamour's own grey box in EITHER theme — founder, r12: "verify
+// glamour's inline-code colour ... meets the >= 4.5:1 rule"; it clears
+// 4.5:1 against glamour's own dark code-background by only a hair, ~4.55:1,
+// and fails outright (~2.28:1) against its light one). Color is now
+// theme.Hex(theme.AccentColor()) — the SAME accent colour ContrastPairs
+// checks against EVERY role card's own background (see ContrastPairs'
+// "inline code text" entries) — and BackgroundColor is cleared entirely
+// (nil): inline code renders on whatever card surface already surrounds
+// it, rather than a background glamour picked with no idea which role's
+// tint (or which real terminal background) it will actually sit on.
+func codeStyleOverride(dark bool) ansi.StyleConfig {
+	cfg := styles.LightStyleConfig
+	if dark {
+		cfg = styles.DarkStyleConfig
+	}
+	accent := theme.Hex(theme.AccentColor())
+	cfg.Code.Color = &accent
+	cfg.Code.BackgroundColor = nil
+	return cfg
+}
+
 // Render renders text as markdown at width, falling back to the raw text,
 // trimmed of surrounding whitespace, on any renderer error — markdown
 // rendering is a presentation nicety, never a reason to drop a response.
@@ -74,7 +100,21 @@ const wordWrapMargin = 4
 // mdrender.Render to chatshell.WithMarkdownRenderer / transcript.
 // WithMarkdownRenderer).
 func Render(text string, width int) string {
-	renderer, err := NewTermRenderer(glamour.WithStandardStyle(resolvedStyle()), glamour.WithWordWrap(max(minWordWrap, width-wordWrapMargin)))
+	// codeStyleOverride only replaces glamour's OWN "dark"/"light" styles
+	// (resolvedStyle()'s two possible auto-tracked values) -- a caller
+	// that pinned Style to something else (glamour's "notty"/"ascii"/a
+	// named theme like "dracula") gets that style verbatim via
+	// WithStandardStyle, same as before this round: this package has no
+	// tui/theme-driven override for those, and guessing one would risk
+	// breaking a deliberate non-colour-terminal choice.
+	var styleOpt glamour.TermRendererOption
+	switch style := resolvedStyle(); style {
+	case "dark", "light":
+		styleOpt = glamour.WithStyles(codeStyleOverride(style == "dark"))
+	default:
+		styleOpt = glamour.WithStandardStyle(style)
+	}
+	renderer, err := NewTermRenderer(styleOpt, glamour.WithWordWrap(max(minWordWrap, width-wordWrapMargin)))
 	if err != nil {
 		return text
 	}

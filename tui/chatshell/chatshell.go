@@ -121,9 +121,22 @@ func WithCommands(commands []Command) Option {
 	return func(m *Model) { m.commands = commands }
 }
 
-// WithSidebarRenderer sets how sidebar entries render.
+// WithSidebarRenderer sets how sidebar entries render. Preserves any
+// title a WithSidebarTitle call already set (in either order) by reading
+// the previous m.sidebar's own Title() before replacing it wholesale.
 func WithSidebarRenderer(render sidebar.Renderer) Option {
-	return func(m *Model) { m.sidebar = sidebar.New(render) }
+	return func(m *Model) { m.sidebar = sidebar.New(render).WithTitle(m.sidebar.Title()) }
+}
+
+// WithSidebarTitle sets the default sidebar's header text (default
+// "Pinned") -- content only, e.g. a product's own name for its
+// working-context list (founder, r11, sneat-cli coordinator review: "any
+// product using the default sidebar" should be able to give it a proper
+// header instead of the internal "Sidebar" implementation name). A no-op
+// for a product using WithSidePanel instead -- a SidePanel supplies its
+// own header entirely.
+func WithSidebarTitle(title string) Option {
+	return func(m *Model) { m.sidebar = m.sidebar.WithTitle(title) }
 }
 
 // WithSidePanel installs a product SidePanel in place of the default
@@ -987,13 +1000,19 @@ func (m *Model) growPanelChat(delta int) {
 // width chatshell allotted the whole sidebar zone.
 func (m *Model) panelView(width int, focused bool) string {
 	inner := m.panelInnerWidth(width)
+	innerHeight := m.panelInnerHeight()
 	var content string
 	if m.sidePanel != nil {
-		content = m.sidePanel.View(inner, m.panelInnerHeight(), focused)
+		content = m.sidePanel.View(inner, innerHeight, focused)
 	} else {
 		content = m.sidebar.View(inner, focused)
 	}
-	return theme.PanelFrame(width, content, focused)
+	// header is always "" here: both a SidePanel and the default sidebar
+	// already render their own header as their content's own first line
+	// (sidebar.Model.View's own theme.PanelHeader call) -- PanelFrame's
+	// header parameter exists for a future caller that wants PanelFrame to
+	// supply it instead, not used by chatshell today.
+	return theme.PanelFrame(width, innerHeight, "", content, focused)
 }
 
 // panelInnerWidth returns the content width available INSIDE
@@ -1449,12 +1468,13 @@ func (m *Model) historyHeight() int {
 	if m.busy {
 		busySpinnerLine = 1
 	}
-	// marginRows accounts for BOTH blank rows View() inserts when the
+	// marginRows accounts for all THREE blank rows View() inserts when the
 	// terminal is tall enough (theme.ContentMargins): one between the top
 	// bar and the content below it, one between the last transcript card
-	// and the composer -- see View()'s own doc. Both collapse to 0 below
+	// and the composer, and (r12) one between the composer and the
+	// status bar -- see View()'s own doc. All three collapse to 0 below
 	// theme.MarginCollapseRows terminal rows, same as here.
-	marginRows := 2 * theme.ContentMargins(m.height)
+	marginRows := 3 * theme.ContentMargins(m.height)
 	return max(1, m.height-m.topBarHeight()-m.menuHeight()-m.composerHeight()-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine-marginRows)
 }
 
@@ -1542,7 +1562,7 @@ func (m *Model) statusBarView() string {
 		}
 		styled := make([]string, len(lines))
 		for i, line := range lines {
-			styled[i] = theme.Bar(m.width, line)
+			styled[i] = theme.StatusLine(m.width, line)
 		}
 		return strings.Join(styled, "\n")
 	}
@@ -1966,7 +1986,7 @@ func (m *Model) View() tea.View {
 	for range theme.ContentMargins(m.height) {
 		chatParts = append(chatParts, "")
 	}
-	if chips := m.chipsView(m.chatWidth()); chips != "" {
+	if chips := m.chipsView(m.chatWidth(), inputFocused); chips != "" {
 		// Chips render above the input, closest to the composer -- after
 		// the slash-command menu (which sits directly above the input only
 		// while no chips are focused-adjacent) and before it.
@@ -1992,8 +2012,20 @@ func (m *Model) View() tea.View {
 	for range theme.ContentMargins(m.height) {
 		topParts = append(topParts, "")
 	}
+	// A THIRD blank row, same collapse rule, now separates the composer
+	// from the status bar too -- founder, r12, verbatim, seeing the
+	// rendered result in Warp: "status line should have top margin ...
+	// It should be last line on screen" (superseding the r9 "no blank row
+	// between the composer and the hints/status bar" rule -- see theme's
+	// own vertical-margins doc). The status bar itself is the LAST part
+	// joined below, with nothing after it, so it always lands on the
+	// terminal's own last row.
+	bodyParts := []string{body}
+	for range theme.ContentMargins(m.height) {
+		bodyParts = append(bodyParts, "")
+	}
 	status := m.statusBarView()
-	content := lipgloss.JoinVertical(lipgloss.Left, append(topParts, body, status)...)
+	content := lipgloss.JoinVertical(lipgloss.Left, append(append(topParts, bodyParts...), status)...)
 	if n := len(m.overlays); n > 0 {
 		content = m.renderOverlay(content, m.overlays[n-1])
 	}

@@ -1,6 +1,7 @@
 package chatshell
 
 import (
+	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -280,10 +281,11 @@ func (m *Model) cycleChipFocus(forward bool) {
 	}
 }
 
-// chipCell is one rendered chip pill within a wrapped row: index into
+// chipCell is one rendered chip pill within the chip row: index into
 // m.chips, the pill's rendered text (including its "×" close glyph), and x,
-// the column (within the row's own width) where a mouse click removes it --
-// the position of the "×" glyph itself.
+// the ABSOLUTE column (from the row's own start, i.e. including the
+// composer's marker column and leading edge-filler -- see chipRow) where a
+// mouse click removes it -- the position of the "×" glyph itself.
 type chipCell struct {
 	index int
 	text  string
@@ -295,27 +297,30 @@ type chipCell struct {
 // truncated) label to form its pill text, e.g. " Customer × ".
 const chipCloseGlyph = "×"
 
-// chipRows lays out the current chips into rows that wrap at width (a
-// single half-block cell between adjacent pills on the same row -- see
-// chipEdgeFiller; a pill that would overflow starts a new row instead),
-// mirroring DataTug's attachmentRows. A single chip wider than width still
-// gets its own row (truncated, close glyph preserved) rather than being
-// dropped. Returns nil when there are no chips.
+// chipOverflowReserve is the width chipRow reserves at the row's end for a
+// trailing "+N" overflow pill (a notch cell plus " +NN " -- two-digit N is
+// the realistic ceiling for attachment counts) while deciding how many
+// chips fit -- founder, r11 (Warp feedback, verbatim): "keep one row: show
+// as many chips as fit plus a '+N' chip ... never overflow or clip
+// mid-chip."
+const chipOverflowReserve = 1 + 6
+
+// fitChips greedily lays out as many of m.chips as fit within available
+// columns (a single half-block cell of gap between adjacent pills -- see
+// chipEdgeFiller), stopping at the first chip that would overflow rather
+// than truncating it away; cell.x is absolute, offset by leading (the
+// composer's own marker + edge-filler columns that precede the row's first
+// chip -- see chipRow). A single chip wider than available still gets
+// placed (truncated, close glyph preserved) when it's the very first one,
+// rather than being dropped outright.
 //
 // Pill text is " label × " -- one space either side of the label, one
 // before the close glyph, one trailing (founder, r9: "one space either
-// side of the label"; no brackets) -- the SAME total width the older
-// "[label ×]" bracket form used, so this changed nothing about which chips
-// land on which row or the close glyph's own x offset (still
-// used+len(label)+2, unchanged below).
-func (m *Model) chipRows(width int) [][]chipCell {
-	if len(m.chips) == 0 {
-		return nil
-	}
-	available := max(1, width)
-	rows := [][]chipCell{{}}
+// side of the label"; no brackets).
+func fitChips(chips []Chip, leading, available int) []chipCell {
+	var cells []chipCell
 	used := 0
-	for i, c := range m.chips {
+	for i, c := range chips {
 		label := ansi.Truncate(c.Label, max(0, available-4), "")
 		text := " " + label + " " + chipCloseGlyph + " "
 		w := ansi.StringWidth(text)
@@ -324,26 +329,62 @@ func (m *Model) chipRows(width int) [][]chipCell {
 			gap = 1
 		}
 		if used+gap+w > available && used > 0 {
-			rows = append(rows, []chipCell{})
-			used, gap = 0, 0
+			break
 		}
 		used += gap
-		rows[len(rows)-1] = append(rows[len(rows)-1], chipCell{
+		cells = append(cells, chipCell{
 			index: i,
 			text:  text,
 			label: label,
-			x:     used + ansi.StringWidth(label) + 2,
+			x:     leading + used + ansi.StringWidth(label) + 2,
 		})
 		used += w
 	}
-	return rows
+	return cells
 }
 
-// chipsHeight is the number of rows chipRows(width) lays out -- how many
-// extra lines the chip row(s) take above the input, so historyHeight can
+// chipRow lays out the current chips into the composer's ONE chip row --
+// it never wraps to a second row (founder, r11, verbatim: "If the chips
+// don't fit the width ... keep one row"). leading is how many columns
+// (the composer's own marker column plus its left edge-filler -- see
+// theme.ComposerTextColumn/ComposerChipLeadingFill) come before the row's
+// first chip cell; those columns, and the alignment they give the first
+// chip's label, are ALWAYS present, even with zero chips fitting.
+//
+// It first tries to fit every chip; if they all fit, there's no overflow.
+// Otherwise it redoes the fit reserving chipOverflowReserve columns at the
+// end for a "+N" pill, and whatever didn't make it into that narrower fit
+// becomes the overflow count -- always > 0 at that point: fitChips' per-
+// chip width is a non-decreasing function of available (a longer label
+// truncates to a LARGER cap at a LARGER available, and a chip within its
+// untruncated length renders at a constant width regardless), so a
+// strictly smaller available (chipOverflowReserve > 0) can only fit the
+// same chips or fewer, never more, than the unreserved pass already
+// couldn't. Returns nil, 0 when there are no chips.
+func (m *Model) chipRow(width int) (cells []chipCell, overflowN int) {
+	if len(m.chips) == 0 {
+		return nil, 0
+	}
+	leading := composerMarkerWidth + theme.ComposerChipLeadingFill()
+	available := max(0, width-leading)
+	cells = fitChips(m.chips, leading, available)
+	if len(cells) == len(m.chips) {
+		return cells, 0
+	}
+	reserved := max(0, available-chipOverflowReserve)
+	cells = fitChips(m.chips, leading, reserved)
+	return cells, len(m.chips) - len(cells)
+}
+
+// chipsHeight is 1 when there are chips to show (the composer's chip row
+// always fits on a single line -- see chipRow) and 0 otherwise -- how many
+// extra lines the chip row takes above the input, so historyHeight can
 // shrink to make room and grow back as chips are removed.
-func (m *Model) chipsHeight(width int) int {
-	return len(m.chipRows(width))
+func (m *Model) chipsHeight(_ int) int {
+	if len(m.chips) == 0 {
+		return 0
+	}
+	return 1
 }
 
 // chipLabelStyle/chipCloseStyle/chipFocusedStyle render a chip pill as a
@@ -410,44 +451,68 @@ func renderChipCell(cell chipCell, focused bool) string {
 	return chipLabelStyle().Render(labelPart) + chipCloseStyle().Render(closePart)
 }
 
-// chipsView renders the current chips as one or more wrapped rows: pills
-// full-height solid cells (renderChipCell), separated by EXACTLY one
-// half-block filler cell (chipEdgeFiller(1)) rather than a blank space,
-// with the row's remaining width past the last pill also filled the same
-// way -- so each row reads as a strip of tabs rising off a half-block
-// surface, the row immediately above the composer effectively BEING its
-// top edge (see chatshell.go's View(), which skips ComposerFrame's own
-// top edge whenever chips are present in half-block mode:
-// theme.ComposerFrameNoTopEdge). Returns "" when there are no chips.
-func (m *Model) chipsView(width int) string {
-	rows := m.chipRows(width)
-	if len(rows) == 0 {
+// composerMarkerWidth mirrors theme's own unexported composerBarWidth --
+// the 1-column marker (▖ focused, blank otherwise) the composer's top edge
+// always starts with, chips included -- see theme.ComposerChipMarker.
+const composerMarkerWidth = 1
+
+// chipsView renders the composer's ONE chip row (see chipRow -- it never
+// wraps): the marker column (theme.ComposerChipMarker, matching whatever
+// the composer's own edges show), then theme.ComposerChipLeadingFill()
+// columns of plain edge-filler BEFORE the first chip -- so the composer's
+// own top-left corner is always rendered and the first chip's LABEL lands
+// on theme.ComposerTextColumn(), the same column the composer's own typed
+// text starts on (founder, r11, verbatim: "Attachment chips should have
+// margin on left so left top corner is always rendered. I think first
+// chip text should be aligned with text of the message") -- then each
+// pill as a full-height solid cell (renderChipCell), separated by EXACTLY
+// one half-block filler cell (chipEdgeFiller(1)), a trailing "+N" pill
+// (same chipLabelStyle) when chipRow reports an overflow count, and the
+// row's remaining width past the last cell filled the same way -- so the
+// row reads as a strip of tabs rising off a half-block surface, effectively
+// BEING the composer's top edge (see chatshell.go's View(), which skips
+// ComposerFrame's own top edge whenever chips are present in half-block
+// mode: theme.ComposerFrameNoTopEdge). composerFocused matches whatever
+// focus state the composer's own edges are rendered with (inputFocused in
+// View()), independent of which individual chip, if any, is itself
+// Tab-focused (cell.index == m.chipFocus, handled by renderChipCell).
+// Returns "" when there are no chips.
+func (m *Model) chipsView(width int, composerFocused bool) string {
+	if len(m.chips) == 0 {
 		return ""
 	}
-	sep := chipEdgeFiller(1)
-	lines := make([]string, 0, len(rows))
-	for _, row := range rows {
-		parts := make([]string, 0, len(row))
-		used := 0
-		for i, cell := range row {
-			parts = append(parts, renderChipCell(cell, cell.index == m.chipFocus))
-			used += ansi.StringWidth(cell.text)
-			if i < len(row)-1 {
-				used++ // the separator cell chipRows already reserved.
-			}
-		}
-		line := strings.Join(parts, sep)
-		if fill := max(0, width-used); fill > 0 {
-			line += chipEdgeFiller(fill)
-		}
-		lines = append(lines, line)
+	cells, overflowN := m.chipRow(width)
+	leading := composerMarkerWidth + theme.ComposerChipLeadingFill()
+	line := theme.ComposerChipMarker(composerFocused) + chipEdgeFiller(theme.ComposerChipLeadingFill())
+	used := leading
+	writeSep := func() {
+		line += chipEdgeFiller(1)
+		used++
 	}
-	return strings.Join(lines, "\n")
+	for i, cell := range cells {
+		if i > 0 {
+			writeSep()
+		}
+		line += renderChipCell(cell, cell.index == m.chipFocus)
+		used += ansi.StringWidth(cell.text)
+	}
+	if overflowN > 0 {
+		if len(cells) > 0 {
+			writeSep()
+		}
+		pillText := " +" + strconv.Itoa(overflowN) + " "
+		line += chipLabelStyle().Render(pillText)
+		used += ansi.StringWidth(pillText)
+	}
+	if fill := max(0, width-used); fill > 0 {
+		line += chipEdgeFiller(fill)
+	}
+	return line
 }
 
 // chipsTopY returns the Y coordinate (chatshell's own top-left-origin
-// coordinate frame, matching tea.Mouse's) of the first chip row, so
-// handleMouseClick can translate a click's Y into a row index: the
+// coordinate frame, matching tea.Mouse's) of the chip row, so
+// handleMouseClick can tell a chip-row click apart from any other: the
 // rendered top bar's height, plus the transcript's fixed viewport height
 // (historyHeight), plus the slash-command menu's height when it's
 // currently showing, plus TWO theme.ContentMargins(m.height) rows -- the
@@ -455,9 +520,8 @@ func (m *Model) chipsView(width int) string {
 // margin (above the chip row, which sits directly against the composer:
 // founder, r10, verbatim, on the margin instead landing BETWEEN the chip
 // row and the composer, "it should be part of the composer") -- exactly
-// the content View() stacks above the chip row(s), in order (see
-// historyHeight's own doc for why each of these is measured rather than
-// assumed).
+// the content View() stacks above the chip row (see historyHeight's own
+// doc for why each of these is measured rather than assumed).
 func (m *Model) chipsTopY() int {
 	return m.topBarHeight() + 2*theme.ContentMargins(m.height) + m.historyHeight() + m.menuHeight()
 }
@@ -479,18 +543,19 @@ func (m *Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 // resulting ChipObserver notification command. It reports ok=false (no
 // removal) while mouse reporting is off, the shell is busy (the composer,
 // chips included, is disabled while busy -- see handleInputKey), there are
-// no chips, msg isn't a left-button click, or msg's coordinates don't land
-// on any chip's close glyph.
+// no chips, msg isn't a left-button click, msg's Y isn't the chip row, or
+// msg's X doesn't land on any VISIBLE chip's close glyph -- a chip folded
+// into the trailing "+N" overflow pill isn't individually clickable, since
+// it isn't individually rendered.
 func (m *Model) chipCloseClick(msg tea.MouseClickMsg) (tea.Cmd, bool) {
 	if !m.mouseEnabled || m.busy || len(m.chips) == 0 || msg.Button != tea.MouseLeft {
 		return nil, false
 	}
-	rows := m.chipRows(m.chatWidth())
-	row := msg.Y - m.chipsTopY()
-	if row < 0 || row >= len(rows) {
+	if msg.Y != m.chipsTopY() {
 		return nil, false
 	}
-	for _, cell := range rows[row] {
+	cells, _ := m.chipRow(m.chatWidth())
+	for _, cell := range cells {
 		if msg.X == cell.x {
 			return m.removeChipAt(cell.index), true
 		}

@@ -30,6 +30,7 @@ const (
 type Model struct {
 	refs    []session.EntityRef
 	render  Renderer
+	title   string
 	cursor  int
 	visible bool
 	width   int
@@ -38,13 +39,40 @@ type Model struct {
 	chatPercent int
 }
 
+// defaultTitle is the sidebar's header text absent WithTitle -- founder,
+// r11 (sneat-cli coordinator review): the default sidebar's product-
+// neutral fallback, distinct from DataTug's own SidePanel (which supplies
+// its own tab labels entirely) so a product using the default sidebar out
+// of the box gets a plain, sensible header rather than the internal
+// "Sidebar" implementation name.
+const defaultTitle = "Pinned"
+
 // New returns a visible, empty sidebar using render to format entries.
 func New(render Renderer) *Model {
 	if render == nil {
 		render = func(ref session.EntityRef, width int) string { return ref.Title }
 	}
-	return &Model{render: render, visible: true, chatPercent: 65}
+	return &Model{render: render, visible: true, chatPercent: 65, title: defaultTitle}
 }
+
+// WithTitle sets the sidebar's header text (default "Pinned") -- content
+// only, e.g. a product's own name for its working-context list. Chained
+// after New, mirroring chatshell's own With* option shape but scoped to
+// this package's own constructor (sidebar.Model has no other options
+// today).
+func (m *Model) WithTitle(title string) *Model {
+	if title != "" {
+		m.title = title
+	}
+	return m
+}
+
+// Title returns the sidebar's current header text -- chatshell's own
+// WithSidebarRenderer reads this before replacing m.sidebar wholesale, so
+// a WithSidebarTitle call is never lost regardless of which of the two
+// options a product applies first (see chatshell.WithSidebarRenderer's
+// own doc).
+func (m *Model) Title() string { return m.title }
 
 // Refs returns the current ordered sidebar entries.
 func (m *Model) Refs() []session.EntityRef { return m.refs }
@@ -143,7 +171,7 @@ func (m *Model) View(width int, focused bool) string {
 	if width != m.width {
 		m.SetWidth(width)
 	}
-	title := theme.PanelHeader("Sidebar")
+	title := theme.PanelHeader(m.title)
 	if len(m.refs) == 0 {
 		return title + "\n  (empty)"
 	}
