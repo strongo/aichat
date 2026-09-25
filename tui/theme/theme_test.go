@@ -1144,3 +1144,16 @@ func TestContrastTextMatchesSurfaceText(t *testing.T) {
 		t.Fatalf("ContrastText(%v) = %#v, want surfaceText's own %#v", bg, got, want)
 	}
 }
+
+// TestReserveMarkerColumnDirect covers ReserveMarkerColumn directly (its
+// own package's coverage doesn't see tui/transcript's cross-package use
+// of it, same as TestContrastTextMatchesSurfaceText above): a
+// MarkerColumnWidth-wide blank gutter is prefixed onto EVERY line, multi-
+// line content included, never just the first.
+func TestReserveMarkerColumnDirect(t *testing.T) {
+	got := ReserveMarkerColumn("a\nbb")
+	want := strings.Repeat(" ", MarkerColumnWidth) + "a\n" + strings.Repeat(" ", MarkerColumnWidth) + "bb"
+	if got != want {
+		t.Fatalf("ReserveMarkerColumn(%q) = %q, want %q", "a\nbb", got, want)
+	}
+}

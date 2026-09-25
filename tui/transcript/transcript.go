@@ -557,12 +557,19 @@ func (m *Model) View() string { return m.viewport.View() }
 // plus a left accent bar — never a border) — never a scattered
 // lipgloss.NewStyle() literal here; every colour/padding decision lives in
 // tui/theme. A grid-like Block (SelfFramed) is the one exception: it
-// renders its own View directly, with no Card fill (see SelfFramed).
+// renders its own View directly, with no Card fill (see SelfFramed) — but
+// still reserves theme's own MarkerColumnWidth gutter to its left (see
+// theme.ReserveMarkerColumn), so its own drawn border lands in the SAME
+// column an (unfocused) Card's own surface starts in, instead of one
+// column further left (founder correction, 2026-09-25: align the grid's
+// left border to the card/composer surface's own left column, rather than
+// giving every OTHER surface an in-surface accent).
 func (m *Model) renderEntry(e *Entry, width int, focused bool) string {
 	switch {
 	case e.Block != nil:
 		if sf, ok := e.Block.(SelfFramed); ok && sf.SelfFramed() {
-			return e.Block.View(width, focused)
+			inner := max(1, width-theme.MarkerColumnWidth)
+			return theme.ReserveMarkerColumn(e.Block.View(inner, focused))
 		}
 		role := theme.RoleBlock
 		if r, ok := e.Block.(Roled); ok {

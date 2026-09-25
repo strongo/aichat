@@ -482,6 +482,37 @@ func InnerWidth(width int) int {
 	return max(1, width-cardBarWidth-2*CardPaddingCols)
 }
 
+// MarkerColumnWidth is the 1-column focus-marker gutter every Card/
+// ComposerFrame reserves to the left of its own surface (see
+// surfaceFill's cardBarWidth/composerBarWidth) — blank when unfocused, so
+// a card/composer's SURFACE (its own drawn left edge, "▄"/"▀"/fill) always
+// starts in the SAME column, terminal column MarkerColumnWidth, whether
+// focused or not. A SelfFramed transcript Block (tui/grid — the one
+// exception to the Card wrap, see transcript's own SelfFramed doc) draws
+// its OWN border directly rather than going through Card, so it must
+// reserve this same gutter itself to keep its border lined up with every
+// other surface's left edge — see ReserveMarkerColumn.
+const MarkerColumnWidth = cardBarWidth
+
+// ReserveMarkerColumn prefixes every line of content — already rendered
+// at width-MarkerColumnWidth columns — with a blank MarkerColumnWidth-
+// column gutter, producing a block exactly width columns wide whose own
+// first drawn column (content's own column 0) lands in terminal column
+// MarkerColumnWidth, the same column a Card/ComposerFrame's own surface
+// starts in. It never draws a marker glyph itself — a SelfFramed block's
+// own focus signalling (e.g. tui/grid's border colour) is unaffected;
+// this only shifts position (founder correction, 2026-09-25: "if a
+// focused grid currently signals focus only by border colour, keep that;
+// just align it").
+func ReserveMarkerColumn(content string) string {
+	gutter := strings.Repeat(" ", MarkerColumnWidth)
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		lines[i] = gutter + line
+	}
+	return strings.Join(lines, "\n")
+}
+
 // surfaceFill composes ONE filled surface block — a Card or a
 // ComposerFrame — from already-painted content: padded horizontally by
 // paddingCols at OUTER width, with a 1-column left accent bar (barColor)

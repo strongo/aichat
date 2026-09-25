@@ -851,10 +851,78 @@ func TestRenderEntrySelfFramedBlockSkipsCardWrap(t *testing.T) {
 	m := New()
 	blk := &selfFramedBlock{fakeBlock{label: "grid-like"}}
 	out := m.renderEntry(&Entry{Block: blk}, 40, false)
-	want := blk.View(40, false)
+	// No Card fill/header wrap -- but the block's own left edge is still
+	// shifted right by theme.MarkerColumnWidth, so it lines up with a
+	// Card's own (unfocused) surface left edge, not the marker column
+	// itself. See TestRenderEntrySelfFramedBlockAlignsWithCardSurface for
+	// the actual column-alignment assertion.
+	want := theme.ReserveMarkerColumn(blk.View(40-theme.MarkerColumnWidth, false))
 	if out != want {
-		t.Fatalf("SelfFramed block should render unwrapped: got %q, want %q", out, want)
+		t.Fatalf("SelfFramed block should render unwrapped (marker-column-aligned): got %q, want %q", out, want)
 	}
+}
+
+// TestRenderEntrySelfFramedBlockAlignsWithCardSurface covers the founder's
+// 2026-09-25 correction: the grid's (SelfFramed) own left border must land
+// in the SAME column an ordinary (non-SelfFramed) card's own unfocused
+// surface starts in -- both one column right of column 0, which stays the
+// blank focus-marker gutter for every transcript entry, grid included.
+// Measured two ways: (a) the SelfFramed block's own first column (its
+// content's own column 0, e.g. a grid's "╭") lands at theme.
+// MarkerColumnWidth; (b) under half-block edges (forced via
+// withTrueColorEnv), an ordinary card's own top "▄" edge row -- ITS
+// surface's real left edge, not the further-indented padded text -- starts
+// in that exact same column.
+func TestRenderEntrySelfFramedBlockAlignsWithCardSurface(t *testing.T) {
+	withTrueColorEnv(t, func() {
+		m := New()
+		width := 40
+
+		selfFramed := &selfFramedBlock{fakeBlock{label: "╭grid border here"}}
+		gridOut := m.renderEntry(&Entry{Block: selfFramed}, width, false)
+		gridFirstLine := strings.SplitN(ansi.Strip(gridOut), "\n", 2)[0]
+		gridCol := firstNonBlankColumn(gridFirstLine)
+		if gridCol != theme.MarkerColumnWidth {
+			t.Fatalf("SelfFramed block's own left column = %d, want %d (theme.MarkerColumnWidth)", gridCol, theme.MarkerColumnWidth)
+		}
+
+		prose := &fakeBlock{label: "prose"}
+		cardOut := m.renderEntry(&Entry{Block: prose}, width, false)
+		cardLines := strings.Split(ansi.Strip(cardOut), "\n")
+		cardEdgeLine := cardLines[0] // top "▄" half-block edge row, Card's own surface left edge.
+		cardCol := firstNonBlankColumn(cardEdgeLine)
+		if !strings.Contains(cardEdgeLine, "▄") {
+			t.Fatalf("expected card's first rendered line to be its top half-block edge row, got %q (is half-block active?)", cardEdgeLine)
+		}
+		if cardCol != gridCol {
+			t.Fatalf("card surface's own left column = %d, SelfFramed block's = %d, want equal", cardCol, gridCol)
+		}
+	})
+}
+
+// firstNonBlankColumn returns the index of the first non-space rune in
+// line, or len(line) if it's all spaces.
+func firstNonBlankColumn(line string) int {
+	for i, r := range line {
+		if r != ' ' {
+			return i
+		}
+	}
+	return len(line)
+}
+
+// withTrueColorEnv sets TERM/COLORTERM so theme.HalfBlockEdgesActive()
+// reports true for the duration of fn -- mirrors chatshell's own helper
+// of the same name (tui/chatshell/chip_test.go), duplicated here since
+// tests can't share unexported helpers across packages.
+func withTrueColorEnv(t *testing.T, fn func()) {
+	t.Helper()
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("COLORTERM", "truecolor")
+	if !theme.HalfBlockEdgesActive() {
+		t.Fatal("withTrueColorEnv: theme.HalfBlockEdgesActive() still false")
+	}
+	fn()
 }
 
 func TestRenderEntryNonSelfFramedBlockStillGetsCardWrap(t *testing.T) {
