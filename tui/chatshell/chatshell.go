@@ -1408,7 +1408,19 @@ func (m *Model) sidebarWidth() int {
 	if !m.splitEnabled() {
 		return 0
 	}
-	return max(1, m.width-2-m.chatWidth()-1)
+	// The trailing "-1" this used to subtract dated back to
+	// theme.PanelFrame's own single-column "│" divider, reserved here on
+	// TOP of chatWidth()'s own budget. PanelFrame no longer draws
+	// anything of its own outside the OUTER width panelView already
+	// passes it (its 2-column gap+marker come out of THAT budget, via
+	// panelInnerWidth) -- so the panel's own outer width is simply
+	// whatever remains after chatWidth(), with no separate frame
+	// allowance here. Kept as -1 after this round-10 gap/marker redesign
+	// would have shrunk the panel's usable content by one extra column
+	// for no reason, tipping tabStripHeader from its full label set to
+	// the short one at borderline widths -- a real r10 regression this
+	// fixes.
+	return max(1, m.width-2-m.chatWidth())
 }
 
 // historyHeight is the transcript viewport's fixed height: the terminal
