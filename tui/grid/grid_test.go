@@ -1917,3 +1917,10 @@ func TestBorderLineNonPositiveAndTinyWidths(t *testing.T) {
 		t.Fatalf("borderLine(width=4) = %q, want the plain fallback", got)
 	}
 }
+
+func TestSelfFramedIsAlwaysTrue(t *testing.T) {
+	m := New([]Column{{Name: "a"}}, []Row{{Values: []any{"x"}}})
+	if !m.SelfFramed() {
+		t.Fatal("grid.Model.SelfFramed() = false, want true (a grid always draws its own frame)")
+	}
+}

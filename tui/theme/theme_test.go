@@ -121,6 +121,30 @@ func TestRenderHintsWithAndWithoutSegments(t *testing.T) {
 	}
 }
 
+func TestRenderHintsWrapsOntoMultipleLinesWhenTooNarrow(t *testing.T) {
+	hints := []Hint{
+		{Key: "Shift+↑↓", Label: "navigate"}, {Key: "Enter", Label: "send"},
+		{Key: "F6/Shift+→", Label: "workspace"}, {Key: "Ctrl+←→", Label: "resize"},
+		{Key: "F3", Label: "projects"}, {Key: "F4", Label: "sessions"}, {Key: "Ctrl+C", Label: "quit"},
+	}
+	out := RenderHints(24, hints, "session summary line")
+	lines := strings.Split(out, "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected RenderHints to wrap onto multiple lines at width 24, got 1:\n%s", out)
+	}
+	flat := plain(out)
+	for _, want := range []string{"session summary line", "navigate", "send", "quit"} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("wrapped hints dropped %q:\n%s", want, flat)
+		}
+	}
+	for i, line := range lines {
+		if w := lipgloss.Width(line); w != 24 {
+			t.Errorf("wrapped line %d width = %d, want 24: %q", i, w, line)
+		}
+	}
+}
+
 func TestComposerFrameFocusedVsUnfocused(t *testing.T) {
 	unfocused := ComposerFrame(30, "type here", false)
 	focused := ComposerFrame(30, "type here", true)

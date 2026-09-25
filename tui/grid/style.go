@@ -41,6 +41,14 @@ var (
 // only ever used as a NAME lookup key, never rendered directly — grid.go's
 // buildTable instead re-resolves the live preset via currentStyle(m.style.
 // Name) on every render, which always reflects theme's current variant.
+// Lines/Soft/Minimal stay texturally distinguishable from each other (a
+// different BorderColor each) while every colour still comes from
+// tui/theme, never a preset-local literal: Lines uses MutedColor() (the
+// same neutral border every other unfocused frame in aichat uses), Soft
+// AccentColor() (a warmer, softer divider), Minimal FocusColor() (reused
+// here purely for its own distinct hue, not to imply focus — Minimal's
+// header carries no background fill, which is what actually reads as
+// "minimal").
 func styleLines() Style {
 	bg, fg := theme.SurfaceColors()
 	return Style{
@@ -54,7 +62,7 @@ func styleSoft() Style {
 	bg, fg := theme.SurfaceColors()
 	return Style{
 		Name:        "Soft",
-		BorderColor: theme.MutedColor(),
+		BorderColor: theme.AccentColor(),
 		HeaderStyle: lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(true),
 	}
 }
@@ -63,7 +71,7 @@ func styleMinimal() Style {
 	_, fg := theme.SurfaceColors()
 	return Style{
 		Name:        "Minimal",
-		BorderColor: theme.MutedColor(),
+		BorderColor: theme.FocusColor(),
 		HeaderStyle: lipgloss.NewStyle().Foreground(fg).Bold(true),
 	}
 }

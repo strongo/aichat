@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
+	"github.com/strongo/aichat/tui/theme"
 )
 
 type fakeBlock struct {
@@ -839,5 +840,42 @@ func TestSetSizeHeightChangeKeepsFollowingWhenAtBottom(t *testing.T) {
 	m.SetSize(20, 5)
 	if !m.viewport.AtBottom() {
 		t.Fatal("expected to still be at bottom after a height change that started at the bottom")
+	}
+}
+
+type selfFramedBlock struct{ fakeBlock }
+
+func (b *selfFramedBlock) SelfFramed() bool { return true }
+
+func TestRenderEntrySelfFramedBlockSkipsCardWrap(t *testing.T) {
+	m := New()
+	blk := &selfFramedBlock{fakeBlock{label: "grid-like"}}
+	out := m.renderEntry(&Entry{Block: blk}, 40, false)
+	want := blk.View(40, false)
+	if out != want {
+		t.Fatalf("SelfFramed block should render unwrapped: got %q, want %q", out, want)
+	}
+}
+
+func TestRenderEntryNonSelfFramedBlockStillGetsCardWrap(t *testing.T) {
+	m := New()
+	blk := &fakeBlock{label: "prose-like"}
+	out := m.renderEntry(&Entry{Block: blk}, 40, false)
+	if out == blk.View(40, false) {
+		t.Fatal("a Block without SelfFramed should be wrapped in a Card, not rendered raw")
+	}
+}
+
+type roledBlock struct{ fakeBlock }
+
+func (b *roledBlock) Role() theme.Role { return theme.RoleUser }
+
+func TestRenderEntryBlockCardUsesRoledCapability(t *testing.T) {
+	m := New()
+	blk := &roledBlock{fakeBlock{label: "b"}}
+	out := m.renderEntry(&Entry{Block: blk}, 40, false)
+	want := theme.Card(theme.RoleUser, "", blk.View(theme.InnerWidth(40), false), 40, false)
+	if out != want {
+		t.Fatalf("Roled block should render with its reported role: got %q, want %q", out, want)
 	}
 }

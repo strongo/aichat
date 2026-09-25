@@ -1100,14 +1100,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // matching a typical terminal's own default scroll step.
 const mouseWheelScrollLines = 3
 
-// splitSeparatorWidth is the width, in columns, of the single-space gap
-// View() draws between the chat column and the side panel/sidebar when
-// split (see View, chatWidth/sidebarWidth) -- handleMouseWheel uses it to
-// tell whether a wheel event's X falls in the chat column or past the
-// gap. It is only a bare gap, not a drawn divider (e.g. " │ "), because
-// theme.PanelFrame now draws the panel's OWN left border immediately
-// after it -- an additional manual divider here would double it.
-const splitSeparatorWidth = 1
+// splitSeparatorWidth is 0: View() draws NO gap of its own between the
+// chat column and the side panel/sidebar when split (see View, chatWidth/
+// sidebarWidth) -- theme.PanelFrame draws the panel's own single-column
+// divider as the FIRST column of the side panel itself (founder
+// 2026-09-25: "no boxes around boxes" — one divider, not a chatshell gap
+// plus a PanelFrame border on top of it), so X == chatWidth() is already
+// the divider/side column, not a gap before it. handleMouseWheel uses
+// this to tell whether a wheel event's X falls in the chat column or the
+// side column.
+const splitSeparatorWidth = 0
 
 // handleMouseWheel scrolls the transcript viewport, UNLESS a product
 // SidePanel is installed and the event's X falls in its column (past the
@@ -1364,7 +1366,8 @@ func isCanceled(err error) bool {
 
 func (m *Model) resize() {
 	m.transcript.SetSize(m.chatWidth(), m.historyHeight())
-	m.input.SetWidth(max(1, m.chatWidth()-2))
+	composerCols, _ := theme.ComposerFrameSize()
+	m.input.SetWidth(max(1, m.chatWidth()-composerCols))
 	if m.sidePanel == nil && m.sidebar.Visible() {
 		m.sidebar.SetWidth(m.panelInnerWidth(m.sidebarWidth()))
 	}
@@ -1830,7 +1833,11 @@ func (m *Model) View() tea.View {
 	body := chat
 	if m.splitEnabled() {
 		side := m.panelView(m.sidebarWidth(), m.focusRing.Zone() == focus.ZoneSidebar)
-		body = lipgloss.JoinHorizontal(lipgloss.Top, chat, " │ ", side)
+		// No manual glue between chat and side: theme.PanelFrame already
+		// draws the one divider between them (founder 2026-09-25: "no
+		// boxes around boxes" — a single vertical divider, not a second
+		// one from chatshell on top of it).
+		body = lipgloss.JoinHorizontal(lipgloss.Top, chat, side)
 	}
 	status := m.statusBarView()
 	content := lipgloss.JoinVertical(lipgloss.Left, top, body, status)
