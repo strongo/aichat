@@ -60,7 +60,7 @@ func installationID(path string, op installationOps) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create installation ID temp file: %w", err)
 	}
-	defer os.Remove(tmp.Name())
+	defer func() { _ = os.Remove(tmp.Name()) }()
 	if err := op.chmod(tmp, 0600); err != nil {
 		_ = op.close(tmp)
 		return "", err

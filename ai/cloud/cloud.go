@@ -311,7 +311,7 @@ func (c *Client) ReportInteraction(ctx context.Context, report cloudproto.Intera
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
 		return fmt.Errorf("cloud: interaction report: HTTP %d", resp.StatusCode)
 	}
