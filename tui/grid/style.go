@@ -6,6 +6,8 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+
+	"github.com/strongo/aichat/tui/theme"
 )
 
 // Style is a grid's border/header color preset. It is presentation only:
@@ -18,24 +20,69 @@ type Style struct {
 	HeaderStyle lipgloss.Style
 }
 
-// Built-in style presets, ported from DataTug's table_style.go.
+// Built-in style presets, ported from DataTug's table_style.go. Every
+// colour is resolved fresh from tui/theme on each access (via a function,
+// not a package-level var baked in at import time — theme.Dark can change
+// at runtime, e.g. a product calling theme.SetDark, and a memoised colour
+// would silently keep rendering the OLD variant forever after — see
+// styleLines/styleSoft/styleMinimal below), so a grid always renders in
+// whichever Dark variant is current, light or dark, never a hard-coded
+// background that only looks right in one of them.
 var (
-	StyleLines = Style{
-		Name:        "Lines",
-		BorderColor: lipgloss.Color("241"),
-		HeaderStyle: lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("255")).Bold(true),
-	}
-	StyleSoft = Style{
-		Name:        "Soft",
-		BorderColor: lipgloss.Color("235"),
-		HeaderStyle: lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("250")).Bold(true),
-	}
-	StyleMinimal = Style{
-		Name:        "Minimal",
-		BorderColor: lipgloss.Color("232"),
-		HeaderStyle: lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Bold(true),
-	}
+	StyleLines   = styleLines()
+	StyleSoft    = styleSoft()
+	StyleMinimal = styleMinimal()
 )
+
+// styleLines/styleSoft/styleMinimal build this preset's Style fresh from
+// the CURRENT tui/theme colours. ParseStyle/cycling only ever compare
+// Style.Name, so a Style value captured before a later theme.SetDark call
+// (e.g. these three package vars above, kept for API compatibility) is
+// only ever used as a NAME lookup key, never rendered directly — grid.go's
+// buildTable instead re-resolves the live preset via currentStyle(m.style.
+// Name) on every render, which always reflects theme's current variant.
+func styleLines() Style {
+	bg, fg := theme.SurfaceColors()
+	return Style{
+		Name:        "Lines",
+		BorderColor: theme.MutedColor(),
+		HeaderStyle: lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(true),
+	}
+}
+
+func styleSoft() Style {
+	bg, fg := theme.SurfaceColors()
+	return Style{
+		Name:        "Soft",
+		BorderColor: theme.MutedColor(),
+		HeaderStyle: lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(true),
+	}
+}
+
+func styleMinimal() Style {
+	_, fg := theme.SurfaceColors()
+	return Style{
+		Name:        "Minimal",
+		BorderColor: theme.MutedColor(),
+		HeaderStyle: lipgloss.NewStyle().Foreground(fg).Bold(true),
+	}
+}
+
+// currentStyle re-resolves a Style preset by name against theme's CURRENT
+// colours — grid.go's buildTable calls this instead of using m.style
+// directly, so a grid always renders in the live Dark variant regardless
+// of when its Style value was captured (WithStyle/SetStyle, a saved
+// session's persisted style name, ...).
+func currentStyle(name string) Style {
+	switch name {
+	case "Soft":
+		return styleSoft()
+	case "Minimal":
+		return styleMinimal()
+	default:
+		return styleLines()
+	}
+}
 
 // Styles lists the built-in presets in cycling order.
 var Styles = []Style{StyleLines, StyleSoft, StyleMinimal}
@@ -55,14 +102,34 @@ func (s Style) dividerStyle() lipgloss.Style {
 	return lipgloss.NewStyle().BorderForeground(s.BorderColor)
 }
 
-var (
-	activeTitleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("51"))
-	inactiveTitleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	activeBorderStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
-	selectedOutlineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
-	inactiveBorderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	selectedCellStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
-)
+// activeTitleStyle/inactiveTitleStyle/activeBorderStyle/
+// selectedOutlineStyle/inactiveBorderStyle/selectedCellStyle are FUNCTIONS,
+// not package vars, for the same reason styleLines/styleSoft/styleMinimal
+// above are: every one of them must reflect theme's CURRENT Dark variant
+// on every render, not whatever it was when the package first loaded.
+func activeTitleStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Bold(true).Foreground(theme.FocusColor())
+}
+func inactiveTitleStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(theme.MutedColor())
+}
+func activeBorderStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(theme.FocusColor())
+}
+func selectedOutlineStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(theme.BorderColor(true))
+}
+func inactiveBorderStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(theme.BorderColor(false))
+}
+func selectedCellStyle() lipgloss.Style {
+	// Foreground-only (unlike FocusSurfaceColors' background+foreground
+	// pair the ROW highlight below uses): this marks the SELECTED COLUMN
+	// (h/l), a lighter-weight cue than "the current row" — every cell in
+	// that column getting FocusSurfaceColors' full background would
+	// visually compete with, not complement, the actual row highlight.
+	return lipgloss.NewStyle().Bold(true).Foreground(theme.AccentColor())
+}
 
 // columnStyle mirrors DataTug's gridColumnStyle: numeric columns align
 // right, the selected column is bold/highlighted.
@@ -72,7 +139,7 @@ func columnStyle(col Column, selected bool) lipgloss.Style {
 		alignment = lipgloss.Right
 	}
 	if selected {
-		return selectedCellStyle.Align(alignment)
+		return selectedCellStyle().Align(alignment)
 	}
 	return lipgloss.NewStyle().Align(alignment)
 }

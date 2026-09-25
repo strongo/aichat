@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
+	"github.com/strongo/aichat/tui/theme"
 )
 
 // Chip is a product-neutral attachment shown as a removable pill above the
@@ -336,12 +337,19 @@ func (m *Model) chipsHeight(width int) int {
 	return len(m.chipRows(width))
 }
 
-// chipStyle/chipFocusedStyle render a chip pill's text: dim/blue normal,
-// bold/inverted when focused (Tab-cycled or about to be removed).
-var (
-	chipStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("111"))
-	chipFocusedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57"))
-)
+// chipStyle/chipFocusedStyle render a chip pill's text: muted normal,
+// FocusSurfaceColors-highlighted when focused (Tab-cycled or about to be
+// removed) — the SAME accent every other focused/selected element uses
+// (founder 2026-09-25). Functions, not package vars: theme.Dark can change
+// at runtime (theme.SetDark), and a memoised colour would keep rendering
+// the stale variant forever after.
+func chipStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(theme.MutedColor())
+}
+func chipFocusedStyle() lipgloss.Style {
+	bg, fg := theme.FocusSurfaceColors()
+	return lipgloss.NewStyle().Bold(true).Foreground(fg).Background(bg)
+}
 
 // chipsView renders the current chips as one or more wrapped rows, joined
 // with a blank line above nothing (each row is newline-joined; a space
@@ -355,9 +363,9 @@ func (m *Model) chipsView(width int) string {
 	for _, row := range rows {
 		parts := make([]string, 0, len(row))
 		for _, cell := range row {
-			style := chipStyle
+			style := chipStyle()
 			if cell.index == m.chipFocus {
-				style = chipFocusedStyle
+				style = chipFocusedStyle()
 			}
 			parts = append(parts, style.Render(cell.text))
 		}

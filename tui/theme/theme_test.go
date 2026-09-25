@@ -72,7 +72,7 @@ func TestInnerWidthNeverBelowOne(t *testing.T) {
 	if got := InnerWidth(-5); got != 1 {
 		t.Fatalf("InnerWidth(-5) = %d, want 1", got)
 	}
-	if got := InnerWidth(10); got != 10-borderColumns-2*CardPadding {
+	if got := InnerWidth(10); got != 10-cardBarWidth-2*CardPaddingCols {
 		t.Fatalf("InnerWidth(10) = %d", got)
 	}
 }
@@ -134,8 +134,26 @@ func TestComposerFrameFocusedVsUnfocused(t *testing.T) {
 
 func TestComposerFrameSize(t *testing.T) {
 	cols, rows := ComposerFrameSize()
-	if cols != 2 || rows != 2 {
-		t.Fatalf("ComposerFrameSize() = (%d, %d), want (2, 2)", cols, rows)
+	if cols != 1 || rows != 0 {
+		t.Fatalf("ComposerFrameSize() = (%d, %d), want (1, 0)", cols, rows)
+	}
+}
+
+func TestPanelFrameFocusedVsUnfocused(t *testing.T) {
+	unfocused := PanelFrame(30, "panel content", false)
+	focused := PanelFrame(30, "panel content", true)
+	if unfocused == focused {
+		t.Fatal("focused panel frame identical to unfocused")
+	}
+	if !strings.Contains(plain(unfocused), "panel content") || !strings.Contains(plain(focused), "panel content") {
+		t.Fatalf("frame missing content: unfocused=%q focused=%q", unfocused, focused)
+	}
+}
+
+func TestPanelFrameSize(t *testing.T) {
+	cols, rows := PanelFrameSize()
+	if cols != 1 || rows != 0 {
+		t.Fatalf("PanelFrameSize() = (%d, %d), want (1, 0)", cols, rows)
 	}
 }
 
@@ -194,3 +212,39 @@ func TestSetDarkAndPickBothBranches(t *testing.T) {
 type fakeColor string
 
 func (c fakeColor) RGBA() (r, g, b, a uint32) { return 0, 0, 0, 0 }
+
+func TestContrastMeetsWCAG(t *testing.T) {
+	prevDark := Dark
+	t.Cleanup(func() { SetDark(prevDark) })
+	for _, dark := range []bool{true, false} {
+		SetDark(dark)
+		variant := "dark"
+		if !dark {
+			variant = "light"
+		}
+		pairs := ContrastPairs()
+		if len(pairs) == 0 {
+			t.Fatalf("[%s] ContrastPairs returned none", variant)
+		}
+		for _, p := range pairs {
+			ratio := Contrast(p.FG, p.BG)
+			if ratio < p.MinimumRatio {
+				t.Errorf("[%s] %s: contrast %.2f:1 below minimum %.2f:1 (fg=%#v bg=%#v)", variant, p.Name, ratio, p.MinimumRatio, p.FG, p.BG)
+			}
+		}
+	}
+}
+
+func TestContrastIsSymmetric(t *testing.T) {
+	white := lipgloss.Color("#FFFFFF")
+	black := lipgloss.Color("#000000")
+	if got := Contrast(white, black); got < 20 || got > 21.1 {
+		t.Fatalf("Contrast(white, black) = %.2f, want ~21", got)
+	}
+	if got := Contrast(black, white); got < 20 || got > 21.1 {
+		t.Fatalf("Contrast(black, white) = %.2f, want ~21 (order-independent)", got)
+	}
+	if got := Contrast(white, white); got < 0.99 || got > 1.01 {
+		t.Fatalf("Contrast(white, white) = %.2f, want 1", got)
+	}
+}

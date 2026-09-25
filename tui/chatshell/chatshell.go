@@ -977,12 +977,40 @@ func (m *Model) growPanelChat(delta int) {
 }
 
 // panelView renders the active sidebar-zone content (SidePanel or the
-// default sidebar) at width, focused as given.
+// default sidebar) wrapped in the shared theme.PanelFrame (founder
+// 2026-09-25: "Same for ... side panel" — a full frame, focus-bordered
+// when the zone has focus, matching every other bordered element): width
+// is the frame's OUTER width, so the content itself (and the height a
+// SidePanel is asked to lay out) is sized to PanelFrameSize's smaller
+// inner box via panelInnerWidth/panelInnerHeight — never the raw column
+// width chatshell allotted the whole sidebar zone.
 func (m *Model) panelView(width int, focused bool) string {
+	inner := m.panelInnerWidth(width)
+	var content string
 	if m.sidePanel != nil {
-		return m.sidePanel.View(width, m.historyHeight(), focused)
+		content = m.sidePanel.View(inner, m.panelInnerHeight(), focused)
+	} else {
+		content = m.sidebar.View(inner, focused)
 	}
-	return m.sidebar.View(width, focused)
+	return theme.PanelFrame(width, content, focused)
+}
+
+// panelInnerWidth returns the content width available INSIDE
+// theme.PanelFrame for a panel of the given OUTER width.
+func (m *Model) panelInnerWidth(width int) int {
+	cols, _ := theme.PanelFrameSize()
+	return max(1, width-cols)
+}
+
+// panelInnerHeight returns the content height available INSIDE
+// theme.PanelFrame, given the frame's own top/bottom border rows —
+// historyHeight() is the OUTER row budget the chat column and the side
+// panel column both match (View joins them side by side), so the panel's
+// own content must be that minus PanelFrameSize's row overhead to keep the
+// two columns the same total height.
+func (m *Model) panelInnerHeight() int {
+	_, rows := theme.PanelFrameSize()
+	return max(1, m.historyHeight()-rows)
 }
 
 // updatePanel forwards msg to the active sidebar-zone content.
@@ -1072,11 +1100,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // matching a typical terminal's own default scroll step.
 const mouseWheelScrollLines = 3
 
-// splitSeparatorWidth is the width, in columns, of the " │ " divider View()
-// draws between the chat column and the side panel/sidebar when split
-// (see View, chatWidth/sidebarWidth) -- handleMouseWheel uses it to tell
-// whether a wheel event's X falls in the chat column or past the divider.
-const splitSeparatorWidth = 3
+// splitSeparatorWidth is the width, in columns, of the single-space gap
+// View() draws between the chat column and the side panel/sidebar when
+// split (see View, chatWidth/sidebarWidth) -- handleMouseWheel uses it to
+// tell whether a wheel event's X falls in the chat column or past the
+// gap. It is only a bare gap, not a drawn divider (e.g. " │ "), because
+// theme.PanelFrame now draws the panel's OWN left border immediately
+// after it -- an additional manual divider here would double it.
+const splitSeparatorWidth = 1
 
 // handleMouseWheel scrolls the transcript viewport, UNLESS a product
 // SidePanel is installed and the event's X falls in its column (past the
@@ -1335,7 +1366,7 @@ func (m *Model) resize() {
 	m.transcript.SetSize(m.chatWidth(), m.historyHeight())
 	m.input.SetWidth(max(1, m.chatWidth()-2))
 	if m.sidePanel == nil && m.sidebar.Visible() {
-		m.sidebar.SetWidth(m.sidebarWidth())
+		m.sidebar.SetWidth(m.panelInnerWidth(m.sidebarWidth()))
 	}
 }
 

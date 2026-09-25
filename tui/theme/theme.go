@@ -19,6 +19,7 @@ package theme
 
 import (
 	"image/color"
+	"math"
 	"os"
 	"strings"
 
@@ -140,15 +141,52 @@ func FocusColor() color.Color { return pick(lipgloss.Color("#1A5FC7"), lipgloss.
 
 // MutedColor is the shared low-emphasis text colour (hint labels, an empty
 // sidebar's placeholder, unfocused chrome borders).
-func MutedColor() color.Color { return pick(lipgloss.Color("#6B6B63"), lipgloss.Color("#8A8F98")) }
+func MutedColor() color.Color { return pick(lipgloss.Color("#54544C"), lipgloss.Color("#A3A8B1")) }
 
 // AccentColor is the shared emphasis colour for a hint's key/shortcut
 // (distinct from FocusColor, which marks focus/selection specifically).
-func AccentColor() color.Color { return pick(lipgloss.Color("#8A5A00"), lipgloss.Color("#E8C25A")) }
+func AccentColor() color.Color { return pick(lipgloss.Color("#734B00"), lipgloss.Color("#E8C25A")) }
 
 func barColors() (bg, fg color.Color) {
 	return pick(lipgloss.Color("#D8DCE6"), lipgloss.Color("#2E3440")),
 		pick(lipgloss.Color("#101820"), lipgloss.Color("#ECEFF4"))
+}
+
+// SurfaceColors returns the neutral panel/grid surface background+
+// foreground pair — RoleBlock's own colours — for any component that needs
+// a plain themed surface (blending into its enclosing card) WITHOUT
+// drawing its own full Card frame, e.g. tui/grid's non-highlighted cells,
+// tui/sidebar's unselected rows, or a side panel's frame background. No
+// aichat component should pick its own background literal for this; read
+// it from here so a grid cell, a sidebar row and a card never disagree
+// about what "the surface" looks like.
+func SurfaceColors() (bg, fg color.Color) {
+	bg, _, fg = blockColors()
+	return bg, fg
+}
+
+// FocusSurfaceColors returns the SINGLE background+foreground pair every
+// aichat component uses to mark "this is focused/selected": background is
+// FocusColor() itself — the SAME accent a focused Card's border and the
+// composer's focused border use — paired with a foreground guaranteed to
+// contrast with it in both Dark variants. A grid's highlighted row, a
+// sidebar's selected row, and a join block's chosen candidate all use this
+// pair, so "what is selected" reads as the one consistent accent across
+// every aichat component (founder 2026-09-25: "Use the single theme focus/
+// selection colour everywhere").
+func FocusSurfaceColors() (bg, fg color.Color) {
+	return FocusColor(), pick(lipgloss.Color("#FFFFFF"), lipgloss.Color("#0B1220"))
+}
+
+// BorderColor returns FocusColor() when focused, MutedColor() otherwise —
+// the one rule every bordered aichat element (a Card, the composer frame,
+// a grid's own card, a panel frame) follows for its border colour, so a
+// product never has to decide this for itself.
+func BorderColor(focused bool) color.Color {
+	if focused {
+		return FocusColor()
+	}
+	return MutedColor()
 }
 
 // --- header labels -----------------------------------------------------
@@ -173,48 +211,85 @@ func HeaderFor(role Role) string {
 }
 
 // --- cards ---------------------------------------------------------------
+//
+// Founder ruling (2026-09-25, REPLACING the earlier bordered-card design):
+// "There is unnecessary border around message card and grid. The card
+// defined not by border but by background for user message and in
+// generally." A card is a FILLED BACKGROUND BLOCK, never a box-drawing
+// border — a role's background tint (colorsFor) IS the card, with inner
+// padding and a bold header line inside the fill. Focus/selection (no
+// border to thicken) instead SHIFTS the whole fill to
+// FocusSurfaceColors() and adds a 1-column left accent bar in FocusColor()
+// — the bar is the non-text focus indicator (>= nonTextMinRatio against
+// the surrounding background; see the contrast section below), the
+// background shift is the reading cue. Grids are the one exception (see
+// tui/grid) — a grid keeps its own drawn border, title/footer inline in
+// the border, and a scrollbar in the right border, with NO card fill
+// around it (transcript's SelfFramed capability skips the Card wrap for
+// it entirely).
 
-// CardPadding is the horizontal space, in columns, kept between a card's
-// border and its content on each side.
-const CardPadding = 1
+// CardPaddingCols/Rows is the space, in columns/rows, kept between a
+// card's fill edge and its content.
+const CardPaddingCols = 2
+const CardPaddingRows = 1
 
-// borderColumns is how many columns a card's left+right border consumes.
-const borderColumns = 2
+// MaxInlineGridRows is the shared default for how many data rows a grid
+// shows at once when embedded inline in a transcript (tui/grid.Model's
+// DefaultMaxVisibleRows) — founder 2026-09-25: "Grids embedded in the chat
+// transcript show at most 10 data rows (default; make it a theme/
+// transcript constant ... overridable per product via an option, not a
+// per-product style)". A product overrides it per grid via
+// grid.WithMaxVisibleRows(n), never by redefining this constant.
+const MaxInlineGridRows = 10
+
+// cardBarWidth is the 1-column left accent bar Card reserves on every
+// card (rendered in FocusColor() when focused, or the card's own
+// background — i.e. invisible — otherwise), so a card's OUTER width never
+// changes between its focused and unfocused rendering.
+const cardBarWidth = 1
 
 // InnerWidth returns the content width available inside a card of the
 // given OUTER width — what a Block should render at (via
 // theme.InnerWidth(width)) so its own View(width, focused) output lines up
 // exactly with the card Card(...) then wraps it in.
 func InnerWidth(width int) int {
-	return max(1, width-borderColumns-2*CardPadding)
+	return max(1, width-cardBarWidth-2*CardPaddingCols)
 }
 
-// Card renders body (and, when non-empty, header above it in bold) inside a
-// padded, coloured, rounded-border card for role, at OUTER width — the
-// same visual language across every product: a distinct but harmonious
-// background/border per role, and a clearly visible, thicker, accent
-// border while focused (DataTug's current selection highlighting is the
-// reference look).
+// Card renders body (and, when non-empty, header above it in bold) as a
+// filled, coloured background block for role, at OUTER width — see the
+// package doc above for the no-border design and its focus/selection
+// language. Every aichat product's message/Block cards render through
+// this one function.
 func Card(role Role, header, body string, width int, focused bool) string {
-	bg, border, fg := colorsFor(role)
-	b := lipgloss.RoundedBorder()
+	bg, _, fg := colorsFor(role)
+	barColor := bg // blends into the fill — invisible — when unfocused.
 	if focused {
-		b = lipgloss.ThickBorder()
-		border = FocusColor()
+		bg, fg = FocusSurfaceColors()
+		barColor = FocusColor()
 	}
-	style := lipgloss.NewStyle().
-		Background(bg).
-		Foreground(fg).
-		BorderStyle(b).
-		BorderForeground(border).
-		BorderBackground(bg).
-		Padding(0, CardPadding).
-		Width(InnerWidth(width))
 	content := body
 	if header != "" {
-		content = lipgloss.NewStyle().Bold(true).Foreground(fg).Render(header) + "\n" + body
+		content = lipgloss.NewStyle().Bold(true).Background(bg).Foreground(fg).Render(header) + "\n" + body
 	}
-	return style.Render(content)
+	fillStyle := lipgloss.NewStyle().
+		Background(bg).
+		Foreground(fg).
+		Padding(CardPaddingRows, CardPaddingCols).
+		Width(InnerWidth(width))
+	return addLeftBar(fillStyle.Render(content), barColor)
+}
+
+// addLeftBar prepends a 1-column bar (bg-filled with barColor) to every
+// line of block — Card's focus indicator, and ComposerFrame's/PanelFrame's
+// analogous accent column.
+func addLeftBar(block string, barColor color.Color) string {
+	bar := lipgloss.NewStyle().Background(barColor).Render(" ")
+	lines := strings.Split(block, "\n")
+	for i, line := range lines {
+		lines[i] = bar + line
+	}
+	return strings.Join(lines, "\n")
 }
 
 // --- bars (top bar / hints-status bar) ------------------------------------
@@ -270,76 +345,259 @@ type Hint struct {
 	Label string
 }
 
-// RenderHints renders the shared hints/status bar: each Hint as its key (in
-// AccentColor, bold) followed by its label (in MutedColor), hints separated
-// by two spaces, then any trailing right-of-hints segments (e.g. a product/
-// session summary or a hyperlink) separated by " │ " — DataTug's original
-// statusBar layout, now the default for every product. A product supplies
-// only the hint list and segment strings; chatshell.WithHintsProvider (or
-// the plain SetStatus default) wires this in automatically.
+// RenderHints renders the shared hints/status bar: any trailing segments
+// (e.g. a product/session summary or a hyperlink) first, then each Hint as
+// its key (in AccentColor, bold) followed by its label (in MutedColor) —
+// DataTug's original statusBar layout, now the default for every product.
+// Unlike a single-line Bar, RenderHints WRAPS: a segment or hint that would
+// overflow the current line starts a new line instead of being silently
+// truncated (ported from DataTug's own wrapStatusSegments, now shared —
+// founder 2026-09-25: "Same for ... hints status bar"), each wrapped line
+// rendered through Bar so every line keeps the shared chrome. A product
+// supplies only the hint list and segment strings; chatshell.
+// WithHintsProvider (or the plain SetStatus default) wires this in
+// automatically.
 func RenderHints(width int, hints []Hint, segments ...string) string {
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(AccentColor())
 	labelStyle := lipgloss.NewStyle().Foreground(MutedColor())
-	parts := make([]string, 0, len(hints))
+	tokens := make([]string, 0, len(hints)+len(segments))
+	tokens = append(tokens, segments...)
 	for _, h := range hints {
-		parts = append(parts, keyStyle.Render(h.Key)+" "+labelStyle.Render(h.Label))
+		tokens = append(tokens, keyStyle.Render(h.Key)+" "+labelStyle.Render(h.Label))
 	}
-	content := strings.Join(parts, "  ")
-	if len(segments) > 0 {
-		joined := strings.Join(segments, " │ ")
-		if content != "" {
-			content = joined + "   " + content
-		} else {
-			content = joined
+	lines := wrapTokens(tokens, max(1, width))
+	if len(lines) == 0 {
+		return Bar(width, "")
+	}
+	styled := make([]string, len(lines))
+	for i, line := range lines {
+		styled[i] = Bar(width, line)
+	}
+	return strings.Join(styled, "\n")
+}
+
+// wrapTokens packs tokens onto as few lines as fit within maxWidth,
+// breaking to a new line only when the next token would not fit — ported
+// from DataTug's wrapStatusSegments (datatug-cli/pkg/chat/chatui.go,
+// before this package existed).
+func wrapTokens(tokens []string, maxWidth int) []string {
+	const separator = "   "
+	lines := make([]string, 0, len(tokens))
+	current := ""
+	for _, token := range tokens {
+		token = ansi.Truncate(token, maxWidth, "…")
+		candidate := token
+		if current != "" {
+			candidate = current + separator + token
 		}
+		if current != "" && ansi.StringWidth(candidate) > maxWidth {
+			lines = append(lines, current)
+			current = token
+			continue
+		}
+		current = candidate
 	}
-	return Bar(width, content)
+	if current != "" {
+		lines = append(lines, current)
+	}
+	return lines
 }
 
 // --- composer frame --------------------------------------------------
+//
+// Founder ruling (2026-09-25): "Composer: consistent with this language —
+// prefer a filled input area (background) with a focus accent rather than
+// a heavy box." Same language as Card: a filled SurfaceColors background,
+// no border, shifting to FocusSurfaceColors plus a 1-column left accent
+// bar while focused.
 
-// composerBorderColumns/Rows is the frame ComposerFrame draws around a
-// composer's own rendered view: one column/row of border on each side (no
-// extra padding — the textarea already reserves its own).
-const composerBorderColumns = 2
-const composerBorderRows = 2
+// composerBarWidth is the 1-column left accent bar ComposerFrame reserves
+// (see cardBarWidth's identical reasoning: a constant outer width whether
+// or not it's focused).
+const composerBarWidth = 1
 
 // ComposerFrameSize returns how many extra columns/rows ComposerFrame adds
 // around its content, so a caller (chatshell's resize/historyHeight) can
-// size the inner input and reserve the right amount of screen space.
-func ComposerFrameSize() (cols, rows int) { return composerBorderColumns, composerBorderRows }
+// size the inner input and reserve the right amount of screen space. Rows
+// is always 0 — a filled background needs no extra rows, unlike the
+// earlier bordered design's top/bottom border lines.
+func ComposerFrameSize() (cols, rows int) { return composerBarWidth, 0 }
 
 // ComposerFrame wraps a composer's rendered input view in the shared
-// bordered box: FocusColor and a thicker border while focused, MutedColor
-// and a thinner one otherwise — the same accent a focused card or a
+// filled background: SurfaceColors unfocused, FocusSurfaceColors plus a
+// left accent bar while focused — the same accent a focused card or a
 // selected panel row uses, so "the composer has focus" reads consistently
 // with every other zone.
 func ComposerFrame(width int, content string, focused bool) string {
-	border := MutedColor()
-	b := lipgloss.RoundedBorder()
+	bg, fg := SurfaceColors()
+	barColor := bg
 	if focused {
-		border = FocusColor()
-		b = lipgloss.ThickBorder()
+		bg, fg = FocusSurfaceColors()
+		barColor = FocusColor()
 	}
-	style := lipgloss.NewStyle().BorderStyle(b).BorderForeground(border).Width(max(1, width-composerBorderColumns))
-	return style.Render(content)
+	style := lipgloss.NewStyle().Background(bg).Foreground(fg).Width(max(1, width-composerBarWidth))
+	return addLeftBar(style.Render(content), barColor)
 }
 
 // --- panel / sidebar rows ------------------------------------------------
 
-// SelectedRow renders one side-panel/sidebar row: "  text" unselected, or
-// "› text" in FocusColor+bold when selected — the same accent a focused
-// card uses, so a selected list row and a focused message read as the same
-// kind of thing.
+// SelectedRow renders one side-panel/sidebar row: "  text" unselected, or a
+// FocusSurfaceColors()-highlighted "› text" when selected — the SAME accent
+// a focused card's border and a grid's highlighted row use, so a selected
+// list row, a focused message, and a selected grid row all read as the
+// same kind of thing (founder 2026-09-25: "Use the single theme focus/
+// selection colour everywhere").
 func SelectedRow(text string, selected bool) string {
 	if !selected {
 		return "  " + text
 	}
-	return lipgloss.NewStyle().Bold(true).Foreground(FocusColor()).Render("› " + text)
+	bg, fg := FocusSurfaceColors()
+	return lipgloss.NewStyle().Bold(true).Background(bg).Foreground(fg).Render("› " + text)
 }
 
 // PanelHeader renders a side-panel/sidebar title header, e.g. "Sidebar" or
 // a product workspace pane's tab name.
 func PanelHeader(title string) string {
 	return lipgloss.NewStyle().Bold(true).Render(title)
+}
+
+// panelDividerWidth is the single vertical divider PanelFrame draws
+// between the transcript and the side panel — founder 2026-09-25: "side
+// panel may keep a frame line only where it separates the panel from the
+// transcript (a single vertical divider is fine) — no boxes around
+// boxes." One column, no border on the other three sides, no padding (a
+// panel's own content, e.g. tui/sidebar's header line, manages its own
+// spacing).
+const panelDividerWidth = 1
+
+// PanelFrameSize returns how many extra columns/rows PanelFrame adds
+// around its content, so a caller (chatshell's panel sizing) can size the
+// panel's own content and reserve the right amount of screen space —
+// mirroring ComposerFrameSize. Rows is always 0.
+func PanelFrameSize() (cols, rows int) { return panelDividerWidth, 0 }
+
+// PanelFrame draws the single divider between the transcript and a side
+// panel's (the default sidebar, or a product SidePanel) own content:
+// BorderColor(focused) — the same accent a focused card/composer uses —
+// so the side panel reads as "this has focus" consistently with every
+// other zone (founder 2026-09-25: "Same for ... side panel"), without a
+// full box around it. The panel's own content (e.g. tui/sidebar's own
+// header line, or a product SidePanel's own tab strip) supplies whatever
+// header/label it wants; PanelFrame only supplies the divider and the
+// panel's background fill.
+func PanelFrame(width int, content string, focused bool) string {
+	bg, fg := SurfaceColors()
+	style := lipgloss.NewStyle().Background(bg).Foreground(fg).Width(max(1, width-panelDividerWidth))
+	return addLeftBar(style.Render(content), BorderColor(focused))
+}
+
+// --- contrast (WCAG 2.x) --------------------------------------------------
+//
+// Founder ruling (2026-09-25): "Make sure we have good contrast and texts
+// are readable" — made measurable, not eyeballed. Every (foreground,
+// background) combination this package actually paints together is named
+// below (ContrastPairs) and checked by TestContrastMeetsWCAG, for BOTH
+// Dark variants, against the thresholds a colour change can never
+// regress silently:
+//
+//   - body text (message text, grid cells, side-panel rows, hint labels)
+//     on its actual background, and selected/highlighted row text on the
+//     selection background: >= bodyTextMinRatio (WCAG AA normal text).
+//   - a focus border/accent against its surrounding background:
+//     >= nonTextMinRatio (WCAG AA non-text contrast) — a border only
+//     needs to be DISTINGUISHABLE, not read as text.
+//   - "muted" text (MutedColor) is read at the SAME bodyTextMinRatio as
+//     any other text — lower emphasis MUST come from weight/saturation,
+//     never from dropping below the text threshold. placeholderMinRatio
+//     exists for the one deliberate exception a product's OWN placeholder
+//     text (e.g. a composer's "Ask anything...", not itself part of this
+//     package) may use instead, documented here rather than silently
+//     assumed.
+
+const (
+	// bodyTextMinRatio is the WCAG AA "normal text" contrast minimum,
+	// applied to every body/muted/selected/header text pair below.
+	bodyTextMinRatio = 4.5
+	// nonTextMinRatio is the WCAG AA "non-text contrast" minimum, applied
+	// to a focus border/accent against its surrounding background.
+	nonTextMinRatio = 3.0
+	// placeholderMinRatio is NOT enforced by this package's own pairs —
+	// documented here as the floor a product's own placeholder text (a
+	// deliberately de-emphasised affordance, not a themed colour pair)
+	// may use instead of bodyTextMinRatio.
+	placeholderMinRatio = 3.0
+)
+
+// ContrastPair names one (foreground, background) combination this
+// package actually paints together, and the minimum WCAG 2.x contrast
+// ratio (see Contrast) it must meet.
+type ContrastPair struct {
+	Name         string
+	FG, BG       color.Color
+	MinimumRatio float64
+}
+
+// ContrastPairs returns every (foreground, background) combination this
+// package paints together, for the CURRENT Dark variant (call SetDark
+// first to get the other variant's set) — the enumerable source of truth
+// TestContrastMeetsWCAG checks, so a future colour change that regresses
+// readability fails a test instead of shipping.
+func ContrastPairs() []ContrastPair {
+	pairs := make([]ContrastPair, 0, 32)
+	for _, role := range []Role{RoleUser, RoleAssistant, RoleSystem, RoleError, RoleBlock} {
+		bg, _, fg := colorsFor(role)
+		pairs = append(pairs,
+			ContrastPair{Name: string(role) + " card body/header text", FG: fg, BG: bg, MinimumRatio: bodyTextMinRatio},
+			ContrastPair{Name: string(role) + " focused card border vs card background", FG: FocusColor(), BG: bg, MinimumRatio: nonTextMinRatio},
+		)
+	}
+
+	surfaceBG, surfaceFG := SurfaceColors()
+	pairs = append(pairs,
+		ContrastPair{Name: "surface body text (grid cell, sidebar row, panel frame)", FG: surfaceFG, BG: surfaceBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "muted text on surface (grid footer, unfocused chip)", FG: MutedColor(), BG: surfaceBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "accent text on surface (grid selected-column cell)", FG: AccentColor(), BG: surfaceBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "focus border vs surface background", FG: FocusColor(), BG: surfaceBG, MinimumRatio: nonTextMinRatio},
+	)
+
+	focusBG, focusFG := FocusSurfaceColors()
+	pairs = append(pairs,
+		ContrastPair{Name: "selected/highlighted row text on selection background", FG: focusFG, BG: focusBG, MinimumRatio: bodyTextMinRatio},
+	)
+
+	barBG, barFG := barColors()
+	pairs = append(pairs,
+		ContrastPair{Name: "top/status bar text", FG: barFG, BG: barBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "hint key (AccentColor) on bar background", FG: AccentColor(), BG: barBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "hint label (MutedColor) on bar background", FG: MutedColor(), BG: barBG, MinimumRatio: bodyTextMinRatio},
+		ContrastPair{Name: "focus border vs bar background", FG: FocusColor(), BG: barBG, MinimumRatio: nonTextMinRatio},
+	)
+
+	return pairs
+}
+
+// relativeLuminance computes a colour's WCAG 2.x relative luminance from
+// its sRGB channels (color.Color.RGBA(), 16-bit, alpha ignored — every
+// colour this package defines is fully opaque).
+func relativeLuminance(c color.Color) float64 {
+	r, g, b, _ := c.RGBA()
+	linear := func(channel uint32) float64 {
+		v := float64(channel) / 65535
+		if v <= 0.03928 {
+			return v / 12.92
+		}
+		return math.Pow((v+0.055)/1.055, 2.4)
+	}
+	return 0.2126*linear(r) + 0.7152*linear(g) + 0.0722*linear(b)
+}
+
+// Contrast computes the WCAG 2.x contrast ratio between two colours —
+// (L1+0.05)/(L2+0.05) with L1 the lighter relative luminance — the metric
+// ContrastPairs' MinimumRatio thresholds are expressed in.
+func Contrast(a, b color.Color) float64 {
+	la, lb := relativeLuminance(a), relativeLuminance(b)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
 }

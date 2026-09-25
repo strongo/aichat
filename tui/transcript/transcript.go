@@ -52,6 +52,32 @@ type Titled interface {
 	Title() string
 }
 
+// Roled is an optional Block capability: when implemented, its Role()
+// selects which theme.Role the shared card renders it as (theme.RoleUser,
+// theme.RoleAssistant, ...) instead of the generic theme.RoleBlock — e.g. a
+// product's own focusable/editable user-message Block (DataTug's
+// userMessageBlock) that still wants the same accent a plain, non-Block
+// user message gets. A Block that doesn't implement it renders as
+// theme.RoleBlock.
+type Roled interface {
+	Role() theme.Role
+}
+
+// SelfFramed is an optional Block capability: when it reports true,
+// transcript renders the Block's own View directly, with NO theme.Card
+// fill wrapped around it at all — e.g. tui/grid.Model, which always draws
+// its own complete border (inline title/footer, a right-edge scrollbar)
+// matching this package's design language for tabular/scrollable content
+// (founder 2026-09-25: "Grids are the exception ... NO surrounding card
+// fill or second frame"; see spec/features/tui-kit's card-vs-grid framing
+// rule). A Block that doesn't implement it, or reports false, gets
+// wrapped in the shared theme.Card fill like any other message — the
+// right choice for prose-like content (e.g. an HTTP response's rendered
+// body, DataTug's own httpDocumentBlock).
+type SelfFramed interface {
+	SelfFramed() bool
+}
+
 // EscCapturer is an optional Block capability: when a focused block is in an
 // input-like mode of its own (e.g. a grid's "/" filter box has focus), it
 // returns true so Esc reaches the block (via Update) instead of chatshell's
@@ -523,22 +549,31 @@ func (m *Model) Rebuild(scrollToBottom bool) {
 func (m *Model) View() string { return m.viewport.View() }
 
 // renderEntry renders one transcript entry as the shared card every aichat
-// product's messages, markdown responses and Blocks now render as (founder
-// 2026-09-25: "Message should be like a card in chat of any app" and
-// "Blocks ... should sit in the same card frame"): a coloured, bordered,
-// padded box from tui/theme, distinct per role, with a bold header and a
-// clearly visible focus highlight when focused — never a scattered
-// lipgloss.NewStyle() literal here; every colour/border/padding decision
-// lives in tui/theme.
+// product's messages, markdown responses and (prose-like) Blocks now
+// render as (founder 2026-09-25: "Message should be like a card in chat
+// of any app"; "The card defined not by border but by background"): a
+// coloured, FILLED-BACKGROUND box from tui/theme, distinct per role, with
+// a bold header and a clearly visible focus highlight (a background shift
+// plus a left accent bar — never a border) — never a scattered
+// lipgloss.NewStyle() literal here; every colour/padding decision lives in
+// tui/theme. A grid-like Block (SelfFramed) is the one exception: it
+// renders its own View directly, with no Card fill (see SelfFramed).
 func (m *Model) renderEntry(e *Entry, width int, focused bool) string {
 	switch {
 	case e.Block != nil:
+		if sf, ok := e.Block.(SelfFramed); ok && sf.SelfFramed() {
+			return e.Block.View(width, focused)
+		}
 		header := ""
 		if t, ok := e.Block.(Titled); ok {
 			header = t.Title()
 		}
+		role := theme.RoleBlock
+		if r, ok := e.Block.(Roled); ok {
+			role = r.Role()
+		}
 		body := e.Block.View(theme.InnerWidth(width), focused)
-		return theme.Card(theme.RoleBlock, header, body, width, focused)
+		return theme.Card(role, header, body, width, focused)
 	case e.Role == RoleUser:
 		return theme.Card(theme.RoleUser, theme.HeaderFor(theme.RoleUser), e.Text, width, focused)
 	case e.Markdown && m.markdownRenderer != nil:
