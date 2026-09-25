@@ -1022,15 +1022,36 @@ func (m *Model) panelInnerWidth(width int) int {
 	return max(1, width-cols)
 }
 
+// chatColumnHeight is the TOTAL row count the chat column occupies in
+// View(): history (plus its trailing busy-spinner line when Busy()), the
+// open slash-command menu, the pre-chips/composer margin row, the chip
+// row, and the composer itself -- exactly what View() stacks into
+// chatParts before lipgloss.JoinHorizontal joins it with the side panel.
+// The side panel must span this SAME total (see panelInnerHeight), not
+// just historyHeight() alone -- founder, r12 coordinator review,
+// verbatim: "the panel spans the transcript area AND the composer rows
+// (the composer sits only in the left column)" -- the earlier
+// historyHeight()-only budget left the panel exactly composerHeight()+
+// theme.ContentMargins(m.height) rows short of the composer's own bottom
+// edge (a real regression the coordinator measured: "panel bottom edge
+// on row 25 while the composer's bottom edge is on row 29").
+func (m *Model) chatColumnHeight() int {
+	busySpinnerLine := 0
+	if m.busy {
+		busySpinnerLine = 1
+	}
+	return m.historyHeight() + busySpinnerLine + m.menuHeight() + theme.ContentMargins(m.height) + m.chipsHeight(m.chatWidth()) + m.composerHeight()
+}
+
 // panelInnerHeight returns the content height available INSIDE
 // theme.PanelFrame, given the frame's own top/bottom border rows —
-// historyHeight() is the OUTER row budget the chat column and the side
-// panel column both match (View joins them side by side), so the panel's
-// own content must be that minus PanelFrameSize's row overhead to keep the
-// two columns the same total height.
+// chatColumnHeight() is the OUTER row budget the chat column and the
+// side panel column both match (View joins them side by side), so the
+// panel's own content must be that minus PanelFrameSize's row overhead
+// to keep the two columns' BOTTOM edges aligned.
 func (m *Model) panelInnerHeight() int {
 	_, rows := theme.PanelFrameSize()
-	return max(1, m.historyHeight()-rows)
+	return max(1, m.chatColumnHeight()-rows)
 }
 
 // updatePanel forwards msg to the active sidebar-zone content.
@@ -1472,9 +1493,15 @@ func (m *Model) historyHeight() int {
 	// terminal is tall enough (theme.ContentMargins): one between the top
 	// bar and the content below it, one between the last transcript card
 	// and the composer, and (r12) one between the composer and the
-	// status bar -- see View()'s own doc. All three collapse to 0 below
+	// status bar -- but only when statusBarVisible() (there's nothing to
+	// separate the composer FROM when there's no status bar at all -- see
+	// View()'s own doc, and statusBarVisible's). All collapse to 0 below
 	// theme.MarginCollapseRows terminal rows, same as here.
-	marginRows := 3 * theme.ContentMargins(m.height)
+	marginCount := 2
+	if m.statusBarVisible() {
+		marginCount = 3
+	}
+	marginRows := marginCount * theme.ContentMargins(m.height)
 	return max(1, m.height-m.topBarHeight()-m.menuHeight()-m.composerHeight()-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine-marginRows)
 }
 
@@ -1519,12 +1546,31 @@ func (m *Model) menuHeight() int {
 	return strings.Count(menu, "\n") + 1
 }
 
+// statusBarVisible reports whether View() renders ANY status/hints
+// segment at all -- false only when there is truly nothing to show: no
+// WithHintsProvider, no legacy WithStatusBar, and SetStatus was never
+// given non-empty text. False means View() omits BOTH the pre-status
+// margin row and the status segment itself, so the composer's own bottom
+// edge becomes the terminal's literal last row -- founder, r12, verbatim,
+// seeing the rendered result in Warp: "with no hints, the composer's
+// bottom edge must be the last screen line (no trailing empty rows);
+// with hints, the hints are the last line(s)."
+func (m *Model) statusBarVisible() bool {
+	return m.hintsProvider != nil || m.statusBarFn != nil || m.status != ""
+}
+
 // statusSegmentHeight is how many rows View()'s status segment occupies:
-// the status text's own line count when SetStatus has been given
-// something, or 1 when it hasn't -- lipgloss.JoinVertical still renders one
+// 0 when statusBarVisible() is false (nothing to show at all -- see its
+// own doc), the status text's own line count when SetStatus has been
+// given something, or 1 for an active hints/status provider whose own
+// text happens to be empty -- lipgloss.JoinVertical still renders one
 // blank row for an EMPTY final segment, same as it would for a one-line
-// one, so an empty status is not "0 rows of chrome".
+// one, so an active-but-empty status is not "0 rows of chrome" (only a
+// genuinely ABSENT one is).
 func (m *Model) statusSegmentHeight() int {
+	if !m.statusBarVisible() {
+		return 0
+	}
 	if m.status == "" {
 		return 1
 	}
@@ -2019,13 +2065,21 @@ func (m *Model) View() tea.View {
 	// between the composer and the hints/status bar" rule -- see theme's
 	// own vertical-margins doc). The status bar itself is the LAST part
 	// joined below, with nothing after it, so it always lands on the
-	// terminal's own last row.
-	bodyParts := []string{body}
-	for range theme.ContentMargins(m.height) {
-		bodyParts = append(bodyParts, "")
+	// terminal's own last row -- but ONLY when there is one: with nothing
+	// to show at all (statusBarVisible() false), neither this margin row
+	// NOR a blank status placeholder is appended, so the COMPOSER's own
+	// bottom edge becomes the terminal's last row instead (founder, r12,
+	// same round: "with no hints, the composer's bottom edge must be the
+	// last screen line (no trailing empty rows)").
+	parts := append([]string{}, topParts...)
+	parts = append(parts, body)
+	if m.statusBarVisible() {
+		for range theme.ContentMargins(m.height) {
+			parts = append(parts, "")
+		}
+		parts = append(parts, m.statusBarView())
 	}
-	status := m.statusBarView()
-	content := lipgloss.JoinVertical(lipgloss.Left, append(append(topParts, bodyParts...), status)...)
+	content := lipgloss.JoinVertical(lipgloss.Left, parts...)
 	if n := len(m.overlays); n > 0 {
 		content = m.renderOverlay(content, m.overlays[n-1])
 	}

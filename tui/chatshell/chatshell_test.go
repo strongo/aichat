@@ -2130,6 +2130,24 @@ func TestHandleMarkdownRenderTickIgnoresStaleTick(t *testing.T) {
 	}
 }
 
+// TestStatusLinesAndStatusBarViewDefensiveEmptyBranches covers
+// statusLines()'s and statusBarView()'s own empty-status fallbacks
+// DIRECTLY: r12's statusBarVisible() gate means View() itself never
+// reaches them any more (with nothing to show at all, View() skips
+// calling statusBarView() entirely -- see statusBarVisible's own doc),
+// but both methods stay defensively correct for any OTHER caller that
+// might invoke them with an empty m.status.
+func TestStatusLinesAndStatusBarViewDefensiveEmptyBranches(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	if lines := m.statusLines(); lines != nil {
+		t.Fatalf("statusLines() with empty status = %v, want nil", lines)
+	}
+	if got := m.statusBarView(); got == "" {
+		t.Fatal("statusBarView() with empty status returned empty string, want a padded blank line")
+	}
+}
+
 func TestStatusLinesSplitsMultilineStatus(t *testing.T) {
 	h := &fakeHandler{}
 	m := newTestShell(h)
