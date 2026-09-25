@@ -575,16 +575,23 @@ func ComposerFrameSize() (cols, rows int) {
 // composerFocusTint is the mixing weight ComposerFocusColors blends
 // FocusColor() into the composer's unfocused surface by — a "slightly
 // stronger tint", not the full bright FocusColor() fill Card/
-// FocusSurfaceColors uses. Founder/coordinator correction (r9, on seeing
-// the composer rendered with FocusSurfaceColors like a Card): "a SUBTLE
-// filled area (a tint one step off the terminal background, like the
-// cards) ... focus = the thin left accent bar in the focus colour +
-// slightly stronger tint (NOT a full bright fill)" — a Card intentionally
-// goes full FocusSurfaceColors on focus (there's no better cue: an entire
-// message either has focus or doesn't), but the composer already reads as
-// focused via its left accent bar and the cursor inside it, so its own
-// fill only needs to nudge toward the accent, not become it.
-const composerFocusTint = 0.22
+// FocusSurfaceColors uses. Founder correction, twice over: first (r9)
+// "a SUBTLE filled area (a tint one step off the terminal background,
+// like the cards) ... focus = the thin left accent bar in the focus
+// colour + slightly stronger tint (NOT a full bright fill)"; then,
+// verbatim, more precisely: "the background of composer should just
+// slightly differ from overall/chat background ... Focus is shown by the
+// thin left accent bar (and at most a MARGINALLY stronger tint)". 0.04
+// keeps the FOCUSED fill's own delta against TerminalBackground() inside
+// [minComposerSurfaceDelta, maxComposerSurfaceDelta] (~1.26:1 dark,
+// ~1.28:1 light) — barely past the UNFOCUSED fill's own ~1.18/1.20:1,
+// never the earlier 0.22 blend's ~1.8:1 "bright slab". A Card
+// intentionally goes full FocusSurfaceColors on focus (there's no better
+// cue: an entire message either has focus or doesn't), but the composer
+// already reads as focused via its left accent bar and the cursor inside
+// it, so its own fill only needs the smallest nudge toward the accent,
+// not become it.
+const composerFocusTint = 0.04
 
 // ComposerFocusColors returns the composer's FOCUSED fill: its own
 // unfocused SurfaceColors() background blended composerFocusTint of the
@@ -791,12 +798,30 @@ func ContrastPairs() []ContrastPair {
 // default — fails loudly instead of shipping again).
 const minSurfaceDelta = 1.15
 
-// SurfaceDeltaPair names one card/composer surface fill and the minimum
-// contrast ratio (see Contrast) it must have against TerminalBackground().
+// minComposerSurfaceDelta/maxComposerSurfaceDelta bound the composer
+// fill's delta against TerminalBackground() on BOTH sides — founder,
+// verbatim: "the background of composer should just slightly differ from
+// overall/chat background ... contrast ratio vs chat background between
+// ~1.1:1 and ~1.3:1, never a bright/saturated fill". Unlike the card
+// roles (minSurfaceDelta is a FLOOR only — a card is allowed to be more
+// obviously tinted than a composer), the composer gets an explicit
+// ceiling too, so a future focus-tint change can't quietly turn it back
+// into a "bright slab" (the exact r9 regression this bounds).
+const (
+	minComposerSurfaceDelta = 1.1
+	maxComposerSurfaceDelta = 1.3
+)
+
+// SurfaceDeltaPair names one card/composer surface fill and the
+// contrast-ratio range (see Contrast) it must sit within against
+// TerminalBackground(). MaximumRatio of 0 means no upper bound (every
+// card role: more tint than the floor is fine, there's no "too much"
+// ceiling for a card the way there is for the composer).
 type SurfaceDeltaPair struct {
 	Name         string
 	Surface      color.Color
 	MinimumRatio float64
+	MaximumRatio float64
 }
 
 // SurfaceDeltaPairs returns every card-role and composer surface fill this
@@ -804,7 +829,8 @@ type SurfaceDeltaPair struct {
 // variant — the source of truth TestSurfaceDistinctFromTerminalBackground
 // checks, so a card/composer tint that's crept too close to
 // TerminalBackground() (unreadable as "a card" at all, independent of its
-// text's own contrast) fails a test instead of shipping.
+// text's own contrast) -- or, for the composer, too far from it (the
+// "bright slab" regression) -- fails a test instead of shipping.
 func SurfaceDeltaPairs() []SurfaceDeltaPair {
 	pairs := make([]SurfaceDeltaPair, 0, 8)
 	for _, role := range []Role{RoleUser, RoleAssistant, RoleSystem, RoleError, RoleBlock} {
@@ -814,8 +840,8 @@ func SurfaceDeltaPairs() []SurfaceDeltaPair {
 	composerBG, _ := SurfaceColors()
 	focusComposerBG, _ := ComposerFocusColors()
 	pairs = append(pairs,
-		SurfaceDeltaPair{Name: "composer fill (unfocused) vs terminal background", Surface: composerBG, MinimumRatio: minSurfaceDelta},
-		SurfaceDeltaPair{Name: "composer fill (focused) vs terminal background", Surface: focusComposerBG, MinimumRatio: minSurfaceDelta},
+		SurfaceDeltaPair{Name: "composer fill (unfocused) vs terminal background", Surface: composerBG, MinimumRatio: minComposerSurfaceDelta, MaximumRatio: maxComposerSurfaceDelta},
+		SurfaceDeltaPair{Name: "composer fill (focused) vs terminal background", Surface: focusComposerBG, MinimumRatio: minComposerSurfaceDelta, MaximumRatio: maxComposerSurfaceDelta},
 	)
 	return pairs
 }

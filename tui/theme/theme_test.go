@@ -343,6 +343,9 @@ func TestSurfaceDistinctFromTerminalBackground(t *testing.T) {
 			if ratio < p.MinimumRatio {
 				t.Errorf("[%s] %s: delta %.3f:1 below minimum %.2f:1 (surface=%#v terminal=%#v)", variant, p.Name, ratio, p.MinimumRatio, p.Surface, term)
 			}
+			if p.MaximumRatio > 0 && ratio > p.MaximumRatio {
+				t.Errorf("[%s] %s: delta %.3f:1 above maximum %.2f:1 -- too far from the terminal background (a \"bright slab\" again) (surface=%#v terminal=%#v)", variant, p.Name, ratio, p.MaximumRatio, p.Surface, term)
+			}
 		}
 	}
 }
