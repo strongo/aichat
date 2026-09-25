@@ -1062,12 +1062,19 @@ func composerFrame(width int, content string, focused, topEdge bool) string {
 // list row, a focused message, and a selected grid row all read as the
 // same kind of thing (founder 2026-09-25: "Use the single theme focus/
 // selection colour everywhere").
-func SelectedRow(text string, selected bool) string {
+// width is the row's own full inner width (the same width its text was
+// laid out at) -- selected passes it to Width() so the highlight fill
+// spans every column of the row, not just as many as "› "+text happens to
+// need (2026-09-25 fix: a short row previously left its own highlight
+// looking like a narrow chip instead of a full-width selected bar, the
+// same "surface spans identical columns on every row" rule Card/
+// PanelFrame already follow).
+func SelectedRow(text string, selected bool, width int) string {
 	if !selected {
 		return "  " + text
 	}
 	bg, fg := FocusSurfaceColors()
-	return lipgloss.NewStyle().Bold(true).Background(bg).Foreground(fg).Render("› " + text)
+	return lipgloss.NewStyle().Bold(true).Background(bg).Foreground(fg).Width(max(1, width)).Render("› " + text)
 }
 
 // PanelHeader renders a side-panel/sidebar title header, e.g. "Sidebar" or
@@ -1084,21 +1091,40 @@ func PanelHeader(title string) string {
 // side panel; the side panel is its own surface... so the gap reads as
 // the separation." SUPERSEDED IN PART, r13 (founder, verbatim: "Side
 // panel should NOT have left accent border treatment. Can we just
-// slightly change background?"): the panel no longer reserves either of
-// these two columns as a focus MARKER — both stay permanently blank now,
-// panel focus is shown by PanelFocusColors() instead (see its own doc).
-const panelGapWidth = 2
+// slightly change background?"): the panel no longer reserves a column as
+// a focus MARKER — panel focus is shown by PanelFocusColors() instead
+// (see its own doc). Only ONE blank column survives, as the divider
+// between the chat column and the panel's own surface (2026-09-25 margin
+// fix: a stale second reserved column here — PanelFrameSize() claiming 2
+// when PanelFrame itself only ever drew 1 — silently widened chatshell's
+// own outer-margin budget by an extra column, the root cause of the side
+// panel ending 2 columns short of the terminal's right edge instead of 1
+// (matching the chat column's own single-column left margin); see
+// chatshell's chatWidth/sidebarWidth doc).
+const panelGapWidth = 1
+
+// panelPaddingCols is the panel content's own left/right inset from its
+// surface edge — the SAME CardPaddingCols a card's text keeps from ITS
+// surface edge (2026-09-25 coordinator finding: panel header/rows started
+// flush against the panel surface's first column ("Beacon", "●
+// Project" touching the edge) while every card's text sits
+// CardPaddingCols in; PanelFrame now reserves the same inset, via
+// surfaceFill's own paddingCols parameter, so panel content lines up with
+// card text).
+const panelPaddingCols = CardPaddingCols
 
 // PanelFrameSize returns how many extra columns/rows PanelFrame adds
 // around its content, so a caller (chatshell's panel sizing) can size the
 // panel's own content and reserve the right amount of screen space —
-// mirroring ComposerFrameSize. rows is a CONSTANT 2 regardless of
-// HalfBlockEdgesActive() — the SAME vPad-vs-edges equalisation
-// ComposerFrameSize relies on (see surfaceFill's own doc): 1 padding row
-// top+bottom in fallback mode, or the top/bottom half-block edge rows in
-// half-block mode — either way exactly 2 extra rows, so a caller's row
+// mirroring ComposerFrameSize. cols is the one gap column (panelGapWidth)
+// plus panelPaddingCols on BOTH sides of the content. rows is a CONSTANT 2
+// regardless of HalfBlockEdgesActive() — the SAME vPad-vs-edges
+// equalisation ComposerFrameSize relies on (see surfaceFill's own doc): 1
+// padding row top+bottom in fallback mode, or the top/bottom half-block
+// edge rows in half-block mode — either way exactly 2 extra rows, so a
+// caller's row
 // budget never has to branch on which mode is active.
-func PanelFrameSize() (cols, rows int) { return panelGapWidth, 2 }
+func PanelFrameSize() (cols, rows int) { return panelGapWidth + 2*panelPaddingCols, 2 }
 
 // panelTintAmount is how far the panel's OWN unfocused fill blends from
 // TerminalBackground() toward the block hue — the SAME weight
@@ -1166,10 +1192,12 @@ func PanelFocusColors() (bg, fg color.Color) {
 // space below its content filled with the panel surface". content itself
 // supplies only its OWN per-row styling (e.g. tui/sidebar's SelectedRow
 // highlight, which still uses the single shared FocusSurfaceColors()
-// selection accent) — the surrounding fill is entirely PanelFrame's job.
-// A single blank column of plain terminal background sits before the
-// surface, matching panelGapWidth's own 2-column gap (now both columns
-// permanently blank, per panelGapWidth's own doc).
+// selection accent) — the surrounding fill is entirely PanelFrame's job,
+// including panelPaddingCols' own left/right text inset (surfaceFill's
+// paddingCols, same as Card's — 2026-09-25 fix: content used to be laid
+// out flush against the surface's own first/last column). A single blank
+// column of plain terminal background sits before the surface
+// (panelGapWidth) — the divider between the chat column and the panel.
 func PanelFrame(width, height int, header, content string, focused bool) string {
 	bg, fg := PanelColors()
 	if focused {
@@ -1190,7 +1218,7 @@ func PanelFrame(width, height int, header, content string, focused bool) string 
 		lines[row] = line
 	}
 	body := paintOver(strings.Join(lines, "\n"), bg, fg)
-	card := surfaceFill(bg, fg, false, 0, 0, body, max(1, width-1), true, true)
+	card := surfaceFill(bg, fg, false, 0, panelPaddingCols, body, max(1, width-panelGapWidth), true, true)
 	cardLines := strings.Split(card, "\n")
 	for i, line := range cardLines {
 		cardLines[i] = " " + line

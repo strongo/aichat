@@ -179,7 +179,7 @@ func (m *Model) View(width int, focused bool) string {
 	lines = append(lines, title)
 	for i, ref := range m.refs {
 		line := m.render(ref, max(1, width-2))
-		lines = append(lines, theme.SelectedRow(line, focused && i == m.cursor))
+		lines = append(lines, theme.SelectedRow(line, focused && i == m.cursor, width))
 	}
 	return strings.Join(lines, "\n")
 }
