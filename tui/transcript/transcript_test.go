@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
 )
@@ -491,14 +492,56 @@ func TestBroadcastSkipsNilBlockEntriesAndBatchesNonNilCmds(t *testing.T) {
 	}
 }
 
-func TestUserCardViewFocusedAppliesBoldStyle(t *testing.T) {
-	unfocused := userCardView("hello", 20, false)
-	focused := userCardView("hello", 20, true)
+func TestRenderEntryUserCardFocusedDiffersFromUnfocused(t *testing.T) {
+	m := New()
+	e := &Entry{Role: RoleUser, Text: "hello"}
+	unfocused := m.renderEntry(e, 20, false)
+	focused := m.renderEntry(e, 20, true)
 	if unfocused == focused {
 		t.Fatalf("expected focused rendering to differ from unfocused: %q", unfocused)
 	}
-	if !strings.Contains(unfocused, "hello") || !strings.Contains(focused, "hello") {
+	if !strings.Contains(ansi.Strip(unfocused), "hello") || !strings.Contains(ansi.Strip(focused), "hello") {
 		t.Fatalf("expected both renderings to contain the text: %q / %q", unfocused, focused)
+	}
+}
+
+func TestRenderEntryAssistantPlainAndMarkdown(t *testing.T) {
+	m := New(WithMarkdownRenderer(func(text string, width int) string { return "MD:" + text }))
+	plain := m.renderEntry(&Entry{Role: RoleAssistant, Text: "hi"}, 30, false)
+	if !strings.Contains(ansi.Strip(plain), "hi") {
+		t.Fatalf("plain assistant card missing text: %q", plain)
+	}
+	md := m.renderEntry(&Entry{Role: RoleAssistant, Text: "hi", Markdown: true}, 30, false)
+	if !strings.Contains(ansi.Strip(md), "MD:hi") {
+		t.Fatalf("markdown assistant card missing rendered markdown: %q", md)
+	}
+}
+
+func TestRenderEntrySystemAndErrorCards(t *testing.T) {
+	m := New()
+	sys := m.renderEntry(&Entry{Role: RoleSystem, Text: "(stopped)"}, 30, false)
+	errCard := m.renderEntry(&Entry{Role: RoleSystem, Text: "error: boom"}, 30, false)
+	if sys == errCard {
+		t.Fatalf("expected a system notice and an error notice to render differently")
+	}
+	if !strings.Contains(ansi.Strip(sys), "(stopped)") || !strings.Contains(ansi.Strip(errCard), "error: boom") {
+		t.Fatalf("card missing text: sys=%q err=%q", sys, errCard)
+	}
+}
+
+type titledBlock struct{ fakeBlock }
+
+func (b *titledBlock) Title() string { return "My Title" }
+
+func TestRenderEntryBlockCardUsesTitledCapability(t *testing.T) {
+	m := New()
+	untitled := m.renderEntry(&Entry{Block: &fakeBlock{label: "b"}}, 30, false)
+	titled := m.renderEntry(&Entry{Block: &titledBlock{fakeBlock{label: "b"}}}, 30, false)
+	if !strings.Contains(ansi.Strip(titled), "My Title") {
+		t.Fatalf("titled block card missing header: %q", titled)
+	}
+	if strings.Contains(ansi.Strip(untitled), "My Title") {
+		t.Fatalf("untitled block card should not show a header: %q", untitled)
 	}
 }
 

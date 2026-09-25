@@ -19,6 +19,7 @@ import (
 	"github.com/strongo/aichat/tui/focus"
 	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
+	"github.com/strongo/aichat/tui/theme"
 	"github.com/strongo/aichat/tui/transcript"
 )
 
@@ -141,16 +142,50 @@ func WithGlobalKeys(fn GlobalKeysFunc) Option {
 	return func(m *Model) { m.globalKeys = fn }
 }
 
-// WithTopBar sets a product-rendered top bar, replacing the default bold
-// title line.
+// WithTopBar sets a product-rendered top bar, replacing the default themed
+// title line. Prefer WithTopBarProvider (content-only: title/context/menu
+// items, rendered through the shared theme.TopBar chrome) — WithTopBar
+// remains for a product that needs a top bar theme.TopBar can't express;
+// it fully replaces chatshell's own styling, so nothing here applies to it.
 func WithTopBar(render func(width int) string) Option {
 	return func(m *Model) { m.topBarFn = render }
 }
 
 // WithStatusBar sets a product-rendered status bar, replacing the default
-// SetStatus-driven status line(s).
+// SetStatus-driven status line(s). Prefer WithHintsProvider (content-only:
+// a Hint list plus trailing segments, rendered through the shared
+// theme.RenderHints chrome) — WithStatusBar remains for a product that
+// needs a status bar theme.RenderHints can't express; it fully replaces
+// chatshell's own styling, so nothing here applies to it.
 func WithStatusBar(render func(width int) string) Option {
 	return func(m *Model) { m.statusBarFn = render }
+}
+
+// TopBarProvider returns the top bar's CONTENT for width: a title, an
+// optional context string (e.g. the current project/space), and menu items
+// (with the active one marked) — chatshell renders it through the shared
+// theme.TopBar chrome every render, so the product supplies content only,
+// never colour. It takes priority over WithTopBar/the plain WithTitle
+// default when set.
+type TopBarProvider func(width int) (title, context string, items []theme.MenuItem)
+
+// WithTopBarProvider sets a content-only top bar (see TopBarProvider).
+func WithTopBarProvider(provide TopBarProvider) Option {
+	return func(m *Model) { m.topBarProvider = provide }
+}
+
+// HintsProvider returns the status/hints bar's CONTENT for width: the
+// current key hints (e.g. {"Enter", "send"}) plus optional trailing
+// segments (e.g. a product/session summary, a hyperlink) — chatshell
+// renders it through the shared theme.RenderHints chrome every render, so
+// the product supplies content only, never colour. It takes priority over
+// WithStatusBar/the plain SetStatus default when set.
+type HintsProvider func(width int) (hints []theme.Hint, segments []string)
+
+// WithHintsProvider sets a content-only status/hints bar (see
+// HintsProvider).
+func WithHintsProvider(provide HintsProvider) Option {
+	return func(m *Model) { m.hintsProvider = provide }
 }
 
 // WithContext sets the context streamed responses and Handler calls run
@@ -236,6 +271,8 @@ type Model struct {
 	globalKeys           GlobalKeysFunc
 	topBarFn             func(width int) string
 	statusBarFn          func(width int) string
+	topBarProvider       TopBarProvider
+	hintsProvider        HintsProvider
 	overlays             []Overlay
 
 	commands             []Command
@@ -1323,16 +1360,17 @@ func (m *Model) sidebarWidth() int {
 // height minus every OTHER row View() stacks around it -- the top bar
 // (topBarHeight, which a product's own WithTopBar may render as more than
 // one line), the open slash-command menu (menuHeight, 0 when it isn't
-// showing), the chip row(s) (chipsHeight), the composer's own fixed single
-// line, the status line(s) (statusSegmentHeight), and -- while Busy() --
-// the spinner's own trailing "\n" + text line View() appends after the
-// transcript (r2 review, B1: that line was previously NOT reserved, so
-// View() rendered one line taller than m.height for the entire duration of
-// a stream) -- so that View()'s total rendered height always equals
-// m.height exactly (a pre-existing gap this REQ fixes: historyHeight
-// previously assumed a constant "4" rows of chrome, silently wrong once a
-// product's top bar wrapped to more than one line, the slash-command menu
-// was open, or busy, either under- or over-filling the screen).
+// showing), the chip row(s) (chipsHeight), the composer's own content line
+// plus its theme.ComposerFrame border rows (composerHeight), the status
+// line(s) (statusSegmentHeight), and -- while Busy() -- the spinner's own
+// trailing "\n" + text line View() appends after the transcript (r2
+// review, B1: that line was previously NOT reserved, so View() rendered
+// one line taller than m.height for the entire duration of a stream) -- so
+// that View()'s total rendered height always equals m.height exactly (a
+// pre-existing gap this REQ fixes: historyHeight previously assumed a
+// constant "4" rows of chrome, silently wrong once a product's top bar
+// wrapped to more than one line, the slash-command menu was open, or busy,
+// either under- or over-filling the screen).
 //
 // historyHeight is PURE (always computed fresh from current state) -- it is
 // View() re-applying it to m.transcript's actual viewport size, on EVERY
@@ -1344,7 +1382,14 @@ func (m *Model) historyHeight() int {
 	if m.busy {
 		busySpinnerLine = 1
 	}
-	return max(1, m.height-m.topBarHeight()-m.menuHeight()-1-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine)
+	return max(1, m.height-m.topBarHeight()-m.menuHeight()-m.composerHeight()-m.statusSegmentHeight()-m.chipsHeight(m.chatWidth())-busySpinnerLine)
+}
+
+// composerHeight is the composer's total rendered row count: its own
+// single content line plus theme.ComposerFrame's top/bottom border rows.
+func (m *Model) composerHeight() int {
+	_, rows := theme.ComposerFrameSize()
+	return 1 + rows
 }
 
 // topBarHeight is the rendered top bar's line count -- 1 for the default
@@ -1380,6 +1425,36 @@ func (m *Model) statusLines() []string {
 		return nil
 	}
 	return strings.Split(m.status, "\n")
+}
+
+// statusBarView renders the status/hints bar, in priority order: a
+// WithHintsProvider content provider (rendered through the shared
+// theme.RenderHints chrome), else a legacy WithStatusBar full-string
+// function, else the plain SetStatus text wrapped in the shared theme.Bar
+// chrome -- every path, including the true default, now renders through
+// tui/theme (founder 2026-09-25).
+func (m *Model) statusBarView() string {
+	switch {
+	case m.hintsProvider != nil:
+		hints, segments := m.hintsProvider(m.width)
+		return theme.RenderHints(m.width, hints, segments...)
+	case m.statusBarFn != nil:
+		return m.statusBarFn(m.width)
+	default:
+		// theme.Bar truncates/pads a single line; a multi-line SetStatus
+		// value (e.g. a product reporting several status rows at once) gets
+		// the same chrome applied line by line, not truncated across the
+		// whole block.
+		lines := m.statusLines()
+		if len(lines) == 0 {
+			lines = []string{""}
+		}
+		styled := make([]string, len(lines))
+		for i, line := range lines {
+			styled[i] = theme.Bar(m.width, line)
+		}
+		return strings.Join(styled, "\n")
+	}
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1661,15 +1736,26 @@ func (m *Model) commandMenuMatches() []Command {
 	return matches
 }
 
-// topBarView renders the top bar: a product's WithTopBar function when set,
-// or the default bold title line. Factored out of View so chipsTopY (mouse
-// hit-testing) can measure its actual rendered height instead of assuming
-// one line -- a product's own top bar is free to render more than one.
+// topBarView renders the top bar, in priority order: a WithTopBarProvider
+// content provider (rendered through the shared theme.TopBar chrome), else
+// a legacy WithTopBar full-string function, else the default themed title
+// line (theme.TopBar with just WithTitle's title, no context/items) --
+// every path (including the true default, no options at all) now renders
+// through tui/theme, so the polished look is the default, not something a
+// product opts into (founder 2026-09-25). Factored out of View so
+// chipsTopY (mouse hit-testing) can measure its actual rendered height
+// instead of assuming one line -- a legacy WithTopBar function is free to
+// render more than one.
 func (m *Model) topBarView() string {
-	if m.topBarFn != nil {
+	switch {
+	case m.topBarProvider != nil:
+		title, context, items := m.topBarProvider(m.width)
+		return theme.TopBar(m.width, title, context, items)
+	case m.topBarFn != nil:
 		return m.topBarFn(m.width)
+	default:
+		return theme.TopBar(m.width, m.title, "", nil)
 	}
-	return lipgloss.NewStyle().Bold(true).Render(m.title)
 }
 
 // View renders the chat screen. It re-applies resize() FIRST, on every
@@ -1696,7 +1782,7 @@ func (m *Model) View() tea.View {
 	if m.busy {
 		history += "\n" + m.spinner.View() + " thinking…"
 	}
-	composer := m.input.View()
+	composer := theme.ComposerFrame(m.chatWidth(), m.input.View(), m.focusRing.Zone() == focus.ZoneInput)
 	menu := m.commandMenuView()
 	chatParts := []string{history}
 	if menu != "" {
@@ -1715,10 +1801,7 @@ func (m *Model) View() tea.View {
 		side := m.panelView(m.sidebarWidth(), m.focusRing.Zone() == focus.ZoneSidebar)
 		body = lipgloss.JoinHorizontal(lipgloss.Top, chat, " │ ", side)
 	}
-	status := strings.Join(m.statusLines(), "\n")
-	if m.statusBarFn != nil {
-		status = m.statusBarFn(m.width)
-	}
+	status := m.statusBarView()
 	content := lipgloss.JoinVertical(lipgloss.Left, top, body, status)
 	if n := len(m.overlays); n > 0 {
 		content = m.renderOverlay(content, m.overlays[n-1])

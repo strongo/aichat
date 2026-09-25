@@ -32,7 +32,23 @@ Like `ai/*`, this package owns only the product-neutral mechanics; products own 
 
 #### REQ: tui-package-boundaries
 
-The module's `tui/*` tree MUST be organised as: `tui` (the message vocabulary shared across sub-packages, e.g. `tui.AddToSidebarMsg`, so a leaf component like `tui/grid` can ask the shell to do something without importing it), `tui/focus` (the pure focus-ring state machine), `tui/transcript` (the scrolling history + `Block`/`EntityBlock` contract), `tui/grid` (the result-grid `Block` implementation), `tui/sidebar` (the working-context panel), `tui/stream` (the `ai.LLMProvider.Stream` → Bubble Tea message pump), and `tui/chatshell` (the assembled chat screen). `tui/*` packages MAY depend on `ai/*` (the event model, `session.EntityRef`) but MUST NOT depend on anything product-specific; products depend on `tui/*`, never the other way around. This mirrors REQ: package-boundaries in `spec/features/ai-layer/README.md` for the `ai/*` tree, which this module also contains.
+The module's `tui/*` tree MUST be organised as: `tui` (the message vocabulary shared across sub-packages, e.g. `tui.AddToSidebarMsg`, so a leaf component like `tui/grid` can ask the shell to do something without importing it), `tui/theme` (the centralised colour/style leaf package — see Theme below), `tui/focus` (the pure focus-ring state machine), `tui/transcript` (the scrolling history + `Block`/`EntityBlock` contract), `tui/grid` (the result-grid `Block` implementation), `tui/mdrender` (the shared glamour-backed `transcript.MarkdownRenderer`), `tui/sidebar` (the working-context panel), `tui/stream` (the `ai.LLMProvider.Stream` → Bubble Tea message pump), and `tui/chatshell` (the assembled chat screen). `tui/*` packages MAY depend on `ai/*` (the event model, `session.EntityRef`) but MUST NOT depend on anything product-specific; products depend on `tui/*`, never the other way around. `tui/theme` is a LEAF within `tui/*` itself: every other `tui/*` package (and `tui/chatshell`) MAY depend on `tui/theme`, but `tui/theme` MUST depend on none of them — this is what makes it safe for `tui/transcript` (a `tui/chatshell` dependency) to also read colours from `tui/theme` without a cycle. This mirrors REQ: package-boundaries in `spec/features/ai-layer/README.md` for the `ai/*` tree, which this module also contains.
+
+### Theme
+
+#### REQ: theme-centralised-look
+
+`tui/theme` MUST be the SOLE place any `tui/*` package (or, transitively, any product built on `tui/chatshell`) constructs a colour, border, or padding decision for aichat's shared chat chrome — no other `tui/*` package MAY call `lipgloss.NewStyle().Foreground(...)`/`.Background(...)` with a hard-coded colour literal (founder ruling, 2026-09-25: "UI styling should be unified across apps"). A product supplies CONTENT ONLY — message text, `[]theme.Hint`, `[]theme.MenuItem`, a title/context string — never a colour: every render path `tui/transcript`, `tui/sidebar` and `tui/chatshell` expose (including their DEFAULTS, reachable with zero product options set) MUST route through a `tui/theme` colour or render helper, so the polished look is what every product gets automatically, not something opted into.
+
+`tui/theme.Dark` (default `true`) MUST select which of each role's light/dark colour pair every helper below resolves against, read fresh on every call (not memoised at package init) so `theme.SetDark` takes effect on the very next render; `theme.Detect()` MUST report the real terminal's apparent background (via `lipgloss.HasDarkBackground`) without ever panicking, falling back to `true` for a non-terminal (a test, CI, a piped run).
+
+#### REQ: theme-card-rendering
+
+`theme.Card(role Role, header, body string, width int, focused bool) string` MUST render body (with header, when non-empty, bold above it) inside a padded (`theme.CardPadding`, 1 column each side), rounded-border, coloured box whose OUTER width is exactly `width`; `theme.InnerWidth(width)` MUST report the content width available inside such a card, so a caller sizing content to render INSIDE one (e.g. a `transcript.Block`'s own `View`) lines up exactly. Each `Role` (`RoleUser`, `RoleAssistant`, `RoleSystem`, `RoleError`, `RoleBlock`) MUST get a DISTINCT background/border/foreground triple, legible in both `Dark` variants. `focused: true` MUST render a visibly different border (a thicker border style plus `theme.FocusColor()`) from `focused: false` — the SAME accent `theme.ComposerFrame` and `theme.SelectedRow` also use for their own focus/selection states, so "this has focus/is selected" reads as one consistent visual language across cards, the composer, and panel rows.
+
+#### REQ: theme-bars-and-chrome
+
+`theme.Bar(width int, content string) string` MUST pad/truncate content to exactly `width` columns, filling the remainder with the shared bar background — content that already carries its own nested lipgloss styling (e.g. `theme.RenderHints`' per-hint colouring) MUST keep that styling; `Bar` itself sets only the background/width frame around it. `theme.TopBar(width int, title, context string, items []MenuItem) string` and `theme.RenderHints(width int, hints []Hint, segments ...string) string` MUST compose a title/context/menu-items triple, respectively a hint-list/segment-list pair, through `Bar`, with an active `MenuItem` visually distinguished (bold+underline) and each `Hint`'s key rendered in `theme.AccentColor()` against its label in `theme.MutedColor()`. `theme.ComposerFrame(width int, content string, focused bool) string` MUST wrap a composer's own rendered content in a bordered box whose border uses `theme.FocusColor()` (thicker border) while focused, `theme.MutedColor()` (thinner border) otherwise; `theme.ComposerFrameSize() (cols, rows int)` MUST report exactly how many extra columns/rows that frame adds, so a caller (`chatshell`'s `resize`/`historyHeight`) can size the composer's own content and reserve the right amount of screen space without hard-coding the frame's dimensions in two places. `theme.SelectedRow(text string, selected bool) string` MUST render a side-panel/sidebar row with the SAME `theme.FocusColor()` accent a focused card uses when `selected`, and an indented, unstyled row otherwise.
 
 ### Focus ring
 
@@ -44,7 +60,11 @@ The module's `tui/*` tree MUST be organised as: `tui` (the message vocabulary sh
 
 #### REQ: transcript-block-contract
 
-`tui/transcript.Block` MUST be the extension point for a rich transcript entry (e.g. a `tui/grid.Model`): `View(width int, focused bool) string`, `Update(msg tea.Msg) (Block, tea.Cmd)` (the Bubble Tea value-model convention: `Update` returns the possibly-new `Block` value, never mutates in place), and `Focusable() bool`. A `Block` that also implements `EntityBlock` (`Current() *session.EntityRef`) additionally reports which entity is under its cursor, which `chatshell.Model.FocusedRef` and "Add to sidebar" use; one that implements `WheelConsumer` (`ConsumesWheel(msg tea.MouseWheelMsg) bool`) can claim a mouse wheel event for itself while focused instead of chatshell scrolling the transcript viewport for it (see REQ: chatshell-mouse-support).
+`tui/transcript.Block` MUST be the extension point for a rich transcript entry (e.g. a `tui/grid.Model`): `View(width int, focused bool) string`, `Update(msg tea.Msg) (Block, tea.Cmd)` (the Bubble Tea value-model convention: `Update` returns the possibly-new `Block` value, never mutates in place), and `Focusable() bool`. A `Block` that also implements `EntityBlock` (`Current() *session.EntityRef`) additionally reports which entity is under its cursor, which `chatshell.Model.FocusedRef` and "Add to sidebar" use; one that implements `WheelConsumer` (`ConsumesWheel(msg tea.MouseWheelMsg) bool`) can claim a mouse wheel event for itself while focused instead of chatshell scrolling the transcript viewport for it (see REQ: chatshell-mouse-support). One that implements `Titled` (`Title() string`) additionally supplies the header shown atop the card `transcript.Model` wraps its `View` output in (REQ: transcript-card-rendering); a `Block` that doesn't implement it renders in an untitled card.
+
+#### REQ: transcript-card-rendering
+
+Every `transcript.Model` entry — a plain user/assistant/system message, an "error: ..." system message, a markdown-rendered assistant message, or a `Block` — MUST render as a card via `theme.Card` (founder ruling, 2026-09-25: "Message should be like a card in chat of any app"; same-day follow-up: "Blocks ... should sit in the same card frame"), never a bespoke `lipgloss.NewStyle()` literal in `tui/transcript` itself. The role→`theme.Role` mapping MUST be: a user entry → `RoleUser`; a `Markdown`-flagged or plain assistant entry → `RoleAssistant` (its header, from `theme.HeaderFor`, is used as-is); a system entry whose `Text` has the `"error:"` prefix (how `chatshell.AppendSystem` reports both a stream/command error and a plain status note — the prefix is the only signal available here to distinguish them) → `RoleError`; any other system entry → `RoleSystem`; a `Block` entry → `RoleBlock`, with its own `View` rendered at `theme.InnerWidth(width)` (so its content lines up exactly inside the card `theme.Card` then wraps it in) and its header taken from an optional `Titled` capability (empty otherwise). `focused` MUST be forwarded to `theme.Card` exactly as `Rebuild` already computes it per entry (the focus-ring's current stop), so a focused card's border visibly differs from an unfocused one, matching every other focus/selection indicator in the product (REQ: theme-card-rendering).
 
 #### REQ: transcript-streamed-append
 
@@ -108,7 +128,9 @@ Async-safe overlay pattern: an `Overlay` that must stay open ACROSS an async rou
 
 #### REQ: chatshell-product-bars
 
-`chatshell.WithTopBar(func(width int) string)` and `WithStatusBar(func(width int) string)` MUST, when set, REPLACE chatshell's default bold-title top line and default `SetStatus`-driven status line(s) respectively in `View()`'s rendered output.
+`chatshell.WithTopBarProvider(func(width int) (title, context string, items []theme.MenuItem))` and `WithHintsProvider(func(width int) (hints []theme.Hint, segments []string))` are the CONTENT-ONLY way a product supplies its top bar and status/hints bar: chatshell renders their return values through `theme.TopBar`/`theme.RenderHints` (REQ: theme-bars-and-chrome) on every render, so the product never touches colour. They take PRIORITY, when set, over the legacy `WithTopBar(func(width int) string)`/`WithStatusBar(func(width int) string)` (which fully replace chatshell's own styling with a product-rendered string, kept for a bar `theme.TopBar`/`theme.RenderHints` cannot express) and the DEFAULT — no options set at all — which MUST ALSO render through `theme.TopBar`/`theme.Bar` (`WithTitle`'s title, and the plain `SetStatus` text, line by line, each wrapped in `theme.Bar`) rather than an unstyled literal: the polished look is the default, not something a product opts into (founder 2026-09-25).
+
+The composer's own rendered view MUST be wrapped in `theme.ComposerFrame`, focused exactly when the focus ring's zone is `focus.ZoneInput` — unconditionally, the same as the top/status bars, with no option to opt out. `historyHeight()`/`resize()` MUST size the composer's content and reserve screen space using `theme.ComposerFrameSize()`'s reported column/row overhead rather than a hard-coded constant, so the frame and the layout math that reserves room for it can never drift apart.
 
 #### REQ: chatshell-transcript-ops
 
@@ -155,7 +177,7 @@ The transcript receives a wheel event through AT MOST ONE mechanism per tick, ne
 
 #### REQ: sidebar-pin-and-notify
 
-`chatshell.Model.PinToSidebar`/`UnpinFromSidebar` MUST add/remove a `session.EntityRef` from the sidebar and, when the `Handler` implements the optional `SidebarObserver` capability (`OnSidebarChange(refs []session.EntityRef)`), notify it with a defensive copy of the current pinned refs -- ONLY when the sidebar actually changed (a duplicate pin or a not-present unpin is a no-op, no notification). `sidebar.Model`'s split-pane width MUST stay within `MinChatPercent`/`MaxChatPercent` (40/75), matching DataTug's existing Ctrl+←/→ clamp, so the chat pane never gets crushed to unusability by resizing the split.
+`chatshell.Model.PinToSidebar`/`UnpinFromSidebar` MUST add/remove a `session.EntityRef` from the sidebar and, when the `Handler` implements the optional `SidebarObserver` capability (`OnSidebarChange(refs []session.EntityRef)`), notify it with a defensive copy of the current pinned refs -- ONLY when the sidebar actually changed (a duplicate pin or a not-present unpin is a no-op, no notification). `sidebar.Model`'s split-pane width MUST stay within `MinChatPercent`/`MaxChatPercent` (40/75), matching DataTug's existing Ctrl+←/→ clamp, so the chat pane never gets crushed to unusability by resizing the split. `sidebar.Model.View` MUST render its header via `theme.PanelHeader` and each row via `theme.SelectedRow` (the cursor row `selected: true` only while `focused`) rather than a package-local style, so the default sidebar's selection highlight uses the same accent every other focused/selected element in the product does (REQ: theme-card-rendering).
 
 ### Grid
 
@@ -523,6 +545,70 @@ There is no fixed built-in secondary view: view `0` is always the table, and eve
 **Given** a `chatshell.Model` `WithChips` three chips, `WithCommands`, `WithMouse(MouseCellMotion)`, `SetMouseEnabled(true)`, sized via `WindowSizeMsg`, rendered once, then the slash-command menu opened by typing (as above) and rendered again
 **When** a left-button `tea.MouseClickMsg` lands on the chip row's `×` (located by scanning the freshly rendered `View()` output, per the mouse-click AC above) -- confirming it still removes a chip with the menu open -- and separately one lands on the MENU's own first row (`topBarHeight() + historyHeight()`, well above the chip row)
 **Then** the click on `×` removes exactly one chip; the click on the menu row removes NO chip and `Chips()` is unchanged -- `chipsTopY`'s click math and the actually-drawn chip row stay in agreement because `View()` re-applied `resize()` before the click's preceding render
+
+### AC: theme-card-focused-differs-from-unfocused-for-every-role
+
+**Requirements:** tui-kit#req:theme-card-rendering
+
+**Given** every `theme.Role` (`RoleUser`, `RoleAssistant`, `RoleSystem`, `RoleError`, `RoleBlock`) and both `theme.Dark` variants
+**When** `theme.Card(role, header, body, width, focused)` is rendered once with `focused: false` and once with `focused: true`
+**Then** the two renderings differ (a visibly different border), and both contain `body`
+
+### AC: theme-bar-truncates-and-pads-to-exact-width
+
+**Requirements:** tui-kit#req:theme-bars-and-chrome
+
+**Given** `content` longer than `width`
+**When** `theme.Bar(width, content)` is rendered
+**Then** the result's rendered width equals `width` exactly (truncated with an ellipsis, then padded with the bar background)
+
+### AC: theme-composer-frame-size-matches-rendered-overhead
+
+**Requirements:** tui-kit#req:theme-bars-and-chrome
+
+**Given** `theme.ComposerFrameSize()`'s reported `(cols, rows)`
+**When** compared against `theme.ComposerFrame(width, content, focused)`'s actual rendered frame
+**Then** the frame adds exactly that many extra columns/rows around content, for both `focused` states
+
+### AC: transcript-block-card-uses-titled-capability-else-untitled
+
+**Requirements:** tui-kit#req:transcript-card-rendering
+
+**Given** two `transcript.Block` entries at the same transcript position, one implementing `transcript.Titled` (returning `"My Title"`), one not
+**When** `transcript.Model.Rebuild` renders both
+**Then** the `Titled` block's card shows `"My Title"` as its header and the other block's card shows no header
+
+### AC: transcript-system-error-prefix-gets-distinct-card-role
+
+**Requirements:** tui-kit#req:transcript-card-rendering
+
+**Given** a `RoleSystem` entry with `Text: "error: boom"` and another with `Text: "(stopped)"`
+**When** both are rendered via `transcript.Model.renderEntry`
+**Then** they render with visibly different card styling (`RoleError` vs `RoleSystem`)
+
+### AC: chatshell-topbar-provider-and-hints-provider-take-priority
+
+**Requirements:** tui-kit#req:chatshell-product-bars
+
+**Given** a `chatshell.Model` constructed with BOTH a legacy `WithTopBar`/`WithStatusBar` option AND the corresponding `WithTopBarProvider`/`WithHintsProvider` content option
+**When** `View()` renders
+**Then** the provider's content appears and the legacy option's full string does not
+
+### AC: chatshell-default-bars-render-through-theme-with-no-options-set
+
+**Requirements:** tui-kit#req:chatshell-product-bars
+
+**Given** a `chatshell.Model` constructed with no top-bar/status-bar/hints option at all, `WithTitle` set, and `SetStatus` called with plain text
+**When** `View()` renders
+**Then** both the title and the status text appear in the output, rendered through `theme.TopBar`/`theme.Bar` (not an unstyled literal) -- the polished default, unconditionally
+
+### AC: sidebar-selected-row-uses-shared-focus-accent
+
+**Requirements:** tui-kit#req:sidebar-pin-and-notify
+
+**Given** a `sidebar.Model` with at least two pinned refs
+**When** `View(width, focused: true)` is rendered with the cursor on one of them
+**Then** that row's rendering differs from every unselected row's, via `theme.SelectedRow`
 
 ## Open Questions
 

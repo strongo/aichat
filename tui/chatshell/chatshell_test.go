@@ -10,6 +10,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
@@ -17,6 +18,7 @@ import (
 	"github.com/strongo/aichat/tui/focus"
 	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
+	"github.com/strongo/aichat/tui/theme"
 	"github.com/strongo/aichat/tui/transcript"
 )
 
@@ -1099,6 +1101,75 @@ func TestWithTopBarAndStatusBarOverrideDefaults(t *testing.T) {
 	}
 	if !strings.Contains(content, "STATUS") {
 		t.Error("expected product-rendered status bar in the view")
+	}
+}
+
+func TestWithTopBarProviderAndHintsProviderOverrideDefaults(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h,
+		WithTopBarProvider(func(width int) (string, string, []theme.MenuItem) {
+			return "TitleFromProvider", "CtxFromProvider", []theme.MenuItem{{Label: "Sessions", Active: true}}
+		}),
+		WithHintsProvider(func(width int) ([]theme.Hint, []string) {
+			return []theme.Hint{{Key: "Enter", Label: "send"}}, []string{"seg-one"}
+		}),
+	)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	content := ansi.Strip(m.View().Content)
+	for _, want := range []string{"TitleFromProvider", "CtxFromProvider", "Sessions", "Enter", "send", "seg-one"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("expected view to contain %q, got:\n%s", want, content)
+		}
+	}
+}
+
+func TestTopBarProviderTakesPriorityOverLegacyWithTopBar(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h,
+		WithTopBar(func(width int) string { return "LEGACY-TOP" }),
+		WithTopBarProvider(func(width int) (string, string, []theme.MenuItem) {
+			return "PROVIDER-TOP", "", nil
+		}),
+	)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	content := m.View().Content
+	if strings.Contains(content, "LEGACY-TOP") {
+		t.Error("legacy WithTopBar should be shadowed by WithTopBarProvider")
+	}
+	if !strings.Contains(content, "PROVIDER-TOP") {
+		t.Error("expected WithTopBarProvider content in the view")
+	}
+}
+
+func TestHintsProviderTakesPriorityOverLegacyWithStatusBar(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h,
+		WithStatusBar(func(width int) string { return "LEGACY-STATUS" }),
+		WithHintsProvider(func(width int) ([]theme.Hint, []string) {
+			return []theme.Hint{{Key: "K", Label: "provider-hint"}}, nil
+		}),
+	)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	content := ansi.Strip(m.View().Content)
+	if strings.Contains(content, "LEGACY-STATUS") {
+		t.Error("legacy WithStatusBar should be shadowed by WithHintsProvider")
+	}
+	if !strings.Contains(content, "provider-hint") {
+		t.Error("expected WithHintsProvider content in the view")
+	}
+}
+
+func TestDefaultTopBarAndStatusBarRenderThroughTheme(t *testing.T) {
+	h := &fakeHandler{}
+	m := New(h, WithTitle("PlainTitle"))
+	m.SetStatus("plain status")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	content := ansi.Strip(m.View().Content)
+	if !strings.Contains(content, "PlainTitle") {
+		t.Error("expected default title in the view")
+	}
+	if !strings.Contains(content, "plain status") {
+		t.Error("expected default status text in the view")
 	}
 }
 

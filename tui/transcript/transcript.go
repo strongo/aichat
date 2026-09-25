@@ -13,6 +13,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/strongo/aichat/ai/session"
+	"github.com/strongo/aichat/tui/theme"
 )
 
 // Role of a transcript entry.
@@ -39,6 +40,16 @@ type Block interface {
 type EntityBlock interface {
 	Block
 	Current() *session.EntityRef
+}
+
+// Titled is an optional Block capability: when implemented, its Title() is
+// shown as the header of the shared card transcript draws around the
+// Block's own View output (founder 2026-09-25: "Blocks ... should sit in
+// the same card frame" as a plain message), e.g. a grid's record-set name
+// or an HTTP response's method+URL. A Block that doesn't implement it
+// renders in an untitled card.
+type Titled interface {
+	Title() string
 }
 
 // EscCapturer is an optional Block capability: when a focused block is in an
@@ -495,17 +506,7 @@ func (m *Model) Rebuild(scrollToBottom bool) {
 			blocks = append(blocks, e.renderOut)
 			continue
 		}
-		var out string
-		switch {
-		case e.Block != nil:
-			out = e.Block.View(width, focused)
-		case e.Role == RoleUser:
-			out = userCardView(e.Text, width, focused)
-		case e.Markdown && m.markdownRenderer != nil:
-			out = m.markdownRenderer(e.Text, width)
-		default:
-			out = plainMessageView(e.Role, e.Text, width)
-		}
+		out := m.renderEntry(e, width, focused)
 		e.renderOut, e.renderWidth, e.renderFocused, e.renderValid = out, width, focused, true
 		blocks = append(blocks, out)
 	}
@@ -521,18 +522,43 @@ func (m *Model) Rebuild(scrollToBottom bool) {
 // View renders the transcript viewport.
 func (m *Model) View() string { return m.viewport.View() }
 
-func userCardView(text string, width int, focused bool) string {
-	bar := "│"
-	style := lipgloss.NewStyle()
-	if focused {
-		style = style.Bold(true)
+// renderEntry renders one transcript entry as the shared card every aichat
+// product's messages, markdown responses and Blocks now render as (founder
+// 2026-09-25: "Message should be like a card in chat of any app" and
+// "Blocks ... should sit in the same card frame"): a coloured, bordered,
+// padded box from tui/theme, distinct per role, with a bold header and a
+// clearly visible focus highlight when focused — never a scattered
+// lipgloss.NewStyle() literal here; every colour/border/padding decision
+// lives in tui/theme.
+func (m *Model) renderEntry(e *Entry, width int, focused bool) string {
+	switch {
+	case e.Block != nil:
+		header := ""
+		if t, ok := e.Block.(Titled); ok {
+			header = t.Title()
+		}
+		body := e.Block.View(theme.InnerWidth(width), focused)
+		return theme.Card(theme.RoleBlock, header, body, width, focused)
+	case e.Role == RoleUser:
+		return theme.Card(theme.RoleUser, theme.HeaderFor(theme.RoleUser), e.Text, width, focused)
+	case e.Markdown && m.markdownRenderer != nil:
+		body := m.markdownRenderer(e.Text, theme.InnerWidth(width))
+		return theme.Card(theme.RoleAssistant, theme.HeaderFor(theme.RoleAssistant), body, width, focused)
+	case e.Role == RoleAssistant:
+		return theme.Card(theme.RoleAssistant, theme.HeaderFor(theme.RoleAssistant), e.Text, width, focused)
+	default:
+		// RoleSystem, including an "error: ..." message (AppendSystem is
+		// how chatshell reports both a plain status note and a stream/
+		// command error — see chatshell.handleStreamDone/cancelBusy) — the
+		// "error:" prefix is the one signal available here to give an
+		// error its own distinct, more alarming card colour instead of
+		// blending into ordinary system notices.
+		role := theme.RoleSystem
+		if strings.HasPrefix(e.Text, "error:") {
+			role = theme.RoleError
+		}
+		return theme.Card(role, theme.HeaderFor(role), e.Text, width, focused)
 	}
-	body := style.Width(max(1, width-2)).Render(text)
-	return bar + " You: " + "\n" + body
-}
-
-func plainMessageView(role Role, text string, width int) string {
-	return lipgloss.NewStyle().Width(max(1, width)).Render(string(role) + ": " + text)
 }
 
 // renderedLineCount is the number of on-screen lines block occupies once

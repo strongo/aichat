@@ -4,9 +4,9 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 
 	"github.com/strongo/aichat/ai/session"
+	"github.com/strongo/aichat/tui/theme"
 )
 
 // Renderer formats one entity ref for the sidebar list at the given width.
@@ -133,26 +133,25 @@ func (m *Model) Update(msg tea.Msg) tea.Cmd {
 	return nil
 }
 
-// View renders the sidebar list.
+// View renders the sidebar list using the shared tui/theme chrome — a
+// header, and per-row selection styling (theme.SelectedRow) matching the
+// same accent every other focused/selected element in an aichat product
+// uses (founder 2026-09-25: side panel styling is centralised, not
+// scattered per package).
 func (m *Model) View(width int, focused bool) string {
 	width = max(1, width)
 	if width != m.width {
 		m.SetWidth(width)
 	}
-	title := lipgloss.NewStyle().Bold(true).Render("Sidebar")
+	title := theme.PanelHeader("Sidebar")
 	if len(m.refs) == 0 {
-		return title + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render("(empty)")
+		return title + "\n  (empty)"
 	}
 	lines := make([]string, 0, len(m.refs)+1)
 	lines = append(lines, title)
 	for i, ref := range m.refs {
 		line := m.render(ref, max(1, width-2))
-		if focused && i == m.cursor {
-			line = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("51")).Render("› " + line)
-		} else {
-			line = "  " + line
-		}
-		lines = append(lines, line)
+		lines = append(lines, theme.SelectedRow(line, focused && i == m.cursor))
 	}
 	return strings.Join(lines, "\n")
 }
