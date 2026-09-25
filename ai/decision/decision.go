@@ -22,6 +22,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
 )
 
@@ -91,10 +92,12 @@ type Taxonomy struct {
 
 // Request is the input to Decide.
 type Request struct {
-	Product  string        `json:"product"`
-	Text     string        `json:"text"`
-	Taxonomy Taxonomy      `json:"taxonomy"`
-	State    session.State `json:"state"` // entity refs only, no rendered data
+	Product       string            `json:"product"`
+	InteractionID string            `json:"interactionId,omitempty"`
+	ClientContext *ai.ClientContext `json:"clientContext,omitempty"`
+	Text          string            `json:"text"`
+	Taxonomy      Taxonomy          `json:"taxonomy"`
+	State         session.State     `json:"state"` // entity refs only, no rendered data
 	// Recent is a short tail of the transcript for continuations.
 	Recent []string  `json:"recent,omitempty"`
 	Now    time.Time `json:"now"`

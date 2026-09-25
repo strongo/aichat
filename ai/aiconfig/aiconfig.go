@@ -187,7 +187,8 @@ func (c Config) String() string {
 // deterministic deciders).
 type Deps struct {
 	// Product identifies the consuming product for cloud metering/routing.
-	Product string
+	Product       string
+	ClientContext *ai.ClientContext
 	// CloudToken supplies the bearer token for cloud requests. Required when
 	// LLM.Provider=="cloud" or a cloud decision provider is wired up.
 	CloudToken func(context.Context) (string, error)
@@ -260,10 +261,11 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 	buildCloudClient := func() *cloud.Client {
 		if cloudClient == nil {
 			cloudClient = cloud.New(cloud.Config{
-				BaseURL:    cloudBaseURL,
-				Product:    deps.Product,
-				Token:      deps.CloudToken,
-				HTTPClient: deps.HTTPClient,
+				BaseURL:       cloudBaseURL,
+				Product:       deps.Product,
+				ClientContext: deps.ClientContext,
+				Token:         deps.CloudToken,
+				HTTPClient:    deps.HTTPClient,
 			})
 		}
 		return cloudClient
