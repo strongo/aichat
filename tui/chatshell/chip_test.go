@@ -1191,3 +1191,110 @@ func TestReplayDataTugComposerAttachmentChipsCanBeFocusedClearedAndRestored(t *t
 		t.Fatalf("Shift+Esc did not restore the chip removed by Ctrl+D: %+v", m.Chips())
 	}
 }
+
+// withTrueColorEnv sets TERM/COLORTERM so theme.HalfBlockEdgesActive()
+// reports true for the duration of fn -- the seam every merged-edge test
+// below uses instead of reaching into theme's own unexported detection
+// var.
+func withTrueColorEnv(t *testing.T, fn func()) {
+	t.Helper()
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("COLORTERM", "truecolor")
+	if !theme.HalfBlockEdgesActive() {
+		t.Fatal("withTrueColorEnv: theme.HalfBlockEdgesActive() still false")
+	}
+	fn()
+}
+
+// TestChipsRenderAsHalfBlockEdgeWithSingleCellSeparator covers the
+// founder's r9 chips-in-edge idea directly: with chips present and
+// half-block edges active, chipsView's row uses EXACTLY one filler cell
+// between adjacent pills (founder, verbatim: "Have a 1 char half height
+// separator between attachments" -- checked for two AND three chips), and
+// the composer renders via ComposerFrameNoTopEdge (no separate top "▄"
+// row of its own -- the chip row performs that role).
+func TestChipsRenderAsHalfBlockEdgeWithSingleCellSeparator(t *testing.T) {
+	withTrueColorEnv(t, func() {
+		for _, n := range []int{2, 3} {
+			h := &fakeHandler{}
+			m := newTestShell(h)
+			m.SetChips(threeChips()[:n])
+
+			view := m.chipsView(m.chatWidth())
+			plain := ansi.Strip(view)
+			// n pills joined by n-1 single "▄" separators, plus a
+			// trailing fill run -- never a plain space anywhere between
+			// or after a pill in this mode.
+			if strings.Contains(plain, "  ") {
+				t.Fatalf("n=%d: expected no double space / plain-space gaps in half-block mode: %q", n, plain)
+			}
+			gotSeparators := strings.Count(view, "▄")
+			if gotSeparators == 0 {
+				t.Fatalf("n=%d: expected half-block filler glyphs in the chips row: %q", n, view)
+			}
+
+			rendered := m.View().Content
+			if !m.composerUsesChipsAsTopEdge() {
+				t.Fatalf("n=%d: expected composerUsesChipsAsTopEdge() true", n)
+			}
+			if !strings.Contains(rendered, "▄") {
+				t.Fatalf("n=%d: expected the rendered view to contain half-block glyphs", n)
+			}
+		}
+	})
+}
+
+// TestChipsMergedEdgeKeepsTotalRenderedHeightExact covers the composerHeight
+// adjustment: with the composer's own top edge omitted (absorbed into the
+// chip row), View()'s TOTAL rendered line count must still equal m.height
+// exactly -- the same invariant historyHeight's own doc requires
+// unconditionally.
+func TestChipsMergedEdgeKeepsTotalRenderedHeightExact(t *testing.T) {
+	withTrueColorEnv(t, func() {
+		h := &fakeHandler{}
+		m := newTestShell(h)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		m.SetChips(threeChips())
+		content := m.View().Content
+		lines := strings.Count(content, "\n") + 1
+		if lines != m.height {
+			t.Fatalf("rendered %d lines, want exactly m.height=%d:\n%s", lines, m.height, content)
+		}
+	})
+}
+
+// TestChipCloseClickStillHitsGlyphInMergedEdgeMode is the critical
+// regression check for the chips-in-edge redesign: chipRows' x/y layout
+// math is UNCHANGED by the visual redesign (same cell widths, same 1-col
+// gap accounting -- see chipRows' own doc), so a click on the rendered ×
+// must still remove the right chip even when that row is now doubling as
+// the composer's own top edge.
+func TestChipCloseClickStillHitsGlyphInMergedEdgeMode(t *testing.T) {
+	withTrueColorEnv(t, func() {
+		h := &chipHandler{}
+		m := New(h, WithMouse(MouseCellMotion))
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		m.SetMouseEnabled(true)
+		m.SetChips(threeChips())
+
+		cell := chipCellFor(t, m, 1)
+		y := m.chipsTopY()
+		m.Update(tea.MouseClickMsg{X: cell.x, Y: y, Button: tea.MouseLeft})
+		if got := m.Chips(); len(got) != 2 || got[0].ID != "a" || got[1].ID != "c" {
+			t.Fatalf("expected chip %q removed by its close-glyph click in merged-edge mode, got %+v", "b", got)
+		}
+	})
+}
+
+// TestComposerFallsBackToOwnTopEdgeWithoutChips covers the "no chips"
+// case in half-block mode: composerUsesChipsAsTopEdge() must be false and
+// the composer must render its OWN top edge as usual.
+func TestComposerFallsBackToOwnTopEdgeWithoutChips(t *testing.T) {
+	withTrueColorEnv(t, func() {
+		h := &fakeHandler{}
+		m := newTestShell(h)
+		if m.composerUsesChipsAsTopEdge() {
+			t.Fatal("expected composerUsesChipsAsTopEdge() false with no chips")
+		}
+	})
+}

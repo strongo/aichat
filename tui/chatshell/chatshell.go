@@ -1430,7 +1430,25 @@ func (m *Model) historyHeight() int {
 // single content line plus theme.ComposerFrame's top/bottom border rows.
 func (m *Model) composerHeight() int {
 	_, rows := theme.ComposerFrameSize()
+	if m.composerUsesChipsAsTopEdge() {
+		// The composer's own top edge row is omitted -- the chip row
+		// immediately above it (already counted by chipsHeight) performs
+		// that role instead (see View()'s doc and theme.
+		// ComposerFrameNoTopEdge).
+		rows--
+	}
 	return 1 + rows
+}
+
+// composerUsesChipsAsTopEdge reports whether View() will render the
+// composer via theme.ComposerFrameNoTopEdge with the chip strip acting as
+// its top half-block edge, instead of theme.ComposerFrame's own top edge
+// -- true exactly when there's at least one chip AND half-block edges are
+// actually active (theme.HalfBlockEdgesActive()); in fallback mode the
+// chip row still renders as its own separate line above a full
+// ComposerFrame, unchanged from before this feature existed.
+func (m *Model) composerUsesChipsAsTopEdge() bool {
+	return len(m.chips) > 0 && theme.HalfBlockEdgesActive()
 }
 
 // topBarHeight is the rendered top bar's line count -- 1 for the default
@@ -1894,6 +1912,9 @@ func (m *Model) View() tea.View {
 		history += "\n" + m.spinner.View() + " thinking…"
 	}
 	composer := theme.ComposerFrame(m.chatWidth(), m.input.View(), inputFocused)
+	if m.composerUsesChipsAsTopEdge() {
+		composer = theme.ComposerFrameNoTopEdge(m.chatWidth(), m.input.View(), inputFocused)
+	}
 	menu := m.commandMenuView()
 	chatParts := []string{history}
 	if menu != "" {

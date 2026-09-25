@@ -291,15 +291,22 @@ type chipCell struct {
 }
 
 // chipCloseGlyph is appended, space-separated, to a chip's (possibly
-// truncated) label to form its pill text, e.g. "[Customer ×]".
+// truncated) label to form its pill text, e.g. " Customer × ".
 const chipCloseGlyph = "×"
 
-// chipRows lays out the current chips into rows that wrap at width (one
-// space between adjacent pills on the same row; a pill that would overflow
-// starts a new row instead), mirroring DataTug's attachmentRows. A single
-// chip wider than width still gets its own row (truncated, close glyph
-// preserved) rather than being dropped. Returns nil when there are no
-// chips.
+// chipRows lays out the current chips into rows that wrap at width (a
+// single half-block cell between adjacent pills on the same row -- see
+// chipEdgeFiller; a pill that would overflow starts a new row instead),
+// mirroring DataTug's attachmentRows. A single chip wider than width still
+// gets its own row (truncated, close glyph preserved) rather than being
+// dropped. Returns nil when there are no chips.
+//
+// Pill text is " label × " -- one space either side of the label, one
+// before the close glyph, one trailing (founder, r9: "one space either
+// side of the label"; no brackets) -- the SAME total width the older
+// "[label ×]" bracket form used, so this changed nothing about which chips
+// land on which row or the close glyph's own x offset (still
+// used+len(label)+2, unchanged below).
 func (m *Model) chipRows(width int) [][]chipCell {
 	if len(m.chips) == 0 {
 		return nil
@@ -309,7 +316,7 @@ func (m *Model) chipRows(width int) [][]chipCell {
 	used := 0
 	for i, c := range m.chips {
 		label := ansi.Truncate(c.Label, max(0, available-4), "")
-		text := "[" + label + " " + chipCloseGlyph + "]"
+		text := " " + label + " " + chipCloseGlyph + " "
 		w := ansi.StringWidth(text)
 		gap := 0
 		if used > 0 {
@@ -337,39 +344,80 @@ func (m *Model) chipsHeight(width int) int {
 	return len(m.chipRows(width))
 }
 
-// chipStyle/chipFocusedStyle render a chip pill's text: muted normal,
-// FocusSurfaceColors-highlighted when focused (Tab-cycled or about to be
-// removed) — the SAME accent every other focused/selected element uses
-// (founder 2026-09-25). Functions, not package vars: theme.Dark can change
-// at runtime (theme.SetDark), and a memoised colour would keep rendering
-// the stale variant forever after.
+// chipStyle/chipFocusedStyle render a chip pill as a FULL-HEIGHT solid
+// cell: theme.SurfaceColors() normal (the SAME surface the composer's own
+// unfocused fill uses, so an unselected chip reads as part of the same
+// surface family), theme.FocusSurfaceColors()-highlighted when focused
+// (Tab-cycled or about to be removed) — the SAME accent every other
+// focused/selected element uses (founder 2026-09-25). Founder, r9: "chip
+// cells are full-height cells with the chip background ... text >=
+// 4.5:1" — MutedColor()-on-SurfaceColors() and FocusSurfaceColors' own
+// pair are both already verified at bodyTextMinRatio by
+// theme.ContrastPairs, so this reuses existing, already-checked colours
+// rather than inventing a new "chip surface". Functions, not package
+// vars: theme.Dark can change at runtime (theme.SetDark), and a memoised
+// colour would keep rendering the stale variant forever after.
 func chipStyle() lipgloss.Style {
-	return lipgloss.NewStyle().Foreground(theme.MutedColor())
+	bg, _ := theme.SurfaceColors()
+	return lipgloss.NewStyle().Background(bg).Foreground(theme.MutedColor())
 }
 func chipFocusedStyle() lipgloss.Style {
 	bg, fg := theme.FocusSurfaceColors()
 	return lipgloss.NewStyle().Bold(true).Foreground(fg).Background(bg)
 }
 
-// chipsView renders the current chips as one or more wrapped rows, joined
-// with a blank line above nothing (each row is newline-joined; a space
-// separates pills on the same row). Returns "" when there are no chips.
+// chipEdgeFiller returns the single-cell separator/fill glyph chipsView
+// uses between pills and to pad a row's remaining width: theme.
+// HalfBlockEdge's own "▄" (foreground = the composer's unfocused surface
+// colour, background = theme.TerminalBackground()) when half-block edges
+// are active — founder, r9, verbatim: "Have a 1 char half height
+// separator between attachments" — or a plain space in fallback mode (no
+// half-block glyphs anywhere in that mode, matching Card/ComposerFrame's
+// own fallback).
+func chipEdgeFiller(width int) string {
+	if !theme.HalfBlockEdgesActive() {
+		return strings.Repeat(" ", max(0, width))
+	}
+	composerBG, _ := theme.SurfaceColors()
+	return theme.HalfBlockEdge(width, composerBG, true)
+}
+
+// chipsView renders the current chips as one or more wrapped rows: pills
+// full-height solid cells (chipStyle/chipFocusedStyle), separated by
+// EXACTLY one half-block filler cell (chipEdgeFiller(1)) rather than a
+// blank space, with the row's remaining width past the last pill also
+// filled the same way -- so each row reads as a strip of tabs rising off
+// a half-block surface, the row immediately above the composer
+// effectively BEING its top edge (see chatshell.go's View(), which skips
+// ComposerFrame's own top edge whenever chips are present in half-block
+// mode: theme.ComposerFrameNoTopEdge). Returns "" when there are no
+// chips.
 func (m *Model) chipsView(width int) string {
 	rows := m.chipRows(width)
 	if len(rows) == 0 {
 		return ""
 	}
+	sep := chipEdgeFiller(1)
 	lines := make([]string, 0, len(rows))
 	for _, row := range rows {
 		parts := make([]string, 0, len(row))
-		for _, cell := range row {
+		used := 0
+		for i, cell := range row {
 			style := chipStyle()
 			if cell.index == m.chipFocus {
 				style = chipFocusedStyle()
 			}
 			parts = append(parts, style.Render(cell.text))
+			used += ansi.StringWidth(cell.text)
+			if i < len(row)-1 {
+				used++ // the separator cell chipRows already reserved.
+			}
 		}
-		lines = append(lines, strings.Join(parts, " "))
+		line := strings.Join(parts, sep)
+		if fill := max(0, width-used); fill > 0 {
+			line += chipEdgeFiller(fill)
+		}
+		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
 }

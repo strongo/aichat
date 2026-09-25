@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -17,6 +18,25 @@ func withDark(t *testing.T, dark bool, fn func()) {
 	prev := Dark
 	SetDark(dark)
 	t.Cleanup(func() { SetDark(prev) })
+	fn()
+}
+
+// withHalfBlockEdges forces HalfBlockEdgesActive() to report trueColor
+// (true) or a downsampled profile (false), independent of the real
+// environment `go test` runs in (which, having no COLORTERM set, reports
+// half-block edges INACTIVE by default -- every existing pre-r9 test
+// exercises the fallback path unless it opts into this).
+func withHalfBlockEdges(t *testing.T, trueColor bool, fn func()) {
+	t.Helper()
+	prevEdges, prevDetect := HalfBlockEdges, detectColorProfile
+	HalfBlockEdges = true
+	detectColorProfile = func() colorprofile.Profile {
+		if trueColor {
+			return colorprofile.TrueColor
+		}
+		return colorprofile.ANSI256
+	}
+	t.Cleanup(func() { HalfBlockEdges, detectColorProfile = prevEdges, prevDetect })
 	fn()
 }
 
@@ -400,5 +420,129 @@ func TestRenderHintsSplitsAnOverWideSegmentOnWordBoundaries(t *testing.T) {
 	}
 	if strings.Contains(flat, "…") {
 		t.Fatalf("expected no mid-word ellipsis truncation once a segment wraps on word boundaries:\n%s", flat)
+	}
+}
+
+// TestCardHalfBlockEdgesUseSurfaceAndTerminalColours covers the founder's
+// half-block-edge idea directly: with HalfBlockEdgesActive() true, a
+// Card's first and last rendered lines must be "▄"/"▀" glyphs coloured
+// foreground=the card's own surface fill, background=TerminalBackground()
+// -- not a full blank padding row.
+func TestCardHalfBlockEdgesUseSurfaceAndTerminalColours(t *testing.T) {
+	withHalfBlockEdges(t, true, func() {
+		withDark(t, true, func() {
+			out := Card(RoleAssistant, "Assistant", "hello world", 40, false)
+			lines := strings.Split(out, "\n")
+			if len(lines) < 3 {
+				t.Fatalf("expected at least 3 lines (top edge, content, bottom edge): %q", out)
+			}
+			bg, _, _ := colorsFor(RoleAssistant)
+			wantEdge := HalfBlockEdge(40-cardBarWidth, bg, true)
+			if !strings.Contains(lines[0], "▄") {
+				t.Fatalf("top line missing the half-block glyph: %q", lines[0])
+			}
+			if !strings.HasSuffix(lines[0], wantEdge) {
+				t.Fatalf("top edge line = %q, want it to end with %q", lines[0], wantEdge)
+			}
+			last := lines[len(lines)-1]
+			if !strings.Contains(last, "▀") {
+				t.Fatalf("bottom line missing the half-block glyph: %q", last)
+			}
+			if strings.Contains(out, "hello world") == false {
+				t.Fatalf("body content lost: %q", out)
+			}
+		})
+	})
+}
+
+// TestCardFallsBackToFullPaddingWithoutTrueColor covers the opt-out/
+// degradation path: HalfBlockEdges=false, or a non-TrueColor profile, must
+// render the ORIGINAL full blank padding row (no "▄"/"▀" anywhere) --
+// unchanged from this package's pre-half-block rendering.
+func TestCardFallsBackToFullPaddingWithoutTrueColor(t *testing.T) {
+	// Gate 1: colour profile isn't TrueColor.
+	withHalfBlockEdges(t, false, func() {
+		out := Card(RoleAssistant, "Assistant", "hello world", 40, false)
+		if strings.ContainsAny(out, "▄▀") {
+			t.Fatalf("expected no half-block glyphs when the colour profile isn't TrueColor: %q", out)
+		}
+	})
+	// Gate 2: HalfBlockEdges=false, even on a TrueColor profile.
+	withHalfBlockEdges(t, true, func() {
+		prev := HalfBlockEdges
+		SetHalfBlockEdges(false)
+		t.Cleanup(func() { SetHalfBlockEdges(prev) })
+		out := Card(RoleAssistant, "Assistant", "hello world", 40, false)
+		if strings.ContainsAny(out, "▄▀") {
+			t.Fatalf("HalfBlockEdges=false must disable half-block edges even on a TrueColor profile: %q", out)
+		}
+	})
+}
+
+// TestHalfBlockEdgesActiveRequiresBothSwitches covers the two independent
+// gates: the package-level on/off switch and colour-profile detection.
+func TestHalfBlockEdgesActiveRequiresBothSwitches(t *testing.T) {
+	prevEdges, prevDetect := HalfBlockEdges, detectColorProfile
+	t.Cleanup(func() { HalfBlockEdges, detectColorProfile = prevEdges, prevDetect })
+
+	HalfBlockEdges = true
+	detectColorProfile = func() colorprofile.Profile { return colorprofile.TrueColor }
+	if !HalfBlockEdgesActive() {
+		t.Fatal("expected active: HalfBlockEdges=true, TrueColor profile")
+	}
+
+	detectColorProfile = func() colorprofile.Profile { return colorprofile.ANSI256 }
+	if HalfBlockEdgesActive() {
+		t.Fatal("expected inactive: ANSI256 profile despite HalfBlockEdges=true")
+	}
+
+	detectColorProfile = func() colorprofile.Profile { return colorprofile.TrueColor }
+	HalfBlockEdges = false
+	if HalfBlockEdgesActive() {
+		t.Fatal("expected inactive: HalfBlockEdges=false despite TrueColor profile")
+	}
+}
+
+// TestComposerFrameNoTopEdgeOmitsOnlyTheTopEdge covers the composer's
+// chips-in-edge seam: ComposerFrameNoTopEdge must drop the top "▄" row
+// (content starts immediately) while keeping the bottom "▀" row, and must
+// equal plain ComposerFrame content-for-content once both are stripped of
+// their edge rows.
+func TestComposerFrameNoTopEdgeOmitsOnlyTheTopEdge(t *testing.T) {
+	withHalfBlockEdges(t, true, func() {
+		full := ComposerFrame(30, "type here", false)
+		noTop := ComposerFrameNoTopEdge(30, "type here", false)
+		fullLines := strings.Split(full, "\n")
+		noTopLines := strings.Split(noTop, "\n")
+		if len(noTopLines) != len(fullLines)-1 {
+			t.Fatalf("ComposerFrameNoTopEdge has %d lines, want %d (ComposerFrame's %d minus its top edge row)", len(noTopLines), len(fullLines)-1, len(fullLines))
+		}
+		if strings.Contains(noTopLines[0], "▄") {
+			t.Fatalf("ComposerFrameNoTopEdge's first line still has a top edge glyph: %q", noTopLines[0])
+		}
+		// The bottom edge row (last line) must still be present and equal.
+		if fullLines[len(fullLines)-1] != noTopLines[len(noTopLines)-1] {
+			t.Fatalf("bottom edge row differs:\nfull:  %q\nnoTop: %q", fullLines[len(fullLines)-1], noTopLines[len(noTopLines)-1])
+		}
+	})
+	// Fallback: identical to ComposerFrame (no edge concept to omit).
+	withHalfBlockEdges(t, false, func() {
+		full := ComposerFrame(30, "type here", false)
+		noTop := ComposerFrameNoTopEdge(30, "type here", false)
+		if full != noTop {
+			t.Fatalf("fallback mode: ComposerFrameNoTopEdge should equal ComposerFrame, got:\nfull:  %q\nnoTop: %q", full, noTop)
+		}
+	})
+}
+
+// TestHalfBlockEdgeNonPositiveWidth covers the width<=0 guard directly --
+// a caller (e.g. chatshell filling zero leftover columns after chips fill
+// a whole row) gets "", not a panic or a negative-length repeat.
+func TestHalfBlockEdgeNonPositiveWidth(t *testing.T) {
+	if got := HalfBlockEdge(0, lipgloss.Color("#112233"), true); got != "" {
+		t.Fatalf("HalfBlockEdge(0, ...) = %q, want empty", got)
+	}
+	if got := HalfBlockEdge(-3, lipgloss.Color("#112233"), false); got != "" {
+		t.Fatalf("HalfBlockEdge(-3, ...) = %q, want empty", got)
 	}
 }

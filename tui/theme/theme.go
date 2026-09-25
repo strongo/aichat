@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -162,6 +163,64 @@ func barColors() (bg, fg color.Color) {
 // black). Every SurfaceDeltaPairs() entry is checked against this.
 func TerminalBackground() color.Color {
 	return pick(lipgloss.Color("#FAFAFA"), lipgloss.Color("#1E1E1E"))
+}
+
+// --- half-block surface edges --------------------------------------------
+//
+// Founder idea (2026-09-25, approved for r9): half-height block glyphs
+// ("▄" U+2584 LOWER HALF BLOCK, "▀" U+2580 UPPER HALF BLOCK), foreground =
+// the surface colour, background = TerminalBackground(), replace a card's
+// or the composer's full blank top/bottom padding row -- the glyph's own
+// filled half reads as the surface easing in/out a half-line, instead of
+// a hard one-row jump. Requires TrueColor (the fg/bg pair must render as
+// two DISTINCT, exact colours to read as a seam, not noise); HalfBlockEdges
+// = false, or a non-TrueColor colour profile, falls back to the original
+// full-padding-row rendering.
+
+// HalfBlockEdges is the product-facing on/off switch (default true) --
+// SetHalfBlockEdges(false) opts a product out entirely, independent of
+// colour-profile detection (e.g. a product that knows its target terminal
+// renders half-blocks with a visible seam despite TrueColor support).
+var HalfBlockEdges = true
+
+// SetHalfBlockEdges sets HalfBlockEdges explicitly.
+func SetHalfBlockEdges(v bool) { HalfBlockEdges = v }
+
+// detectColorProfile is the seam colorProfileSupportsTrueColor calls --
+// colorprofile.Env(os.Environ()), fault-injectable by a test the same way
+// detectBackground is.
+var detectColorProfile = func() colorprofile.Profile { return colorprofile.Env(os.Environ()) }
+
+// colorProfileSupportsTrueColor reports whether the detected colour
+// profile is exactly TrueColor -- half-block edges need the fg/bg pair to
+// render as their EXACT configured colours (a downsampled ANSI256/ANSI
+// terminal could quantise surface and terminal background to the same
+// palette entry, erasing the seam entirely).
+func colorProfileSupportsTrueColor() bool { return detectColorProfile() == colorprofile.TrueColor }
+
+// HalfBlockEdgesActive reports whether Card/ComposerFrame will actually
+// render half-block edges for the CURRENT call: HalfBlockEdges AND a
+// TrueColor colour profile. Exported so a caller composing its own content
+// around a Card/ComposerFrame (chatshell's chip strip, see chip.go) can
+// match its own rendering choice to whichever mode is active.
+func HalfBlockEdgesActive() bool { return HalfBlockEdges && colorProfileSupportsTrueColor() }
+
+// HalfBlockEdge renders ONE half-block edge row, width cells wide, that
+// blends surfaceBG into TerminalBackground(): "▄" (foreground=surfaceBG,
+// background=TerminalBackground()) for the TOP edge — the surface's fill
+// appears to start half a line in — or "▀" (same colours) for the BOTTOM
+// edge. Exported so a caller building its own leading/trailing fill around
+// embedded content (chatshell's chip strip) can match Card/ComposerFrame's
+// own edge glyph/colour rule exactly, rather than re-deriving it.
+func HalfBlockEdge(width int, surfaceBG color.Color, top bool) string {
+	glyph := "▀"
+	if top {
+		glyph = "▄"
+	}
+	if width <= 0 {
+		return ""
+	}
+	return lipgloss.NewStyle().Foreground(surfaceBG).Background(TerminalBackground()).Render(strings.Repeat(glyph, width))
 }
 
 // SurfaceColors returns the neutral panel/grid surface background+
@@ -345,6 +404,49 @@ func InnerWidth(width int) int {
 	return max(1, width-cardBarWidth-2*CardPaddingCols)
 }
 
+// surfaceFill composes ONE filled surface block — a Card or a
+// ComposerFrame — from already-painted content: padded horizontally by
+// paddingCols at OUTER width, with a 1-column left accent bar (barColor)
+// down every CONTENT row (the bar "spans the content rows" only — an edge
+// row's bar column instead gets a plain TerminalBackground() filler cell;
+// the simplest of the edge treatments the founder's half-block idea left
+// open, see HalfBlockEdge's package doc). When HalfBlockEdgesActive(),
+// topEdge/bottomEdge each request a HalfBlockEdge row in place of a full
+// blank padding row on that side; otherwise (fallback) both sides always
+// get a full padding row regardless of topEdge/bottomEdge, matching this
+// package's original (pre-half-block) rendering exactly.
+func surfaceFill(bg, fg, barColor color.Color, barWidth, paddingCols int, content string, width int, topEdge, bottomEdge bool) string {
+	half := HalfBlockEdgesActive()
+	vPad := 1
+	if half {
+		vPad = 0
+	}
+	innerWidth := max(1, width-barWidth-2*paddingCols)
+	rendered := lipgloss.NewStyle().
+		Background(bg).
+		Foreground(fg).
+		Padding(vPad, paddingCols).
+		Width(innerWidth).
+		Render(content)
+	bar := lipgloss.NewStyle().Background(barColor).Render(" ")
+	lines := strings.Split(rendered, "\n")
+	for i, line := range lines {
+		lines[i] = bar + line
+	}
+	block := strings.Join(lines, "\n")
+	if !half {
+		return block
+	}
+	filler := lipgloss.NewStyle().Background(TerminalBackground()).Render(strings.Repeat(" ", barWidth))
+	if topEdge {
+		block = filler + HalfBlockEdge(width-barWidth, bg, true) + "\n" + block
+	}
+	if bottomEdge {
+		block = block + "\n" + filler + HalfBlockEdge(width-barWidth, bg, false)
+	}
+	return block
+}
+
 // Card renders body (and, when non-empty, header above it in bold) as a
 // filled, coloured background block for role, at OUTER width — see the
 // package doc above for the no-border design and its focus/selection
@@ -361,24 +463,7 @@ func Card(role Role, header, body string, width int, focused bool) string {
 	if header != "" {
 		content = lipgloss.NewStyle().Bold(true).Background(bg).Foreground(fg).Render(header) + "\n" + content
 	}
-	fillStyle := lipgloss.NewStyle().
-		Background(bg).
-		Foreground(fg).
-		Padding(CardPaddingRows, CardPaddingCols).
-		Width(InnerWidth(width))
-	return addLeftBar(fillStyle.Render(content), barColor)
-}
-
-// addLeftBar prepends a 1-column bar (bg-filled with barColor) to every
-// line of block — Card's focus indicator, and ComposerFrame's/PanelFrame's
-// analogous accent column.
-func addLeftBar(block string, barColor color.Color) string {
-	bar := lipgloss.NewStyle().Background(barColor).Render(" ")
-	lines := strings.Split(block, "\n")
-	for i, line := range lines {
-		lines[i] = bar + line
-	}
-	return strings.Join(lines, "\n")
+	return surfaceFill(bg, fg, barColor, cardBarWidth, CardPaddingCols, content, width, true, true)
 }
 
 // --- bars (top bar / hints-status bar) ------------------------------------
@@ -614,18 +699,30 @@ func ComposerFocusColors() (bg, fg color.Color) {
 // background off partway through the line (the "lost composer background"
 // regression — see the paintOver doc above).
 func ComposerFrame(width int, content string, focused bool) string {
+	return composerFrame(width, content, focused, true)
+}
+
+// ComposerFrameNoTopEdge is ComposerFrame without its own top edge row —
+// for when a caller is rendering something ELSE immediately above that
+// already performs the top edge's job visually (chatshell's chip strip,
+// see chip.go's chipsEdgeRow: founder, r9, "have attachment chips in the
+// top line of the composer ... the chips row that currently sits inside
+// the composer moves here"). In FALLBACK mode (HalfBlockEdgesActive()
+// false), there is no separate "edge row" concept to omit, so this is
+// identical to ComposerFrame — the caller's own chip row still renders as
+// its own line above, exactly as before this feature existed.
+func ComposerFrameNoTopEdge(width int, content string, focused bool) string {
+	return composerFrame(width, content, focused, false)
+}
+
+func composerFrame(width int, content string, focused, topEdge bool) string {
 	bg, fg := SurfaceColors()
 	barColor := bg
 	if focused {
 		bg, fg = ComposerFocusColors()
 		barColor = FocusColor()
 	}
-	style := lipgloss.NewStyle().
-		Background(bg).
-		Foreground(fg).
-		Padding(composerPaddingRows, composerPaddingCols).
-		Width(max(1, width-composerBarWidth))
-	return addLeftBar(style.Render(paintOver(content, bg, fg)), barColor)
+	return surfaceFill(bg, fg, barColor, composerBarWidth, composerPaddingCols, paintOver(content, bg, fg), width, topEdge, true)
 }
 
 // --- panel / sidebar rows ------------------------------------------------
