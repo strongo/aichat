@@ -642,6 +642,108 @@ func TestDecodeHTTPError_EmptyBodyFallsBackToHTTPStatusMessage(t *testing.T) {
 	}
 }
 
+// TestDecodeHTTPError_HTMLBodyCollapsesToShortMessage covers the bug this
+// guards against: an intermediary (e.g. Cloudflare) in front of the product
+// API returning its own HTML error page for a 502/504 instead of relaying
+// the application's JSON error. Before this fix, that raw HTML ended up
+// verbatim in *ai.Error.Message (and from there in a chat transcript as
+// "upstream: <!DOCTYPE html>...").
+func TestDecodeHTTPError_HTMLBodyCollapsesToShortMessage(t *testing.T) {
+	t.Run("text/html content-type", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body>cloudflare</body></html>"))
+		}))
+		defer srv.Close()
+		_, err := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")}).Usage(context.Background())
+		var aiErr *ai.Error
+		if !errors.As(err, &aiErr) {
+			t.Fatalf("err = %v, want *ai.Error", err)
+		}
+		want := "AI service unavailable (HTTP 502 Bad Gateway) -- try again later"
+		if aiErr.Message != want {
+			t.Errorf("Message = %q, want %q", aiErr.Message, want)
+		}
+		if strings.Contains(aiErr.Message, "<") || strings.Contains(aiErr.Message, "DOCTYPE") {
+			t.Errorf("Message = %q, must never contain raw HTML", aiErr.Message)
+		}
+		if aiErr.Code != ai.ErrCodeUpstream {
+			t.Errorf("Code = %q, want %q", aiErr.Code, ai.ErrCodeUpstream)
+		}
+		if !aiErr.Retryable {
+			t.Error("Retryable = false, want true for a 502")
+		}
+	})
+
+	t.Run("non-html content-type but body starts with '<'", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Deliberately a non-HTML Content-Type -- some intermediaries
+			// mislabel (or omit) the header even while sending HTML, so the
+			// leading '<' must be caught on its own.
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("  <html>mislabeled content-type</html>"))
+		}))
+		defer srv.Close()
+		_, err := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")}).Usage(context.Background())
+		var aiErr *ai.Error
+		if !errors.As(err, &aiErr) {
+			t.Fatalf("err = %v, want *ai.Error", err)
+		}
+		want := "AI service unavailable (HTTP 503 Service Unavailable) -- try again later"
+		if aiErr.Message != want {
+			t.Errorf("Message = %q, want %q", aiErr.Message, want)
+		}
+	})
+}
+
+// TestDecodeHTTPError_PlainTextBodyIsCapped covers the non-HTML, non-JSON
+// fallback path: a short plain-text body passes through unchanged, but a
+// long one is capped so an unexpectedly huge body from a misbehaving
+// intermediary can never flow unbounded into a transcript or log line.
+func TestDecodeHTTPError_PlainTextBodyIsCapped(t *testing.T) {
+	t.Run("short body passes through", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("  upstream connection refused  "))
+		}))
+		defer srv.Close()
+		_, err := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")}).Usage(context.Background())
+		var aiErr *ai.Error
+		if !errors.As(err, &aiErr) {
+			t.Fatalf("err = %v, want *ai.Error", err)
+		}
+		if aiErr.Message != "upstream connection refused" {
+			t.Errorf("Message = %q, want the trimmed body unchanged", aiErr.Message)
+		}
+	})
+
+	t.Run("long body is truncated with an ellipsis", func(t *testing.T) {
+		long := strings.Repeat("x", maxNonJSONErrorExcerpt+50)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(long))
+		}))
+		defer srv.Close()
+		_, err := New(Config{BaseURL: srv.URL, Product: "sneat", Token: tokenFunc("t")}).Usage(context.Background())
+		var aiErr *ai.Error
+		if !errors.As(err, &aiErr) {
+			t.Fatalf("err = %v, want *ai.Error", err)
+		}
+		wantPrefix := strings.Repeat("x", maxNonJSONErrorExcerpt)
+		if !strings.HasPrefix(aiErr.Message, wantPrefix) {
+			t.Errorf("Message does not start with the expected %d-char excerpt", maxNonJSONErrorExcerpt)
+		}
+		if !strings.HasSuffix(aiErr.Message, "…") {
+			t.Errorf("Message = %q, want an ellipsis suffix marking truncation", aiErr.Message)
+		}
+		if len(aiErr.Message) >= len(long) {
+			t.Errorf("Message length = %d, want it shorter than the original %d-byte body", len(aiErr.Message), len(long))
+		}
+	})
+}
+
 func TestNewRequestMethod_InvalidBaseURLErrors(t *testing.T) {
 	c := New(Config{BaseURL: "https://x/\x7f", Product: "sneat", Token: tokenFunc("t")})
 	_, err := c.newRequestMethod(context.Background(), http.MethodGet, cloudproto.PathUsage, nil)

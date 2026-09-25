@@ -315,10 +315,7 @@ func decodeHTTPError(resp *http.Response) error {
 		}
 		return &e
 	}
-	msg := strings.TrimSpace(string(b))
-	if msg == "" {
-		msg = "HTTP " + strconv.Itoa(resp.StatusCode)
-	}
+	msg := nonJSONErrorMessage(resp, b)
 	code := ai.ErrCodeUpstream
 	retryable := resp.StatusCode >= 500
 	switch resp.StatusCode {
@@ -330,4 +327,51 @@ func decodeHTTPError(resp *http.Response) error {
 		code = ai.ErrCodeInvalid
 	}
 	return &ai.Error{Code: code, Message: msg, Retryable: retryable}
+}
+
+// maxNonJSONErrorExcerpt bounds how much of a non-JSON error body ever ends
+// up in an *ai.Error.Message (and, from there, in a chat transcript or log
+// line). A plain-text body that isn't JSON (and isn't HTML -- see
+// nonJSONErrorMessage) is still short in practice (a load balancer's
+// one-liner), but nothing upstream of this function guarantees that, so it
+// is capped defensively rather than trusted.
+const maxNonJSONErrorExcerpt = 200
+
+// nonJSONErrorMessage builds the *ai.Error.Message for an error response
+// whose body is not the expected cloudproto.ErrorResponse JSON (the
+// decodeHTTPError caller already tried and failed that parse). The body
+// commonly comes not from the product's own API but from an intermediary in
+// front of it -- e.g. Cloudflare's own HTML 502/504 page when the origin
+// times out or drops the connection before the application gets to write
+// its JSON error body. Relaying that HTML verbatim into a chat transcript
+// (as "upstream: <!DOCTYPE html>...") is useless to the person reading it
+// and actively confusing (it reads as if the HTML markup IS the error), so
+// any body that looks like HTML -- Content-Type: text/html, or a body whose
+// first non-space byte is '<' as a defensive fallback for an intermediary
+// that sends HTML without bothering to set the header -- collapses to one
+// short, human-readable line instead. Anything else (a short plain-text
+// body, or an empty one) keeps its previous fallback behaviour, just capped.
+func nonJSONErrorMessage(resp *http.Response, body []byte) string {
+	trimmed := bytes.TrimSpace(body)
+	if looksLikeHTML(resp, trimmed) {
+		return fmt.Sprintf("AI service unavailable (HTTP %d %s) -- try again later", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+	msg := string(trimmed)
+	if msg == "" {
+		return "HTTP " + strconv.Itoa(resp.StatusCode)
+	}
+	if len(msg) > maxNonJSONErrorExcerpt {
+		msg = msg[:maxNonJSONErrorExcerpt] + "…"
+	}
+	return msg
+}
+
+// looksLikeHTML reports whether an error body should be treated as an
+// intermediary's HTML error page rather than a plain-text message from the
+// product's own API.
+func looksLikeHTML(resp *http.Response, trimmed []byte) bool {
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(strings.ToLower(ct), "text/html") {
+		return true
+	}
+	return len(trimmed) > 0 && trimmed[0] == '<'
 }
