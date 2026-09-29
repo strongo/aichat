@@ -10,8 +10,8 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
-	"github.com/strongo/aichat/tui/focus"
-	"github.com/strongo/aichat/tui/theme"
+	"github.com/strongo/strongo-tui/pkg/focus"
+	"github.com/strongo/strongo-tui/pkg/theme"
 )
 
 // chipHandler is a Handler + ChipObserver fake for exercising the

@@ -9,7 +9,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
-	"github.com/strongo/aichat/tui/theme"
+	"github.com/strongo/strongo-tui/pkg/theme"
 )
 
 // Chip is a product-neutral attachment shown as a removable pill above the

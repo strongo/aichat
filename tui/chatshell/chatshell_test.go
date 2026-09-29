@@ -15,11 +15,11 @@ import (
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
 	"github.com/strongo/aichat/tui"
-	"github.com/strongo/aichat/tui/focus"
 	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
-	"github.com/strongo/aichat/tui/theme"
 	"github.com/strongo/aichat/tui/transcript"
+	"github.com/strongo/strongo-tui/pkg/focus"
+	"github.com/strongo/strongo-tui/pkg/theme"
 )
 
 type fakeHandler struct {
@@ -66,7 +66,7 @@ func (h *fakeHandler) OnMsg(msg tea.Msg) tea.Cmd {
 }
 
 // fakeBlock is a minimal transcript.Block used to test focus/Esc/update
-// routing without depending on tui/grid (owned by another concurrent lane).
+// routing without depending on a real grid.
 type fakeBlock struct {
 	updates   int
 	captures  bool

@@ -6,7 +6,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/strongo/aichat/ai/session"
-	"github.com/strongo/aichat/tui/theme"
+	"github.com/strongo/strongo-tui/pkg/theme"
 )
 
 // Renderer formats one entity ref for the sidebar list at the given width.
@@ -161,7 +161,7 @@ func (m *Model) Update(msg tea.Msg) tea.Cmd {
 	return nil
 }
 
-// View renders the sidebar list using the shared tui/theme chrome — a
+// View renders the sidebar list using the shared strongo-tui pkg/theme chrome — a
 // header, and per-row selection styling (theme.SelectedRow) matching the
 // same accent every other focused/selected element in an aichat product
 // uses (founder 2026-09-25: side panel styling is centralised, not

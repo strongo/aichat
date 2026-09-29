@@ -5,7 +5,7 @@ This is a short, product-neutral reference for the Bubble Tea chat kit in
 `tui/chatshell`-based screen (`sneat chat`, `datatug chat`, ...). See
 `spec/features/tui-kit` for the full feature spec.
 
-## Focus ring (`tui/focus`)
+## Focus ring (strongo-tui `pkg/focus`)
 
 The screen has three focus zones: **Input** (composer), **Transcript**
 (an ordered list of "stops" — result grids, user messages, any focusable
@@ -123,67 +123,21 @@ notified after every chip-list change chatshell itself performs (a removal,
 `WithChips`/`SetChips`, since those calls already come from the product, and
 `SetChips` never clears a pending snapshot for the same reason.
 
-## Result grid (`tui/grid`)
+## Result grid (strongo-tui `pkg/grid`, adapter `tui/gridblock`)
 
-One grid implementation, used by DataTug and Sneat Chat alike — this package
-now owns the table rendering, per-cell column selection, scrollbar, style
-presets and footer/stats that used to be duplicated in DataTug's own
-`gridState`; DataTug's `gridState` is a thin wrapper embedding a
-`*grid.Model`.
+The grid itself (keys, columns, views, styles, footer, `RowActivatedMsg`,
+`SelectionChangedMsg`, `PinRowMsg`) is product-neutral and lives in
+`github.com/strongo/strongo-tui/pkg/grid`; see that package's documentation
+for its key table and options. aichat only adapts it to the transcript:
 
-| Key | Effect |
-|---|---|
-| `↑`/`↓`, `k` | Move the highlighted row (no `j` binding — reserved for a product's own use, e.g. DataTug's join-candidate navigation) |
-| `←`/`→`, `h`/`l` | Select a column, auto-scrolling it into view (`Model.SelectedColumn()`) |
-| `1` | Switch to the table (always view 0) |
-| `2`.. | Switch to a `WithExtraViews`/`SetExtraViews`-registered view, in registration order |
-| `Tab` | Toggle focus between the table and a split secondary view (`Model.ToggleSecondaryFocusIfSplit()`) |
-| `s` | Sort (toggle ascending/descending) by the selected column |
-| `Enter` | Emit `grid.RowActivatedMsg` for the highlighted row |
-| `+` | Emit `tui.AddToSidebarMsg` for the highlighted row's `Ref` |
-| `/` | Open bubble-table's built-in filter |
-
-`grid.WithKeyHandler(fn)` registers a product hook checked *first*, for every
-key the filter input isn't consuming; it can claim any key above (DataTug's
-Enter opens a cell-detail dialog instead of emitting `RowActivatedMsg`) plus
-its own actions with no generic-grid meaning (DataTug's
-c/r/a/d/b/B/e/q/space workspace keys).
-
-`Model.CapturesEsc()` reports true while the filter input is focused, so a
-surrounding chatshell should let Esc clear/blur the filter before treating
-Esc as its own (e.g. closing the block).
-
-`grid.Row.Values` is **positional** (`[]any`, aligned with the `Columns`
-slice a `Model` was built from), not a map keyed by column name — two
-columns sharing a name (e.g. `SELECT a.id, b.id`) each keep their own value.
-Use `grid.Absent` for a cell with no value at all (a sparse selection); it
-renders differently from an explicit `nil` ("NULL"). A value may be a raw Go
-value (formatted by `grid.FormatValue`) or a product's own pre-formatted
-display string.
-
-There is no fixed Card/Inspector view: the table is always view 0, and
-everything else is a `WithExtraViews`/`SetExtraViews`-registered `ExtraView`,
-in whatever order a product wants. `grid.CardView`/`grid.InspectorView` are
-ready-made `ExtraView` constructors (a formatted field list and a raw-value
-dump of the highlighted row) for a product that wants one — DataTug
-registers `CardView("Current row")` third, after its own Charts view.
-
-A large result is capped to `grid.DefaultMaxVisibleRows` rows per page
-(override with `grid.WithMaxVisibleRows`) so it never renders fully into a
-scrolling transcript.
-
-A product registers its own secondary views (DataTug's Charts, Raw response,
-Headers) with `grid.WithExtraViews(...)`, and a table/secondary-view
-split-pane policy — generalising DataTug's `chooseRecordsetLayout` — with
-`grid.WithSplitLayout(...)`; `Model.NaturalWidth()` gives a `LayoutFunc` the
-table's natural (unclipped) content width to compare against the pane's
-total width.
-
-`grid.WithStyle`/`Model.SetStyle` pick a border/header color preset
-(`grid.StyleLines`/`StyleSoft`/`StyleMinimal`; `grid.ParseStyle` recovers one
-by name). `grid.WithFooterHook` lets a product append text (e.g. a
-save-status badge) to the built-in stats footer (row/column range, sort
-indicator).
+- `gridblock.Wrap(m)` returns a `*gridblock.Block` (embeds `*grid.Model`)
+  that is a `transcript.Block`, `EntityBlock`, `SelfFramed` (the grid draws
+  its own border, no card fill), `Titled` and `EscCapturer`.
+- `gridblock.EntityRef(m)` reads the highlighted row's `Row.Ref`, stored as
+  a `*session.EntityRef` or a `session.EntityRef`.
+- `+` in a grid emits `grid.PinRowMsg`; the block translates it (also inside
+  a `tea.BatchMsg`) into `tui.AddToSidebarMsg`, so chatshell's sidebar
+  contract is unchanged.
 
 ## Sidebar (`tui/sidebar`)
 

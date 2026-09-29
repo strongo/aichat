@@ -16,7 +16,7 @@ import (
 	"charm.land/glamour/v2/ansi"
 	"charm.land/glamour/v2/styles"
 
-	"github.com/strongo/aichat/tui/theme"
+	"github.com/strongo/strongo-tui/pkg/theme"
 )
 
 // TermRenderer is the narrow seam Render needs from *glamour.TermRenderer —
