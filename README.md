@@ -23,7 +23,7 @@ products. Apache-2.0.
 | `ai/internal/sse` | Unexported SSE line-scanner (LF/CRLF/bare-CR) shared by every SSE reader in the module |
 | `tui` | Messages shared across the `tui/*` packages (e.g. `AddToSidebarMsg`) |
 | `tui/gridblock` | Thin adapter making a `github.com/tuigoff/tuigoff/pkg/grid` `Model` a `transcript.Block` (grid `PinRowMsg` becomes `tui.AddToSidebarMsg`); the grid itself lives in strongo-tui |
-| `tui/mdrender` | Shared glamour-backed `transcript.MarkdownRenderer` — one markdown look for every product |
+| Markdown rendering | Moved to [`tuigoff/pkg/mdrender`](https://github.com/tuigoff/tuigoff): tuigoff owns rendering, aichat composes it |
 | `tui/transcript` | Scrolling chat history: every entry (user/assistant/markdown/system/error message, or a `Block`) renders as a themed card via strongo-tui `pkg/theme` |
 | `tui/sidebar` | The right-hand working-context panel: pinned `session.EntityRef`s, themed via strongo-tui `pkg/theme` |
 | `tui/stream` | Pumps an `ai.LLMProvider` stream into Bubble Tea messages without buffering |
