@@ -1,6 +1,6 @@
 // Package transcript renders the scrolling chat history shared by every
 // aichat product: plain user/assistant messages, streamed assistant text and
-// rich Block entries (e.g. a tui/grid result). It generalises DataTug chat's
+// rich Block entries (e.g. a tui/gridblock result). It generalises DataTug chat's
 // entries/history viewport (rebuildHistory / ensureBlockVisible in
 // datatug-cli/pkg/chat/ui.go) behind a product-neutral Model.
 package transcript
@@ -13,7 +13,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/strongo/aichat/ai/session"
-	"github.com/strongo/aichat/tui/theme"
+	"github.com/strongo/strongo-tui/pkg/theme"
 )
 
 // Role of a transcript entry.
@@ -26,7 +26,7 @@ const (
 )
 
 // Block is a rich transcript entry that owns its own rendering and key
-// handling, e.g. a tui/grid result. Update returns the (possibly new) Block
+// handling, e.g. a tui/gridblock result. Update returns the (possibly new) Block
 // value, matching the Bubble Tea value-model convention.
 type Block interface {
 	View(width int, focused bool) string
@@ -65,7 +65,7 @@ type Roled interface {
 
 // SelfFramed is an optional Block capability: when it reports true,
 // transcript renders the Block's own View directly, with NO theme.Card
-// fill wrapped around it at all — e.g. tui/grid.Model, which always draws
+// fill wrapped around it at all — e.g. tui/gridblock.Block (a strongo-tui grid.Model), which always draws
 // its own complete border (inline title/footer, a right-edge scrollbar)
 // matching this package's design language for tabular/scrollable content
 // (founder 2026-09-25: "Grids are the exception ... NO surrounding card
@@ -552,11 +552,11 @@ func (m *Model) View() string { return m.viewport.View() }
 // product's messages, markdown responses and (prose-like) Blocks now
 // render as (founder 2026-09-25: "Message should be like a card in chat
 // of any app"; "The card defined not by border but by background"): a
-// coloured, FILLED-BACKGROUND box from tui/theme, distinct per role, with
+// coloured, FILLED-BACKGROUND box from strongo-tui pkg/theme, distinct per role, with
 // a bold header and a clearly visible focus highlight (a background shift
 // plus a left accent bar — never a border) — never a scattered
 // lipgloss.NewStyle() literal here; every colour/padding decision lives in
-// tui/theme. A grid-like Block (SelfFramed) is the one exception: it
+// pkg/theme. A grid-like Block (SelfFramed) is the one exception: it
 // renders its own View directly, with no Card fill (see SelfFramed) — but
 // still reserves theme's own MarkerColumnWidth gutter to its left (see
 // theme.ReserveMarkerColumn), so its own drawn border lands in the SAME

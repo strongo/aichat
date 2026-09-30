@@ -7,11 +7,12 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
-	"github.com/strongo/aichat/tui/focus"
-	"github.com/strongo/aichat/tui/theme"
+	"github.com/strongo/strongo-tui/pkg/focus"
+	"github.com/strongo/strongo-tui/pkg/theme"
 )
 
 // chipHandler is a Handler + ChipObserver fake for exercising the
@@ -1215,8 +1216,12 @@ func TestReplayDataTugComposerAttachmentChipsCanBeFocusedClearedAndRestored(t *t
 // var.
 func withTrueColorEnv(t *testing.T, fn func()) {
 	t.Helper()
-	t.Setenv("TERM", "xterm-256color")
-	t.Setenv("COLORTERM", "truecolor")
+	// colorprofile.Env reports NoTTY when stdout is not a terminal, so
+	// COLORTERM alone does not activate half-block edges under go test.
+	restore := theme.SetColorProfileDetector(func() colorprofile.Profile {
+		return colorprofile.TrueColor
+	})
+	t.Cleanup(restore)
 	if !theme.HalfBlockEdgesActive() {
 		t.Fatal("withTrueColorEnv: theme.HalfBlockEdgesActive() still false")
 	}

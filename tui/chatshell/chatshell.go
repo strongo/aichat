@@ -17,11 +17,11 @@ import (
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
 	"github.com/strongo/aichat/tui"
-	"github.com/strongo/aichat/tui/focus"
 	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
-	"github.com/strongo/aichat/tui/theme"
 	"github.com/strongo/aichat/tui/transcript"
+	"github.com/strongo/strongo-tui/pkg/focus"
+	"github.com/strongo/strongo-tui/pkg/theme"
 )
 
 // splitMinWidth is the terminal width at or above which the sidebar renders
@@ -72,7 +72,7 @@ type StreamObserver interface {
 
 // MsgHandler is an optional Handler capability: when implemented, chatshell
 // forwards every message it does not itself recognise (e.g. a product
-// message, or a Block message such as grid.RowActivatedMsg) to OnMsg, in
+// message, or a Block message such as grid.RowActivatedMsg (strongo-tui pkg/grid)) to OnMsg, in
 // addition to broadcasting it to the transcript's Blocks.
 type MsgHandler interface {
 	OnMsg(msg tea.Msg) tea.Cmd
@@ -436,7 +436,7 @@ func (m *Model) AppendSystem(text string) {
 	m.transcript.Append(transcript.Entry{Role: transcript.RoleSystem, Text: text})
 }
 
-// AppendBlock appends a rich transcript.Block (e.g. a tui/grid result).
+// AppendBlock appends a rich transcript.Block (e.g. a tui/gridblock result).
 func (m *Model) AppendBlock(block transcript.Block) {
 	m.transcript.Append(transcript.Entry{Block: block})
 }
@@ -1281,7 +1281,7 @@ func (m *Model) updateOverlay(msg tea.Msg) (tea.Model, tea.Cmd) {
 // dispatchUnhandled forwards a message chatshell does not itself recognise
 // to the transcript (so a focused or targeted Block can react, e.g. a
 // window resize) and to an optional MsgHandler (e.g. for a product message
-// such as grid.RowActivatedMsg).
+// such as grid.RowActivatedMsg (strongo-tui pkg/grid)).
 func (m *Model) dispatchUnhandled(msg tea.Msg) tea.Cmd {
 	var cmds []tea.Cmd
 	if cmd := m.transcript.Update(msg); cmd != nil {

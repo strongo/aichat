@@ -5,10 +5,11 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/strongo/aichat/ai/session"
-	"github.com/strongo/aichat/tui/theme"
+	"github.com/strongo/strongo-tui/pkg/theme"
 )
 
 type fakeBlock struct {
@@ -917,8 +918,12 @@ func firstNonBlankColumn(line string) int {
 // tests can't share unexported helpers across packages.
 func withTrueColorEnv(t *testing.T, fn func()) {
 	t.Helper()
-	t.Setenv("TERM", "xterm-256color")
-	t.Setenv("COLORTERM", "truecolor")
+	// colorprofile.Env reports NoTTY when stdout is not a terminal, so
+	// COLORTERM alone does not activate half-block edges under go test.
+	restore := theme.SetColorProfileDetector(func() colorprofile.Profile {
+		return colorprofile.TrueColor
+	})
+	t.Cleanup(restore)
 	if !theme.HalfBlockEdgesActive() {
 		t.Fatal("withTrueColorEnv: theme.HalfBlockEdgesActive() still false")
 	}
