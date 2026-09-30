@@ -10,29 +10,16 @@ package session
 import (
 	"slices"
 	"time"
+
+	"github.com/tuigoff/tuigoff/pkg/entity"
 )
 
-// EntityRef is a stable reference to a product entity.
-type EntityRef struct {
-	Type string            `json:"type" yaml:"type"`
-	Keys map[string]string `json:"keys" yaml:"keys"` // e.g. {"spaceID": "...", "happeningID": "..."}
-	// Title is a display hint for prompts and the sidebar. It may be stale;
-	// products re-resolve the entity by Keys before acting on it.
-	Title string `json:"title,omitempty" yaml:"title,omitempty"`
-}
-
-// Same reports whether two refs point at the same entity (Title ignored).
-func (r EntityRef) Same(o EntityRef) bool {
-	if r.Type != o.Type || len(r.Keys) != len(o.Keys) {
-		return false
-	}
-	for k, v := range r.Keys {
-		if o.Keys[k] != v {
-			return false
-		}
-	}
-	return true
-}
+// EntityRef is a stable reference to a product entity. It is tuigoff's
+// plain-data entity.Ref (Type, Keys, Title and Same), so UI components from
+// tuigoff and the conversational state here share one type without
+// conversion. Title is a display hint for prompts and the sidebar; it may be
+// stale, so products re-resolve the entity by Keys before acting on it.
+type EntityRef = entity.Ref
 
 // Action is a semantic, product-defined operation (never a storage write).
 type Action struct {

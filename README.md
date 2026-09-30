@@ -22,10 +22,8 @@ products. Apache-2.0.
 | `ai/internal/retry` | Unexported retry-before-first-byte helper (+ Retry-After honouring) shared by the HTTP adapters |
 | `ai/internal/sse` | Unexported SSE line-scanner (LF/CRLF/bare-CR) shared by every SSE reader in the module |
 | `tui` | Messages shared across the `tui/*` packages (e.g. `AddToSidebarMsg`) |
-| `tui/gridblock` | Thin adapter making a `github.com/tuigoff/tuigoff/pkg/grid` `Model` a `transcript.Block` (grid `PinRowMsg` becomes `tui.AddToSidebarMsg`); the grid itself lives in strongo-tui |
 | Markdown rendering | Moved to [`tuigoff/pkg/mdrender`](https://github.com/tuigoff/tuigoff): tuigoff owns rendering, aichat composes it |
-| `tui/transcript` | Scrolling chat history: every entry (user/assistant/markdown/system/error message, or a `Block`) renders as a themed card via strongo-tui `pkg/theme` |
-| `tui/sidebar` | The right-hand working-context panel: pinned `session.EntityRef`s, themed via strongo-tui `pkg/theme` |
+| Transcript, sidebar, grid block | Moved to [`tuigoff/pkg/transcript`, `pkg/sidebar`, `pkg/gridblock`](https://github.com/tuigoff/tuigoff): tuigoff renders, aichat composes. `session.EntityRef` is an alias of tuigoff's `entity.Ref` |
 | `tui/stream` | Pumps an `ai.LLMProvider` stream into Bubble Tea messages without buffering |
 | `tui/chatshell` | The reusable chat screen composing the packages above; a product plugs in a `Handler`, and optionally a `SidePanel` (replaces the sidebar), `Overlay`s (modal dialogs), `GlobalKeys`, content-only top-bar/hints-bar providers (`WithTopBarProvider`/`WithHintsProvider`), and mouse support (`WithMouse`/`SetMouseEnabled`: wheel-scrolls the transcript) |
 

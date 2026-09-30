@@ -15,11 +15,12 @@ import (
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
 	"github.com/strongo/aichat/tui"
-	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
-	"github.com/strongo/aichat/tui/transcript"
 	"github.com/tuigoff/tuigoff/pkg/focus"
+	"github.com/tuigoff/tuigoff/pkg/grid"
+	"github.com/tuigoff/tuigoff/pkg/sidebar"
 	"github.com/tuigoff/tuigoff/pkg/theme"
+	"github.com/tuigoff/tuigoff/pkg/transcript"
 )
 
 type fakeHandler struct {
@@ -277,6 +278,20 @@ func TestAddToSidebarMsgPinsAndNotifiesHandler(t *testing.T) {
 	}
 	if len(h.sidebarSeen) != 1 {
 		t.Fatalf("handler not notified: %v", h.sidebarSeen)
+	}
+}
+
+func TestGridPinRowMsgPinsEntityRef(t *testing.T) {
+	h := &fakeHandler{}
+	m := newTestShell(h)
+	ref := session.EntityRef{Type: "row", Keys: map[string]string{"id": "1"}}
+	m.Update(grid.PinRowMsg{Ref: &ref})
+	if len(m.SidebarRefs()) != 1 || len(h.sidebarSeen) != 1 {
+		t.Fatalf("PinRowMsg with a ref must pin: refs=%v seen=%v", m.SidebarRefs(), h.sidebarSeen)
+	}
+	m.Update(grid.PinRowMsg{Ref: "not a ref"})
+	if len(m.SidebarRefs()) != 1 {
+		t.Fatalf("PinRowMsg without a usable ref must be ignored: %v", m.SidebarRefs())
 	}
 }
 
