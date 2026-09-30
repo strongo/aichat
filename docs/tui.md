@@ -123,23 +123,26 @@ notified after every chip-list change chatshell itself performs (a removal,
 `WithChips`/`SetChips`, since those calls already come from the product, and
 `SetChips` never clears a pending snapshot for the same reason.
 
-## Result grid (strongo-tui `pkg/grid`, adapter `tui/gridblock`)
+## Result grid (tuigoff `pkg/grid`, adapter `pkg/gridblock`)
 
 The grid itself (keys, columns, views, styles, footer, `RowActivatedMsg`,
 `SelectionChangedMsg`, `PinRowMsg`) is product-neutral and lives in
 `github.com/tuigoff/tuigoff/pkg/grid`; see that package's documentation
-for its key table and options. aichat only adapts it to the transcript:
+for its key table and options. `github.com/tuigoff/tuigoff/pkg/gridblock`
+adapts it to the transcript:
 
 - `gridblock.Wrap(m)` returns a `*gridblock.Block` (embeds `*grid.Model`)
   that is a `transcript.Block`, `EntityBlock`, `SelfFramed` (the grid draws
   its own border, no card fill), `Titled` and `EscCapturer`.
 - `gridblock.EntityRef(m)` reads the highlighted row's `Row.Ref`, stored as
-  a `*session.EntityRef` or a `session.EntityRef`.
-- `+` in a grid emits `grid.PinRowMsg`; the block translates it (also inside
-  a `tea.BatchMsg`) into `tui.AddToSidebarMsg`, so chatshell's sidebar
-  contract is unchanged.
+  a `*session.EntityRef` or a `session.EntityRef` (both are tuigoff's
+  `entity.Ref`).
+- `+` in a grid emits `grid.PinRowMsg`, which the block passes through
+  untouched; chatshell handles it by pinning the row's entity reference, so
+  a product needs no translation step. `tui.AddToSidebarMsg` remains for
+  product controls that pin directly.
 
-## Sidebar (`tui/sidebar`)
+## Sidebar (tuigoff `pkg/sidebar`)
 
 An ordered list of `session.EntityRef`, rendered by a product-supplied
 `Renderer`. Reachable via `Shift+Right`/`Shift+Left`, or `+` in a grid pins
@@ -261,7 +264,7 @@ transcript.
 - **`WithSidePanel(p SidePanel)`** replaces the default sidebar END TO END:
   `F6` visibility, `Ctrl+Left`/`Ctrl+Right` split-percent resizing (still
   clamped 40–75%), `Shift+Right`/`Shift+Left` focus-ring participation and
-  rendering all route through `p` instead of `tui/sidebar` once set. A
+  rendering all route through `p` instead of `pkg/sidebar` once set. A
   `SidePanel` is `Title() string`, `View(width, height int, focused bool)
   string`, `Update(msg tea.Msg) (SidePanel, tea.Cmd)` — e.g. a DataTug
   workspace pane with its own tabs, explorer and bookmarks.

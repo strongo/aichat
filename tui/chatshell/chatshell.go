@@ -17,11 +17,13 @@ import (
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/session"
 	"github.com/strongo/aichat/tui"
-	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
-	"github.com/strongo/aichat/tui/transcript"
 	"github.com/tuigoff/tuigoff/pkg/focus"
+	"github.com/tuigoff/tuigoff/pkg/grid"
+	"github.com/tuigoff/tuigoff/pkg/gridblock"
+	"github.com/tuigoff/tuigoff/pkg/sidebar"
 	"github.com/tuigoff/tuigoff/pkg/theme"
+	"github.com/tuigoff/tuigoff/pkg/transcript"
 )
 
 // splitMinWidth is the terminal width at or above which the sidebar renders
@@ -436,7 +438,7 @@ func (m *Model) AppendSystem(text string) {
 	m.transcript.Append(transcript.Entry{Role: transcript.RoleSystem, Text: text})
 }
 
-// AppendBlock appends a rich transcript.Block (e.g. a tui/gridblock result).
+// AppendBlock appends a rich transcript.Block (e.g. a pkg/gridblock result).
 func (m *Model) AppendBlock(block transcript.Block) {
 	m.transcript.Append(transcript.Entry{Block: block})
 }
@@ -1116,6 +1118,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tui.AddToSidebarMsg:
 		m.PinToSidebar(msg.Ref)
+		return m, nil
+
+	case grid.PinRowMsg:
+		// A grid block's "+" key: pin the row's entity reference, when it
+		// has one (tuigoff's gridblock passes the grid's message through
+		// untranslated; pinning is this shell's decision).
+		if ref := gridblock.RefOf(msg.Ref); ref != nil {
+			m.PinToSidebar(*ref)
+		}
 		return m, nil
 
 	case sidebar.RemoveMsg:

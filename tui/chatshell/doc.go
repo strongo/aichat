@@ -1,5 +1,5 @@
-// Package chatshell composes tui/transcript, tui/sidebar, strongo-tui pkg/focus and
-// tui/stream into the reusable chat screen every aichat product runs:
+// Package chatshell composes tuigoff's pkg/transcript, pkg/sidebar, pkg/focus and
+// pkg/gridblock with aichat's tui/stream into the reusable chat screen every aichat product runs:
 // history + composer + sidebar + top/status bars, with a split pane when the
 // terminal is wide enough (>= 104 columns, matching DataTug's
 // splitEnabled). Products plug in with a Handler and, optionally, an
