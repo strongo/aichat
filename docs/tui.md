@@ -127,7 +127,7 @@ notified after every chip-list change chatshell itself performs (a removal,
 
 The grid itself (keys, columns, views, styles, footer, `RowActivatedMsg`,
 `SelectionChangedMsg`, `PinRowMsg`) is product-neutral and lives in
-`github.com/strongo/strongo-tui/pkg/grid`; see that package's documentation
+`github.com/tuigoff/tuigoff/pkg/grid`; see that package's documentation
 for its key table and options. aichat only adapts it to the transcript:
 
 - `gridblock.Wrap(m)` returns a `*gridblock.Block` (embeds `*grid.Model`)

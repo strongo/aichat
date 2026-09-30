@@ -18,8 +18,8 @@ import (
 	"github.com/strongo/aichat/tui/sidebar"
 	"github.com/strongo/aichat/tui/stream"
 	"github.com/strongo/aichat/tui/transcript"
-	"github.com/strongo/strongo-tui/pkg/focus"
-	"github.com/strongo/strongo-tui/pkg/theme"
+	"github.com/tuigoff/tuigoff/pkg/focus"
+	"github.com/tuigoff/tuigoff/pkg/theme"
 )
 
 type fakeHandler struct {

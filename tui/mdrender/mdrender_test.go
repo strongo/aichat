@@ -7,7 +7,7 @@ import (
 
 	glamour "charm.land/glamour/v2"
 
-	"github.com/strongo/strongo-tui/pkg/theme"
+	"github.com/tuigoff/tuigoff/pkg/theme"
 )
 
 func TestRenderBasicMarkdown(t *testing.T) {

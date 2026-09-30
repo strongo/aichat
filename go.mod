@@ -9,7 +9,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.6
 	github.com/charmbracelet/colorprofile v0.4.3
 	github.com/charmbracelet/x/ansi v0.11.8
-	github.com/strongo/strongo-tui v0.2.0
+	github.com/tuigoff/tuigoff v0.2.1
 	go.yaml.in/yaml/v3 v3.0.5
 )
 
