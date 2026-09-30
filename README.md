@@ -22,7 +22,7 @@ products. Apache-2.0.
 | `ai/internal/retry` | Unexported retry-before-first-byte helper (+ Retry-After honouring) shared by the HTTP adapters |
 | `ai/internal/sse` | Unexported SSE line-scanner (LF/CRLF/bare-CR) shared by every SSE reader in the module |
 | `tui` | Messages shared across the `tui/*` packages (e.g. `AddToSidebarMsg`) |
-| `tui/gridblock` | Thin adapter making a `github.com/strongo/strongo-tui/pkg/grid` `Model` a `transcript.Block` (grid `PinRowMsg` becomes `tui.AddToSidebarMsg`); the grid itself lives in strongo-tui |
+| `tui/gridblock` | Thin adapter making a `github.com/tuigoff/tuigoff/pkg/grid` `Model` a `transcript.Block` (grid `PinRowMsg` becomes `tui.AddToSidebarMsg`); the grid itself lives in strongo-tui |
 | `tui/mdrender` | Shared glamour-backed `transcript.MarkdownRenderer` — one markdown look for every product |
 | `tui/transcript` | Scrolling chat history: every entry (user/assistant/markdown/system/error message, or a `Block`) renders as a themed card via strongo-tui `pkg/theme` |
 | `tui/sidebar` | The right-hand working-context panel: pinned `session.EntityRef`s, themed via strongo-tui `pkg/theme` |
@@ -31,7 +31,7 @@ products. Apache-2.0.
 
 Products own scopes, intents, prompts, actions and controls. This module owns
 only what every product needs to talk to models and render chat the same way
-— **including how it looks**: `github.com/strongo/strongo-tui/pkg/theme` is the single place colour,
+— **including how it looks**: `github.com/tuigoff/tuigoff/pkg/theme` is the single place colour,
 padding and border decisions live, and every `tui/*` package (and every
 product built on `tui/chatshell`) gets that look as the *default*, with zero
 styling code of its own. A product supplies content only — message text,

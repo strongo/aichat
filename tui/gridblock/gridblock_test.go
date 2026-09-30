@@ -9,7 +9,7 @@ import (
 	"github.com/strongo/aichat/ai/session"
 	"github.com/strongo/aichat/tui"
 	"github.com/strongo/aichat/tui/transcript"
-	"github.com/strongo/strongo-tui/pkg/grid"
+	"github.com/tuigoff/tuigoff/pkg/grid"
 )
 
 func newBlock(ref any) *Block {

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/strongo/strongo-tui/pkg/theme"
+	"github.com/tuigoff/tuigoff/pkg/theme"
 )
 
 // backgroundSGRPattern matches every background-setting SGR component this
