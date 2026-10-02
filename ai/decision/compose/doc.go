@@ -86,8 +86,16 @@
 //     that reports one (a combinator, or an engine that explains its abstentions,
 //     as ai/decision/typesafe does), so a breaker never hides attempts from a
 //     decision.Chain's trace.
-//   - Each answered scored attempt carries its own decision.Usage, so a hedged or
-//     fallen-back call can be metered per engine.
+//   - Every attempt carries the decision.Usage its engine reported, so a hedged or
+//     fallen-back call can be metered per engine: a decided, uncertain or
+//     abstained answer, and a call that failed after a response that carried a
+//     usage object (an engine that reports its own attempt, as
+//     ai/decision/typesafe does, for decisions and for scores). An attempt whose
+//     engine reported none carries nil, never zero, and so does a leg still
+//     running when the call ended (a cancelled loser): its cost is unknown. A
+//     combinator keeps one attempt per upstream call, so usage is never counted
+//     twice. Breaker and Budget pass the wrapped engine's report on, for decisions
+//     and for scores alike.
 //   - A Breaker honours a failure's retry delay (a Retry-After, see
 //     decision.RetryDelay) as a minimum open time, ignores the result of a call
 //     that started before it last opened, returns when its context is done even

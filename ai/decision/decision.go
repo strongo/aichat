@@ -877,6 +877,15 @@ func sideEffectUnsupported(d Decision, minConf float64) string {
 // judgement (invalid, low_confidence, a policy verdict, carried by judged) when
 // the provider returned an answer. When the provider reported no attempts,
 // judged itself is recorded instead.
+//
+// A leaf engine reports its own attempt for every upstream call, with the usage
+// the call billed. The merge keeps that attempt, and so its Usage and Latency,
+// and takes from judged only what the engine cannot know: the verdict, the Role
+// in a combinator, and a Usage or Latency the engine did not report. An engine
+// that failed (it reported one attempt, outcome error, under judged's own name)
+// has the outcome and detail replaced by judged's classification (timeout, auth,
+// ...). One upstream call stays one attempt: nothing is added, so usage is never
+// counted twice.
 func MergeReport(rep Report, judged Attempt, answered bool) []Attempt {
 	if len(rep.Attempts) == 0 {
 		return []Attempt{judged}
@@ -886,14 +895,30 @@ func MergeReport(rep Report, judged Attempt, answered bool) []Attempt {
 		for i := len(out) - 1; i >= 0; i-- {
 			if out[i].Provider == rep.Engine && out[i].Outcome == AttemptDecided {
 				out[i].Outcome, out[i].Detail = judged.Outcome, judged.Detail
-				if out[i].Usage == nil {
-					out[i].Usage = judged.Usage
-				}
+				adopt(&out[i], judged)
 				break
 			}
 		}
+	} else if len(out) == 1 && out[0].Provider == judged.Provider {
+		if out[0].Outcome == AttemptError {
+			out[0].Outcome, out[0].Detail = judged.Outcome, judged.Detail
+		}
+		adopt(&out[0], judged)
 	}
 	return out
+}
+
+// adopt fills what the engine's own attempt left unsaid from the caller's.
+func adopt(a *Attempt, judged Attempt) {
+	if a.Usage == nil {
+		a.Usage = judged.Usage
+	}
+	if a.Role == "" {
+		a.Role = judged.Role
+	}
+	if a.Latency == 0 {
+		a.Latency = judged.Latency
+	}
 }
 
 // lowConfidence reports whether d fails the minConf floor. A module-optional

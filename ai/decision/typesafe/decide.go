@@ -133,28 +133,55 @@ const (
 	AbstainInteractionBelowDurable = "interaction_below_durable"
 )
 
-// DecideTraced implements decision.TracedProvider. It is Decide, plus: when the
-// provider abstains, the report carries one abstained attempt whose Detail is an
-// Abstain* reason code and whose Usage is what the call billed, so the
-// abstention rate and its cause can be measured and metered. A decided answer or
-// an error leaves the report without attempts, for the caller to record.
+// DecideTraced implements decision.TracedProvider. It is Decide, plus a report
+// of the upstream call: ONE attempt for every call, whatever came of it, so a
+// host that meters or caps spend from decision.Trace sees the tokens of every
+// call and not only of the abstained ones:
+//
+//   - decided: Outcome decided, Usage what the call billed (the Chain or
+//     combinator that judges the answer overrides the outcome with its own
+//     verdict, uncertain for example, and keeps the usage);
+//   - abstained: Outcome abstained, Detail an Abstain* reason code, so the
+//     abstention rate and its cause can be measured;
+//   - failed: Outcome error, Detail the error text, and Usage what the response
+//     body carried when it carried a usage object (a non-2xx answer, a 2xx that
+//     fails validation), nil when the call reported none (a network error, a
+//     timeout): its cost is unknown, which is not zero. A combinator or Chain
+//     replaces the outcome with its own classification (timeout, auth, ...).
+//
+// Latency is the time the call took. Usage is nil, never zero, for a call whose
+// response reported no usage.
 func (c *Client) DecideTraced(ctx context.Context, req decision.Request) (decision.Decision, bool, decision.Report, error) {
 	start := time.Now()
 	rep := decision.Report{Engine: c.Name()}
 	plan := c.plan(req)
-	resp, err := c.Ask(ctx, AskRequest{State: decideState(req), Questions: plan.questions})
+	resp, usage, err := c.ask(ctx, AskRequest{State: decideState(req), Questions: plan.questions})
 	if err != nil {
+		rep.Attempts = []decision.Attempt{c.attempt(start, decision.AttemptError, err.Error(), usage)}
 		return decision.Decision{}, false, rep, err
 	}
 	rep.Model = resp.Model
 	d, ok, why, err := c.fold(req, plan, resp)
-	if !ok && err == nil {
-		rep.Attempts = []decision.Attempt{{
-			Provider: c.Name(), Outcome: decision.AttemptAbstained, Detail: why, Latency: time.Since(start),
-			Usage: &decision.Usage{InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens},
-		}}
+	switch {
+	case err != nil:
+		rep.Attempts = []decision.Attempt{c.attempt(start, decision.AttemptError, err.Error(), usage)}
+	case !ok:
+		rep.Attempts = []decision.Attempt{c.attempt(start, decision.AttemptAbstained, why, usage)}
+	default:
+		rep.Attempts = []decision.Attempt{c.attempt(start, decision.AttemptDecided, "", usage)}
 	}
 	return d, ok, rep, err
+}
+
+// attempt is the one attempt a traced call reports: this client's name, the
+// time since start, and the usage the call reported (nil when it reported none).
+func (c *Client) attempt(start time.Time, outcome, detail string, u Usage) decision.Attempt {
+	a := decision.Attempt{Provider: c.Name(), Outcome: outcome, Detail: detail, Latency: time.Since(start)}
+	if u != (Usage{}) {
+		du := decision.Usage(u)
+		a.Usage = &du
+	}
+	return a
 }
 
 func (c *Client) plan(req decision.Request) decidePlan {

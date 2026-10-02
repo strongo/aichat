@@ -159,6 +159,7 @@ var (
 	_ decision.Provider              = (*Breaker)(nil)
 	_ decision.TracedProvider        = (*Breaker)(nil)
 	_ decision.ScoredProvider        = (*Breaker)(nil)
+	_ decision.TracedScorer          = (*Breaker)(nil)
 	_ decision.DeterministicProvider = (*Breaker)(nil)
 )
 
@@ -395,18 +396,37 @@ func (b *Breaker) DecideTraced(ctx context.Context, req decision.Request) (decis
 	return r.d, r.ok, r.rep, err
 }
 
+type scoreOutcome struct {
+	res decision.ScoreResult
+	rep decision.Report
+}
+
 // Score implements decision.ScoredProvider. A breaker with no engine returns
 // ErrNoEngine, and when the wrapped engine is not a scored provider it returns
 // decision.ErrUnsupported, neither touching the breaker.
 func (b *Breaker) Score(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, error) {
+	res, _, err := b.ScoreTraced(ctx, req)
+	return res, err
+}
+
+// ScoreTraced implements decision.TracedScorer, transparently like DecideTraced:
+// the report of a wrapped engine that reports one (its attempt and the usage the
+// call billed, also for a call that failed) is passed on.
+func (b *Breaker) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, decision.Report, error) {
 	if b.inner == nil {
-		return decision.ScoreResult{}, fmt.Errorf("%s: %w", b.Name(), ErrNoEngine)
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("%s: %w", b.Name(), ErrNoEngine)
 	}
 	sp, isScorer := b.inner.(decision.ScoredProvider)
 	if !isScorer {
-		return decision.ScoreResult{}, fmt.Errorf("%s: %w", b.Name(), decision.ErrUnsupported)
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("%s: %w", b.Name(), decision.ErrUnsupported)
 	}
-	return callBreaker(b, ctx, func(ctx context.Context) (decision.ScoreResult, error) {
-		return sp.Score(ctx, req)
+	r, err := callBreaker(b, ctx, func(ctx context.Context) (scoreOutcome, error) {
+		if ts, ok := sp.(decision.TracedScorer); ok {
+			res, rep, err := ts.ScoreTraced(ctx, req)
+			return scoreOutcome{res, rep}, err
+		}
+		res, err := sp.Score(ctx, req)
+		return scoreOutcome{res: res, rep: decision.Report{Engine: b.Name()}}, err
 	})
+	return r.res, r.rep, err
 }
