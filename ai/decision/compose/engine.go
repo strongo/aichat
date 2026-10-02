@@ -328,6 +328,7 @@ func (r legResult[T]) accepted() bool { return r.outcome == decision.AttemptDeci
 // cancelled, whichever is first, so a provider that ignores its context cannot
 // hold the caller past its timeout.
 func runLeg[T any](ctx context.Context, e *Engine, l leg[T], judge func(T) (string, string)) legResult[T] {
+	start := e.cfg.clock.Now() // before the timer exists, so latency never undercounts
 	lctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	timer := e.cfg.clock.AfterFunc(l.timeout, func() { cancel(context.DeadlineExceeded) })
@@ -340,7 +341,6 @@ func runLeg[T any](ctx context.Context, e *Engine, l leg[T], judge func(T) (stri
 		err      error
 	}
 	done := make(chan raw, 1) // buffered: a late provider never blocks on send
-	start := e.cfg.clock.Now()
 	go func() {
 		v, answered, rep, err := l.call(lctx)
 		done <- raw{v, answered, rep, err}
@@ -514,19 +514,14 @@ func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge f
 	}
 
 	out := runOut[T]{winner: -1}
-	hedgeC := make(chan struct{}, 1)
+	hedgeC := make(chan struct{}) // closed by the hedge timer, which fires at most once
 	if e.strategy == StrategyRace {
 		for i := range legs {
 			startLeg(i)
 		}
 	} else {
 		startLeg(0)
-		timer := e.cfg.clock.AfterFunc(e.hedgeAfter, func() {
-			select {
-			case hedgeC <- struct{}{}:
-			default:
-			}
-		})
+		timer := e.cfg.clock.AfterFunc(e.hedgeAfter, func() { close(hedgeC) })
 		defer timer.Stop()
 	}
 
@@ -534,6 +529,7 @@ func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge f
 	for running > 0 && winnerLeg < 0 {
 		select {
 		case <-hedgeC:
+			hedgeC = nil // a nil channel never fires again
 			if !started[1] {
 				out.hedge = true
 				startLeg(1)

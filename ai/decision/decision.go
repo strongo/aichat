@@ -96,7 +96,7 @@ type ModuleSpec struct {
 }
 
 // Taxonomy is the product's decision vocabulary, sent with every request so a
-// shared decision service (Jev) stays product-neutral.
+// shared decision service stays product-neutral.
 type Taxonomy struct {
 	Modules       []ModuleSpec `json:"modules"`
 	Presentations []string     `json:"presentations,omitempty"`

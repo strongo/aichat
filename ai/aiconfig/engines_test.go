@@ -239,7 +239,7 @@ func TestBuild_BreakerDefaultsOnAndCanBeDisabled(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i := 0; i < 10; i++ {
-			p.Decision[0].Decide(context.Background(), engineRequest())
+			_, _, _ = p.Decision[0].Decide(context.Background(), engineRequest())
 		}
 		return down.calls, transitions
 	}

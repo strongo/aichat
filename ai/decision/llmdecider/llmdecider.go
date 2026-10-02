@@ -1,8 +1,10 @@
 // Package llmdecider is a decision.Provider that makes ONE structured
 // inference against an ai.LLMProvider to produce a decision.Decision. It is
-// the product-neutral implementation the cloud hosts as "Jev": nothing here
-// is Sneat- or DataTug-specific, only the taxonomy passed in on each Request
-// gives it product shape.
+// an LLM decider: nothing here is Sneat- or DataTug-specific, only the
+// taxonomy passed in on each Request gives it product shape. Its confidences
+// are the model's self-report, not calibrated probabilities (Decision.Calibrated
+// stays false), so it is a fallback or an emulator behind a real decision
+// model such as ai/decision/typesafe, not a replacement for one.
 package llmdecider
 
 import (

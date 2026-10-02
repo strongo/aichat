@@ -105,15 +105,15 @@ func TestBreaker_OpensAfterFiveConsecutiveFailuresThenFailsFast(t *testing.T) {
 func TestBreaker_SuccessResetsTheRun(t *testing.T) {
 	r := newRig(t, WithBreakerThreshold(3))
 	r.fail(errBoom)
-	r.call(t)
-	r.call(t)
+	_ = r.call(t)
+	_ = r.call(t)
 	r.p.decide = instant("jev", "i").decide
 	if err := r.call(t); err != nil {
 		t.Fatal(err)
 	}
 	r.fail(errBoom)
-	r.call(t)
-	r.call(t)
+	_ = r.call(t)
+	_ = r.call(t)
 	if r.b.State() != BreakerClosed {
 		t.Fatal("two failures after a success must not open a threshold-3 breaker")
 	}
@@ -122,14 +122,14 @@ func TestBreaker_SuccessResetsTheRun(t *testing.T) {
 func TestBreaker_FailuresOutsideTheWindowDoNotAccumulate(t *testing.T) {
 	r := newRig(t, WithBreakerThreshold(2), WithBreakerWindow(10*time.Second))
 	r.fail(errBoom)
-	r.call(t)
+	_ = r.call(t)
 	r.clk.Advance(11 * time.Second)
-	r.call(t) // starts a new run: one failure
+	_ = r.call(t) // starts a new run: one failure
 	if r.b.State() != BreakerClosed {
 		t.Fatal("failures 11s apart opened a 10s-window breaker")
 	}
 	r.clk.Advance(5 * time.Second)
-	r.call(t) // second failure inside the window of the new run
+	_ = r.call(t) // second failure inside the window of the new run
 	if r.b.State() != BreakerOpen {
 		t.Fatalf("state = %v", r.b.State())
 	}
@@ -138,7 +138,7 @@ func TestBreaker_FailuresOutsideTheWindowDoNotAccumulate(t *testing.T) {
 func TestBreaker_HalfOpenProbeRecovers(t *testing.T) {
 	r := newRig(t, WithBreakerThreshold(1), WithBreakerCooldown(30*time.Second))
 	r.fail(errBoom)
-	r.call(t)
+	_ = r.call(t)
 	r.clk.Advance(29 * time.Second)
 	if err := r.call(t); !errors.Is(err, decision.ErrUnavailable) {
 		t.Fatalf("still cooling down: %v", err)
@@ -162,7 +162,7 @@ func TestBreaker_HalfOpenProbeRecovers(t *testing.T) {
 func TestBreaker_FailedProbeReopens(t *testing.T) {
 	r := newRig(t, WithBreakerThreshold(1), WithBreakerCooldown(time.Minute))
 	r.fail(errBoom)
-	r.call(t)
+	_ = r.call(t)
 	r.clk.Advance(time.Minute)
 	if err := r.call(t); !errors.Is(err, errBoom) || r.b.State() != BreakerOpen {
 		t.Fatalf("probe: err=%v state=%v", err, r.b.State())
@@ -177,7 +177,7 @@ func TestBreaker_FailedProbeReopens(t *testing.T) {
 func TestBreaker_OnlyOneProbeAtATime(t *testing.T) {
 	r := newRig(t, WithBreakerThreshold(1), WithBreakerCooldown(time.Second))
 	r.fail(errBoom)
-	r.call(t)
+	_ = r.call(t)
 	r.clk.Advance(time.Second)
 
 	release := make(chan struct{})
@@ -221,14 +221,14 @@ func TestBreaker_CancellationIsNotAFailure(t *testing.T) {
 func TestBreaker_CancelledProbeReleasesTheProbeSlot(t *testing.T) {
 	r := newRig(t, WithBreakerThreshold(1), WithBreakerCooldown(time.Second))
 	r.fail(errBoom)
-	r.call(t)
+	_ = r.call(t)
 	r.clk.Advance(time.Second)
 	r.p.decide = func(ctx context.Context, _ decision.Request) (decision.Decision, bool, error) {
 		return decision.Decision{}, false, ctx.Err()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	r.b.Decide(ctx, request()) // the probe, cancelled: no verdict
+	_, _, _ = r.b.Decide(ctx, request()) // the probe, cancelled: no verdict
 	if r.b.State() != BreakerHalfOpen {
 		t.Fatalf("state = %v", r.b.State())
 	}
@@ -241,7 +241,7 @@ func TestBreaker_CancelledProbeReleasesTheProbeSlot(t *testing.T) {
 func TestBreaker_TimeoutsCountAsFailures(t *testing.T) {
 	r := newRig(t, WithBreakerThreshold(1))
 	r.fail(context.DeadlineExceeded)
-	r.call(t)
+	_ = r.call(t)
 	if r.b.State() != BreakerOpen {
 		t.Fatalf("a wrapped-deadline error must count: %v", r.b.State())
 	}
@@ -255,7 +255,7 @@ func TestBreaker_TimeoutsCountAsFailures(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancelCause(context.Background())
 	cancel(context.DeadlineExceeded)
-	r2.b.Decide(ctx, request())
+	_, _, _ = r2.b.Decide(ctx, request())
 	if r2.b.State() != BreakerOpen {
 		t.Fatalf("deadline-caused cancellation must count: %v", r2.b.State())
 	}
@@ -265,7 +265,7 @@ func TestBreaker_AbstentionAndInvalidAnswersAreHealthy(t *testing.T) {
 	r := newRig(t, WithBreakerThreshold(1))
 	r.p.decide = abstaining("jev").decide
 	for i := 0; i < 3; i++ {
-		r.b.Decide(context.Background(), request())
+		_, _, _ = r.b.Decide(context.Background(), request())
 	}
 	if r.b.State() != BreakerClosed {
 		t.Fatalf("state = %v", r.b.State())
@@ -281,7 +281,7 @@ func TestBreaker_ErrorWhileContextDoneButNotCancelledErrorIsNeutral(t *testing.T
 		cancel()
 		return decision.Decision{}, false, errBoom
 	}
-	r.b.Decide(ctx, request())
+	_, _, _ = r.b.Decide(ctx, request())
 	if r.b.State() != BreakerClosed {
 		t.Fatalf("state = %v", r.b.State())
 	}
@@ -302,7 +302,7 @@ func TestBreaker_ScoredPath(t *testing.T) {
 	r.p.score = func(context.Context, decision.ScoreRequest) (decision.ScoreResult, error) {
 		return decision.ScoreResult{}, errBoom
 	}
-	r.b.Score(context.Background(), scoreRequest())
+	_, _ = r.b.Score(context.Background(), scoreRequest())
 	if r.b.State() != BreakerOpen {
 		t.Fatalf("state = %v", r.b.State())
 	}
@@ -314,7 +314,7 @@ func TestBreaker_ScoredPath(t *testing.T) {
 	r2.p.score = func(context.Context, decision.ScoreRequest) (decision.ScoreResult, error) {
 		return decision.ScoreResult{}, decision.ErrUnsupported
 	}
-	r2.b.Score(context.Background(), scoreRequest())
+	_, _ = r2.b.Score(context.Background(), scoreRequest())
 	if r2.b.State() != BreakerClosed {
 		t.Fatalf("state = %v", r2.b.State())
 	}
