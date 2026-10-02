@@ -43,6 +43,20 @@ const DefaultHedgeAfter = 600 * time.Millisecond
 // DecisionTimeout, matching decision.Chain's default.
 const DefaultTimeout = 1500 * time.Millisecond
 
+var (
+	// ErrSuperseded is the cause (context.Cause) of the context of a Hedged
+	// primary that was cancelled because its backup answered after the hedge
+	// fired: the primary had not answered within the latency budget, so a
+	// Breaker counts that cancellation as a failure of the primary. Without it a
+	// primary that hangs forever would be cancelled neutrally on every call and
+	// its breaker would never open. A Race loser is NOT superseded in this sense:
+	// all racers start together, so losing a race says nothing about health.
+	ErrSuperseded = errors.New("compose: engine superseded by its hedge")
+	// ErrNoEngine is returned by an engine or breaker built without a provider
+	// to run.
+	ErrNoEngine = errors.New("compose: no engine to run")
+)
+
 type config struct {
 	name           string
 	clock          Clock
@@ -92,11 +106,34 @@ func newEngine(s Strategy, providers []decision.Provider, hedgeAfter time.Durati
 	if cfg.name == "" {
 		names := make([]string, len(providers))
 		for i, p := range providers {
-			names[i] = p.Name()
+			names[i] = providerName(p)
 		}
 		cfg.name = string(s) + "(" + strings.Join(names, ",") + ")"
 	}
 	return &Engine{cfg: cfg, strategy: s, providers: providers, hedgeAfter: hedgeAfter}
+}
+
+// providerName is p's name, "<nil>" for a missing provider.
+func providerName(p decision.Provider) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return p.Name()
+}
+
+// check reports an engine that cannot run: a zero value (not built by a
+// constructor), no providers, or a nil provider. Constructors never panic; the
+// first call returns this error instead.
+func (e *Engine) check() error {
+	if e.cfg.clock == nil || len(e.providers) == 0 {
+		return fmt.Errorf("compose: %s: %w (engine has no providers)", e.cfg.name, ErrNoEngine)
+	}
+	for _, p := range e.providers {
+		if p == nil {
+			return fmt.Errorf("compose: %s: %w (a provider is nil)", e.cfg.name, ErrNoEngine)
+		}
+	}
+	return nil
 }
 
 // Single runs one provider. It exists so every decision, even one with no
@@ -135,6 +172,9 @@ func (e *Engine) Strategy() Strategy { return e.strategy }
 // longest this engine can take, so a hedged backup is not starved by what is
 // left of a chain's default.
 func (e *Engine) DecisionTimeout() time.Duration {
+	if len(e.providers) == 0 {
+		return 0
+	}
 	ts := make([]time.Duration, len(e.providers))
 	for i, p := range e.providers {
 		ts[i] = e.legTimeout(p)
@@ -207,6 +247,9 @@ type decided struct{ d decision.Decision }
 
 // DecideTraced implements decision.TracedProvider.
 func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decision.Decision, bool, decision.Report, error) {
+	if err := e.check(); err != nil {
+		return decision.Decision{}, false, decision.Report{Strategy: string(e.strategy)}, err
+	}
 	legs := make([]leg[decided], len(e.providers))
 	for i, p := range e.providers {
 		legs[i] = leg[decided]{
@@ -223,7 +266,7 @@ func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decisi
 	}
 	judge := func(v decided) (string, string) {
 		if err := decision.Validate(v.d, req.Taxonomy); err != nil {
-			return decision.AttemptInvalid, err.Error()
+			return decision.AttemptInvalid, decision.InvalidDetail(err)
 		}
 		if e.cfg.policy != nil && v.d.Calibrated && len(v.d.Scores) > 0 &&
 			e.cfg.policy.EvaluateDecision(v.d).Outcome == decision.OutcomeUncertain {
@@ -234,6 +277,7 @@ func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decisi
 	out := run(ctx, e, legs, judge)
 	rep := out.report(e)
 	if v, ok := out.value(); ok {
+		rep.Model = v.d.Model
 		return v.d, true, rep, nil
 	}
 	if out.abstained() {
@@ -253,6 +297,9 @@ func (e *Engine) Score(ctx context.Context, req decision.ScoreRequest) (decision
 
 // ScoreTraced implements decision.TracedScorer.
 func (e *Engine) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, decision.Report, error) {
+	if err := e.check(); err != nil {
+		return decision.ScoreResult{}, decision.Report{Strategy: string(e.strategy)}, err
+	}
 	if err := decision.ValidateScoreRequest(req); err != nil {
 		return decision.ScoreResult{}, decision.Report{Strategy: string(e.strategy)}, fmt.Errorf("compose: %s: invalid score request: %w", e.cfg.name, err)
 	}
@@ -276,12 +323,15 @@ func (e *Engine) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (de
 	}
 	judge := func(res decision.ScoreResult) (string, string) {
 		if err := decision.ValidateScoreResult(req, res); err != nil {
-			return decision.AttemptInvalid, err.Error()
+			return decision.AttemptInvalid, decision.InvalidDetail(err)
 		}
 		if e.cfg.policy != nil {
-			for _, a := range res.Answers {
-				if a.Calibrated && e.cfg.policy.Evaluate(a).Outcome == decision.OutcomeUncertain {
-					return decision.AttemptUncertain, a.QuestionID
+			// In question order, so the verdict never depends on map iteration.
+			for _, q := range req.Questions {
+				if a := res.Answers[q.ID]; a.Calibrated {
+					if sel := e.cfg.policy.Evaluate(a); sel.Outcome == decision.OutcomeUncertain {
+						return decision.AttemptUncertain, sel.Reason
+					}
 				}
 			}
 		}
@@ -291,6 +341,7 @@ func (e *Engine) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (de
 	rep := out.report(e)
 	if v, ok := out.value(); ok {
 		v.Engine = rep.Engine
+		rep.Model = v.Model
 		v.Report = &rep
 		return v, rep, nil
 	}
@@ -329,10 +380,8 @@ func (r legResult[T]) accepted() bool { return r.outcome == decision.AttemptDeci
 // hold the caller past its timeout.
 func runLeg[T any](ctx context.Context, e *Engine, l leg[T], judge func(T) (string, string)) legResult[T] {
 	start := e.cfg.clock.Now() // before the timer exists, so latency never undercounts
-	lctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	timer := e.cfg.clock.AfterFunc(l.timeout, func() { cancel(context.DeadlineExceeded) })
-	defer timer.Stop()
+	lctx, release := withTimeout(ctx, e.cfg.clock, l.timeout)
+	defer release()
 
 	type raw struct {
 		val      T
@@ -385,6 +434,10 @@ func classify(err, cause error) (outcome, detail string) {
 		return decision.AttemptUnavailable, err.Error()
 	case errors.Is(err, decision.ErrUnsupported):
 		return decision.AttemptUnsupported, err.Error()
+	case errors.Is(err, decision.ErrAuth):
+		return decision.AttemptAuth, err.Error()
+	case errors.Is(err, decision.ErrInvalidRequest):
+		return decision.AttemptRejected, err.Error()
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded):
 		return decision.AttemptTimeout, err.Error()
 	case errors.Is(err, context.Canceled) && cause != nil:
@@ -401,6 +454,10 @@ type runOut[T any] struct {
 	answerIdx int            // index into results of the answer returned (the winner, else an uncertain one), -1 if none
 	fallback  bool
 	hedge     bool
+	// primaryStands is true when a Hedged primary answered with an abstention or
+	// an uncertain answer that does not trigger the backup: that answer is the
+	// result, whatever the backup was doing.
+	primaryStands bool
 }
 
 // pickAnswer chooses the answer an engine returns: the accepted one, else the
@@ -408,6 +465,12 @@ type runOut[T any] struct {
 func (o runOut[T]) pickAnswer() int {
 	if o.winner >= 0 {
 		return o.winner
+	}
+	if o.primaryStands {
+		if o.results[0].outcome == decision.AttemptUncertain {
+			return 0
+		}
+		return -1 // an abstention
 	}
 	for i, r := range o.results {
 		if r.outcome == decision.AttemptUncertain {
@@ -499,8 +562,8 @@ type indexed[T any] struct {
 // goroutine, the first accepted answer wins, and every other leg is cancelled
 // through the shared context. Cancelled legs are recorded but not waited for.
 func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge func(T) (string, string)) runOut[T] {
-	rctx, cancelAll := context.WithCancel(ctx)
-	defer cancelAll()
+	rctx, cancelAll := context.WithCancelCause(ctx)
+	defer cancelAll(nil)
 
 	results := make([]*legResult[T], len(legs))
 	started := make([]bool, len(legs))
@@ -526,7 +589,7 @@ func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge f
 	}
 
 	winnerLeg := -1
-	for running > 0 && winnerLeg < 0 {
+	for running > 0 && winnerLeg < 0 && !out.primaryStands {
 		select {
 		case <-hedgeC:
 			hedgeC = nil // a nil channel never fires again
@@ -541,13 +604,25 @@ func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge f
 			switch {
 			case rr.accepted():
 				winnerLeg = r.idx
-			case e.strategy == StrategyHedged && r.idx == 0 && !started[1] && e.triggers(rr.outcome):
-				out.fallback = true
-				startLeg(1)
+			case e.strategy == StrategyHedged && r.idx == 0 && e.triggers(rr.outcome):
+				if !started[1] {
+					out.fallback = true
+					startLeg(1)
+				}
+			case e.strategy == StrategyHedged && r.idx == 0 && (rr.outcome == decision.AttemptAbstained || rr.outcome == decision.AttemptUncertain):
+				out.primaryStands = true
 			}
 		}
 	}
-	cancelAll()
+	// A primary that is still running when its hedge answered did not answer
+	// within the latency budget: cancel it with ErrSuperseded so a Breaker around
+	// it counts that as a failure instead of a neutral cancellation.
+	cause := context.Canceled
+	superseded := e.strategy == StrategyHedged && winnerLeg == 1 && out.hedge && results[0] == nil
+	if superseded {
+		cause = ErrSuperseded
+	}
+	cancelAll(cause)
 
 	// Record every started leg in leg order; one still running is a loser.
 	for i := range legs {
@@ -560,6 +635,9 @@ func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge f
 		case started[i]:
 			lat := e.cfg.clock.Now().Sub(startedAt[i])
 			a := decision.Attempt{Provider: legs[i].name, Outcome: decision.AttemptCancelled, Latency: lat, Role: legs[i].role}
+			if superseded && i == 0 {
+				a.Detail = "superseded by hedge"
+			}
 			out.results = append(out.results, legResult[T]{
 				role: legs[i].role, outcome: decision.AttemptCancelled, latency: lat,
 				engine: legs[i].name, attempts: []decision.Attempt{a},

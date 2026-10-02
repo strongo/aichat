@@ -13,6 +13,9 @@ import (
 // testKey is a fake key used only against fakes; it is not a credential.
 const testKey = "test-key-not-a-secret"
 
+// testModel is the pinned model id the tests configure.
+const testModel = "jev-1.13.0"
+
 // fakeDoer is a canned HTTP exchange that records the request.
 type fakeDoer struct {
 	status  int
@@ -78,7 +81,7 @@ func (f *fakeDoer) questions(t *testing.T) map[string]map[string]any {
 
 func newClient(t *testing.T, d *fakeDoer, mutate ...func(*Config)) *Client {
 	t.Helper()
-	cfg := Config{APIKey: testKey, HTTPClient: d}
+	cfg := Config{APIKey: testKey, Model: testModel, HTTPClient: d}
 	for _, m := range mutate {
 		m(&cfg)
 	}

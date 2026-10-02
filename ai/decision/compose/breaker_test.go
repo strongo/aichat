@@ -232,6 +232,9 @@ func TestBreaker_CancelledProbeReleasesTheProbeSlot(t *testing.T) {
 	if r.b.State() != BreakerHalfOpen {
 		t.Fatalf("state = %v", r.b.State())
 	}
+	// The breaker returns without waiting for the engine's goroutine, so wait
+	// for it before the test swaps the engine's behaviour.
+	waitFor(t, func() bool { return r.p.calls.Load() == 2 && r.p.running.Load() == 0 }, "the probe call to end")
 	r.p.decide = instant("jev", "i").decide
 	if err := r.call(t); err != nil || r.b.State() != BreakerClosed {
 		t.Fatalf("next call should take the probe: err=%v state=%v", err, r.b.State())

@@ -175,7 +175,7 @@ func TestScore_InvalidResultFromNestedWinnerIsRelabelled(t *testing.T) {
 	// stub traced scorer whose report claims "decided" for an invalid result.
 	stub := stubTracedScorer{res: bad, rep: decision.Report{Strategy: "x", Engine: "llm", Attempts: []decision.Attempt{{Provider: "llm", Outcome: decision.AttemptDecided}}}}
 	_, rep, err := Single(stub, WithClock(clk)).ScoreTraced(context.Background(), scoreRequest())
-	if err == nil || rep.Attempts[0].Outcome != decision.AttemptInvalid || !strings.Contains(rep.Attempts[0].Detail, "no answer") {
+	if err == nil || rep.Attempts[0].Outcome != decision.AttemptInvalid || !strings.Contains(rep.Attempts[0].Detail, "validation") {
 		t.Fatalf("err=%v rep=%+v", err, rep)
 	}
 }

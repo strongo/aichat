@@ -11,14 +11,14 @@ import (
 	"github.com/strongo/aichat/ai/decision"
 )
 
-func chinookRequest() decision.ScoreRequest {
-	tables := []string{"Album", "Artist", "Customer", "Invoice"}
+func libraryRequest() decision.ScoreRequest {
+	tables := []string{"books", "authors", "members", "loans"}
 	var cands []decision.Candidate
 	for _, t := range tables {
 		cands = append(cands, decision.Candidate{ID: t})
 	}
 	return decision.ScoreRequest{
-		Text: "Which countries buy the most music relative to their population?",
+		Text: "Which members borrow the most books relative to how long they have been members?",
 		Questions: []decision.Question{
 			{ID: "tables", Kind: decision.KindRelevance, Instructions: "Is the table needed to answer the question?", Candidates: cands},
 			{ID: "kind", Kind: decision.KindChoice, Instructions: "What kind of question is this?", NoneID: "other",
@@ -27,9 +27,9 @@ func chinookRequest() decision.ScoreRequest {
 	}
 }
 
-// chinookResponse is shaped like the live API's answer: a Choice with a
+// libraryResponse is shaped like the live API's answer: a Choice with a
 // probability per option (rounded to two places) and one Noul per candidate.
-const chinookResponse = `{"model":"jev-1.13.0","answers":{
+const libraryResponse = `{"model":"jev-1.13.0","answers":{
   "q0.c0":{"type":"noul","noul":0.04},
   "q0.c1":{"type":"noul","noul":0.02},
   "q0.c2":{"type":"noul","noul":0.71},
@@ -38,10 +38,10 @@ const chinookResponse = `{"model":"jev-1.13.0","answers":{
  },"usage":{"input_tokens":512,"output_tokens":127}}`
 
 func TestScore_MapsQuestionsToOneCallAndAnswersBack(t *testing.T) {
-	d := &fakeDoer{body: chinookResponse}
+	d := &fakeDoer{body: libraryResponse}
 	var ev CallEvent
 	c := newClient(t, d, func(c *Config) { c.Name = "jev"; c.OnCall = func(e CallEvent) { ev = e } })
-	res, err := c.Score(context.Background(), chinookRequest())
+	res, err := c.Score(context.Background(), libraryRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,11 +52,11 @@ func TestScore_MapsQuestionsToOneCallAndAnswersBack(t *testing.T) {
 	// What was sent: the question and the candidate catalogue as the state, one
 	// Noul per candidate, one Choice.
 	st := d.sent(t)["state"].(map[string]any)
-	if st["question"] != "Which countries buy the most music relative to their population?" || st["context"] != nil {
+	if st["question"] != "Which members borrow the most books relative to how long they have been members?" || st["context"] != nil {
 		t.Fatalf("state = %v", st)
 	}
 	catalogue := st["candidates"].(map[string]any)["q0"].([]any)
-	if len(catalogue) != 4 || catalogue[3].(map[string]any)["name"] != "Invoice" || catalogue[3].(map[string]any)["description"] != nil {
+	if len(catalogue) != 4 || catalogue[3].(map[string]any)["name"] != "loans" || catalogue[3].(map[string]any)["description"] != nil {
 		t.Fatalf("catalogue = %v", catalogue)
 	}
 	if _, ok := st["candidates"].(map[string]any)["q1"]; ok {
@@ -88,7 +88,7 @@ func TestScore_MapsQuestionsToOneCallAndAnswersBack(t *testing.T) {
 	for _, s := range rel.Scores {
 		got = append(got, fmt.Sprintf("%s=%.2f", s.ID, s.Probability))
 	}
-	if !reflect.DeepEqual(got, []string{"Invoice=0.96", "Customer=0.71", "Album=0.04", "Artist=0.02"}) {
+	if !reflect.DeepEqual(got, []string{"loans=0.96", "members=0.71", "books=0.04", "authors=0.02"}) {
 		t.Fatalf("scores = %v", got)
 	}
 	ch := res.Answers["kind"]
@@ -96,9 +96,9 @@ func TestScore_MapsQuestionsToOneCallAndAnswersBack(t *testing.T) {
 		t.Fatalf("choice answer = %+v", ch)
 	}
 
-	// The documented policy reads it: Invoice and Customer relevant, the rest dropped.
+	// The documented policy reads it: loans and members relevant, the rest dropped.
 	pol := decision.NarrowingPolicy()
-	if sel := pol.Evaluate(rel); sel.Outcome != decision.OutcomeSeveral || !reflect.DeepEqual(sel.Picks, []string{"Invoice", "Customer"}) {
+	if sel := pol.Evaluate(rel); sel.Outcome != decision.OutcomeSeveral || !reflect.DeepEqual(sel.Picks, []string{"loans", "members"}) {
 		t.Fatalf("selection = %+v", sel)
 	}
 	if sel := pol.Evaluate(ch); sel.Outcome != decision.OutcomeSelected {
@@ -107,9 +107,9 @@ func TestScore_MapsQuestionsToOneCallAndAnswersBack(t *testing.T) {
 }
 
 func TestScore_ContextTravelsWithTheText(t *testing.T) {
-	d := &fakeDoer{body: chinookResponse}
-	req := chinookRequest()
-	req.Context = map[string]any{"tables": map[string]any{"Invoice": []string{"Total", "BillingCountry"}}}
+	d := &fakeDoer{body: libraryResponse}
+	req := libraryRequest()
+	req.Context = map[string]any{"tables": map[string]any{"loans": []string{"due_on", "member_id"}}}
 	if _, err := newClient(t, d).Score(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
@@ -120,25 +120,25 @@ func TestScore_ContextTravelsWithTheText(t *testing.T) {
 }
 
 func TestScore_CandidateDescriptionsAreSent(t *testing.T) {
-	d := &fakeDoer{body: chinookResponse}
-	req := chinookRequest()
-	req.Questions[0].Candidates[3].Description = "Invoice(InvoiceId, CustomerId, BillingCountry, Total)"
+	d := &fakeDoer{body: libraryResponse}
+	req := libraryRequest()
+	req.Questions[0].Candidates[3].Description = "loans(loan_id, member_id, book_id, due_on)"
 	if _, err := newClient(t, d).Score(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	cand := d.sent(t)["state"].(map[string]any)["candidates"].(map[string]any)["q0"].([]any)[3].(map[string]any)
-	if cand["description"] != "Invoice(InvoiceId, CustomerId, BillingCountry, Total)" {
+	if cand["description"] != "loans(loan_id, member_id, book_id, due_on)" {
 		t.Fatalf("candidate = %v", cand)
 	}
 }
 
 func TestScore_RejectsBadRequestsWithoutCalling(t *testing.T) {
-	d := &fakeDoer{body: chinookResponse}
+	d := &fakeDoer{body: libraryResponse}
 	c := newClient(t, d)
 	if _, err := c.Score(context.Background(), decision.ScoreRequest{}); err == nil || d.calls != 0 {
 		t.Fatalf("empty request: err=%v calls=%d", err, d.calls)
 	}
-	req := chinookRequest()
+	req := libraryRequest()
 	req.Questions = req.Questions[1:]
 	var many []decision.Candidate
 	for i := 0; i <= MaxChoiceOptions; i++ {
@@ -158,7 +158,7 @@ func TestScore_RejectsBadRequestsWithoutCalling(t *testing.T) {
 }
 
 func TestScore_APIErrorsPropagate(t *testing.T) {
-	_, err := newClient(t, &fakeDoer{status: 429}).Score(context.Background(), chinookRequest())
+	_, err := newClient(t, &fakeDoer{status: 429}).Score(context.Background(), libraryRequest())
 	if !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("err = %v", err)
 	}
@@ -180,7 +180,7 @@ func TestScore_MalformedAnswersAreBadResponses(t *testing.T) {
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := newClient(t, &fakeDoer{body: body}).Score(context.Background(), chinookRequest())
+			_, err := newClient(t, &fakeDoer{body: body}).Score(context.Background(), libraryRequest())
 			if !errors.Is(err, ErrBadResponse) {
 				t.Fatalf("err = %v", err)
 			}

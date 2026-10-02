@@ -53,9 +53,18 @@ func ftoa(f float64) string {
 	return b
 }
 
-// fullAnswers answers every question the full taxonomy implies (without the
-// interaction question).
+// interactionAnswer answers the interaction question (always asked).
+func interactionAnswer(top string, conf float64) string {
+	return choiceJSON("interaction", top, conf, `"`+top+`":0.9,"command":0.1`)
+}
+
+// fullAnswers answers every question the full taxonomy implies.
 func fullAnswers() []string {
+	return append(baseAnswers(), interactionAnswer("question", 0.9))
+}
+
+// baseAnswers answers every question except the interaction one.
+func baseAnswers() []string {
 	return []string{
 		choiceJSON("intent", "calendar/show", 0.82, `"calendar/show":0.9,"calendar/create":0.05,"contacts/find":0.03,"other":0.02`),
 		noulJSON("scope0", 0.95), noulJSON("scope1", 0.2), noulJSON("scope2", 0.9),
@@ -85,6 +94,7 @@ func TestDecide_FullTaxonomyFoldsIntoADecision(t *testing.T) {
 		Presentation:   "day_calendar",
 		NeedsLLM:       true,
 		Calibrated:     true,
+		Model:          "jev-1.13.0",
 		Scores:         map[string]float64{"calendar/show": 0.9, "calendar/create": 0.05, "contacts/find": 0.03, "other": 0.02},
 	}
 	if !reflect.DeepEqual(dec, want) {
@@ -93,13 +103,13 @@ func TestDecide_FullTaxonomyFoldsIntoADecision(t *testing.T) {
 	if err := decision.Validate(dec, taxonomy()); err != nil {
 		t.Fatalf("the folded decision must validate: %v", err)
 	}
-	if len(seen) != 1 || seen[0].Questions != 7 {
+	if len(seen) != 1 || seen[0].Questions != 8 {
 		t.Fatalf("one call carries every question: %+v", seen)
 	}
 
 	// The question set and what the model is shown.
 	q := d.questions(t)
-	if len(q) != 7 {
+	if len(q) != 8 {
 		t.Fatalf("questions = %v", keys(q))
 	}
 	crit := q["intent"]["criteria"].(map[string]any)
@@ -143,7 +153,7 @@ func TestDecide_StateCarriesTitlesRecentAndContext(t *testing.T) {
 		Sidebar:   []session.EntityRef{{Type: "contact", Title: "Bob"}},
 		Previous:  &session.Action{Kind: "create"},
 	}
-	d := &fakeDoer{body: response(append(fullAnswers(), choiceJSON("interaction", "continuation", 0.9, `"continuation":0.95,"question":0.05`))...)}
+	d := &fakeDoer{body: response(append(baseAnswers(), choiceJSON("interaction", "continuation", 0.9, `"continuation":0.95,"question":0.05`))...)}
 	dec, ok, err := newClient(t, d).Decide(context.Background(), req)
 	if err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
@@ -164,26 +174,29 @@ func TestDecide_StateCarriesTitlesRecentAndContext(t *testing.T) {
 	}
 }
 
-func TestDecide_InteractionOnlyAskedWithStateOrRecent(t *testing.T) {
-	d := &fakeDoer{body: response(fullAnswers()...)}
-	if _, _, err := newClient(t, d).Decide(context.Background(), decideRequest()); err != nil {
-		t.Fatal(err)
+// The interaction is never assumed: the question is asked on an empty state
+// too, and the model's top option is the Interaction (the Decision has no
+// per-interaction confidence, so even a doubtful one is used).
+func TestDecide_InteractionIsAlwaysAskedAndTheTopOptionIsUsed(t *testing.T) {
+	d := &fakeDoer{body: response(append(baseAnswers(), choiceJSON("interaction", "chat", 0.1, `"chat":0.4,"question":0.35,"command":0.25`))...)}
+	dec, ok, err := newClient(t, d).Decide(context.Background(), decideRequest())
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
 	}
-	if _, asked := d.questions(t)["interaction"]; asked {
-		t.Fatal("interaction must not be asked on an empty state")
+	q, asked := d.questions(t)["interaction"]
+	if !asked || len(q["criteria"].(map[string]any)) != len(interactionOrder) {
+		t.Fatalf("the interaction question must be asked on an empty state: %v", q)
 	}
-	for name, mutate := range map[string]func(*decision.Request){
-		"recent":    func(r *decision.Request) { r.Recent = []string{"x"} },
-		"focused":   func(r *decision.Request) { r.State.Focused = &session.EntityRef{} },
-		"selection": func(r *decision.Request) { r.State.Selection = []session.EntityRef{{}} },
-		"sidebar":   func(r *decision.Request) { r.State.Sidebar = []session.EntityRef{{}} },
-		"previous":  func(r *decision.Request) { r.State.Previous = &session.Action{} },
-	} {
-		req := decideRequest()
-		mutate(&req)
-		if !askInteraction(req) {
-			t.Errorf("%s: interaction not asked", name)
-		}
+	if dec.Interaction != decision.InteractionChat {
+		t.Fatalf("interaction = %q", dec.Interaction)
+	}
+}
+
+func TestDecide_AnInteractionOutsideTheEnumIsABadResponse(t *testing.T) {
+	d := &fakeDoer{body: response(append(baseAnswers(), choiceJSON("interaction", "SECRET-ECHO", 0.9, `"SECRET-ECHO":1`))...)}
+	_, _, err := newClient(t, d).Decide(context.Background(), decideRequest())
+	if !errors.Is(err, ErrBadResponse) || strings.Contains(err.Error(), "SECRET-ECHO") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -197,14 +210,13 @@ func TestDecide_OtherAbstains(t *testing.T) {
 
 func TestDecide_UnclearSecondaryChoicesAreLeftUnset(t *testing.T) {
 	req := decideRequest()
-	req.Recent = []string{"hi"}
 	d := &fakeDoer{body: response(
 		choiceJSON("intent", "contacts/find", 0.7, `"contacts/find":0.8,"other":0.2`),
 		noulJSON("scope0", 0.1), noulJSON("scope1", 0.1), noulJSON("scope2", 0.61),
 		noulJSON("data0", 0.59),
 		choiceJSON("entity", "none", 0.9, `"none":0.95,"contact":0.05`),
-		choiceJSON("presentation", "list", 0.2, `"list":0.4,"day_calendar":0.35,"none":0.25`),  // low confidence
-		choiceJSON("interaction", "command", 0.1, `"command":0.4,"question":0.35,"chat":0.25`), // uncertain
+		choiceJSON("presentation", "list", 0.2, `"list":0.4,"day_calendar":0.35,"none":0.25`), // low confidence
+		interactionAnswer("question", 0.9),
 	)}
 	dec, ok, err := newClient(t, d).Decide(context.Background(), req)
 	if err != nil || !ok {
@@ -228,6 +240,7 @@ func TestDecide_MissingScopeAnswersNeverSelect(t *testing.T) {
 		`"scope0":{"type":"choice"}`, // wrong type for a noul: ignored
 		choiceJSON("entity", "none", 0.9, `"none":1.0`),
 		choiceJSON("presentation", "none", 0.9, `"none":1.0`),
+		interactionAnswer("question", 0.9),
 	)}
 	dec, ok, err := newClient(t, d).Decide(context.Background(), decideRequest())
 	if err != nil || !ok || dec.RequiredScopes != nil || dec.RequiredData != nil {
@@ -237,15 +250,15 @@ func TestDecide_MissingScopeAnswersNeverSelect(t *testing.T) {
 
 func TestDecide_ChooseRoleIsOneChoice(t *testing.T) {
 	req := decision.Request{
-		Text: "Which table holds the amounts?",
+		Text: "Which field holds the due dates?",
 		Taxonomy: decision.Taxonomy{
-			Modules:       []decision.ModuleSpec{{Name: "choose:measure", Intents: []string{"Invoice.Total", "count_rows", "none"}}},
+			Modules:       []decision.ModuleSpec{{Name: "choose:measure", Intents: []string{"loans.due_on", "count_rows", "none"}}},
 			Presentations: []string{"ignored"}, EntityTypes: []string{"ignored"},
-			Descriptions: map[string]string{"choose:measure/Invoice.Total": "the invoice amount"},
+			Descriptions: map[string]string{"choose:measure/loans.due_on": "the date a loan is due"},
 		},
 		Recent: []string{"ignored because roles ask one question"},
 	}
-	d := &fakeDoer{body: response(choiceJSON("intent", "Invoice.Total", 0.9, `"Invoice.Total":0.93,"count_rows":0.05,"none":0.02`))}
+	d := &fakeDoer{body: response(choiceJSON("intent", "loans.due_on", 0.9, `"loans.due_on":0.93,"count_rows":0.05,"none":0.02`))}
 	dec, ok, err := newClient(t, d).Decide(context.Background(), req)
 	if err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
@@ -254,10 +267,10 @@ func TestDecide_ChooseRoleIsOneChoice(t *testing.T) {
 		t.Fatalf("questions = %v", keys(q))
 	}
 	crit := d.questions(t)["intent"]["criteria"].(map[string]any)
-	if len(crit) != 3 || crit["Invoice.Total"] != "the invoice amount" {
+	if len(crit) != 3 || crit["loans.due_on"] != "the date a loan is due" {
 		t.Fatalf("criteria = %v (no `other` is added in role mode)", crit)
 	}
-	if dec.Module.Value != "choose:measure" || dec.Intent.Value != "Invoice.Total" || dec.Interaction != decision.InteractionQuestion {
+	if dec.Module.Value != "choose:measure" || dec.Intent.Value != "loans.due_on" || dec.Interaction != decision.InteractionQuestion {
 		t.Fatalf("decision = %+v", dec)
 	}
 	if err := decision.Validate(dec, req.Taxonomy); err != nil {
@@ -267,7 +280,7 @@ func TestDecide_ChooseRoleIsOneChoice(t *testing.T) {
 
 func TestDecide_ModuleWithoutIntents(t *testing.T) {
 	req := decision.Request{Text: "hi", Taxonomy: decision.Taxonomy{Modules: []decision.ModuleSpec{{Name: "chat"}}}}
-	d := &fakeDoer{body: response(choiceJSON("intent", "chat", 0.9, `"chat":0.9,"other":0.1`), noulJSON("scope0", 0.9))}
+	d := &fakeDoer{body: response(choiceJSON("intent", "chat", 0.9, `"chat":0.9,"other":0.1`), noulJSON("scope0", 0.9), interactionAnswer("question", 0.9))}
 	dec, ok, err := newClient(t, d).Decide(context.Background(), req)
 	if err != nil || !ok || dec.Module.Value != "chat" || dec.Intent.Value != "" || !reflect.DeepEqual(dec.RequiredScopes, []string{"chat"}) {
 		t.Fatalf("dec=%+v ok=%v err=%v", dec, ok, err)
@@ -298,12 +311,15 @@ func TestDecide_ErrorsAndBadAnswers(t *testing.T) {
 			}
 		})
 	}
-	// The interaction answer missing although asked.
-	req := decideRequest()
-	req.Recent = []string{"x"}
-	_, ok, err = newClient(t, &fakeDoer{body: response(fullAnswers()...)}).Decide(context.Background(), req)
+	// The interaction answer missing although it is always asked.
+	_, ok, err = newClient(t, &fakeDoer{body: response(baseAnswers()...)}).Decide(context.Background(), decideRequest())
 	if ok || !errors.Is(err, ErrBadResponse) {
 		t.Fatalf("interaction missing: ok=%v err=%v", ok, err)
+	}
+	// An error never quotes the model's own words back.
+	_, _, err = newClient(t, &fakeDoer{body: response(choiceJSON("intent", "SECRET-ECHO", 0.9, `"SECRET-ECHO":1.0`))}).Decide(context.Background(), decideRequest())
+	if !errors.Is(err, ErrBadResponse) || strings.Contains(err.Error(), "SECRET-ECHO") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -313,6 +329,7 @@ func TestDecide_PolicyIsConfigurable(t *testing.T) {
 		choiceJSON("intent", "contacts/find", 0.9, `"contacts/find":0.9,"other":0.1`),
 		choiceJSON("entity", "none", 0.9, `"none":1.0`),
 		choiceJSON("presentation", "list", 0.7, `"list":0.8,"none":0.2`),
+		interactionAnswer("question", 0.9),
 	)
 	dec, _, err := newClient(t, &fakeDoer{body: body}).Decide(context.Background(), decideRequest())
 	if err != nil || dec.Presentation != "list" {

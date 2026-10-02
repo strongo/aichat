@@ -16,9 +16,10 @@ var (
 // text, the context, and the candidates of every relevance question. The
 // candidate catalogue lives in the state, not in each question, because the
 // model reads a shared, structured catalogue far better than a description
-// repeated inside every yes/no question (measured against the live API: the same
-// 11 Chinook tables scored 0.2-0.4 each with per-question descriptions and
-// separated cleanly, 0.8+ against 0.05, with the catalogue in the state).
+// repeated inside every yes/no question (measured against the live API on a
+// catalogue of 11 tables: with per-question descriptions every candidate scored
+// 0.2-0.4 and nothing separated; with the catalogue in the state the relevant
+// ones scored 0.8+ against 0.05).
 func scoreState(req decision.ScoreRequest) map[string]any {
 	st := map[string]any{"question": req.Text}
 	if len(req.Context) > 0 {
@@ -60,16 +61,14 @@ type candidateRef struct {
 // them. A Noul has no confidence, so a relevance Answer has none either.
 func (c *Client) Score(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, error) {
 	if err := decision.ValidateScoreRequest(req); err != nil {
-		return decision.ScoreResult{}, fmt.Errorf("typesafe: %w", err)
+		// Not %w of err: its text quotes the caller's question and candidate ids.
+		return decision.ScoreResult{}, fmt.Errorf("%w: the score request failed validation", ErrInvalidRequest)
 	}
 	questions := map[string]Question{}
 	refs := map[string]candidateRef{} // wire key -> candidate (relevance only)
 	for qi, q := range req.Questions {
 		switch q.Kind {
 		case decision.KindChoice:
-			if len(q.Candidates) > MaxChoiceOptions {
-				return decision.ScoreResult{}, fmt.Errorf("%w: question %q has %d (limit %d)", ErrTooManyOptions, q.ID, len(q.Candidates), MaxChoiceOptions)
-			}
 			opts := make(map[string]any, len(q.Candidates))
 			for _, cand := range q.Candidates {
 				if cand.Description == "" {
@@ -98,7 +97,7 @@ func (c *Client) Score(ctx context.Context, req decision.ScoreRequest) (decision
 		var ans decision.Answer
 		var err error
 		if q.Kind == decision.KindChoice {
-			ans, err = foldChoice(q, resp.Answers[choiceKey(qi)])
+			ans, err = foldChoice(qi, q, resp.Answers[choiceKey(qi)])
 		} else {
 			ans, err = foldRelevance(qi, q, resp.Answers)
 		}
@@ -108,7 +107,7 @@ func (c *Client) Score(ctx context.Context, req decision.ScoreRequest) (decision
 		res.Answers[q.ID] = ans
 	}
 	if err := decision.ValidateScoreResult(req, res); err != nil {
-		return decision.ScoreResult{}, fmt.Errorf("%w: %v", ErrBadResponse, err)
+		return decision.ScoreResult{}, fmt.Errorf("%w: %s", ErrBadResponse, decision.InvalidDetail(err))
 	}
 	return res, nil
 }
@@ -116,9 +115,11 @@ func (c *Client) Score(ctx context.Context, req decision.ScoreRequest) (decision
 func choiceKey(qi int) string        { return fmt.Sprintf("q%d", qi) }
 func relevanceKey(qi, ci int) string { return fmt.Sprintf("q%d.c%d", qi, ci) }
 
-func foldChoice(q decision.Question, a Answer) (decision.Answer, error) {
+// foldChoice and foldRelevance name a question by its index, never its id: an
+// error must not quote caller-supplied content.
+func foldChoice(qi int, q decision.Question, a Answer) (decision.Answer, error) {
 	if a.Type != TypeChoice || a.Probabilities == nil || a.Confidence == nil {
-		return decision.Answer{}, fmt.Errorf("%w: question %q: expected a choice answer", ErrBadResponse, q.ID)
+		return decision.Answer{}, fmt.Errorf("%w: question %d: expected a choice answer", ErrBadResponse, qi)
 	}
 	scores := make([]decision.Score, 0, len(a.Probabilities))
 	for id, p := range a.Probabilities {
@@ -134,7 +135,7 @@ func foldRelevance(qi int, q decision.Question, answers map[string]Answer) (deci
 	for ci, cand := range q.Candidates {
 		a, ok := answers[relevanceKey(qi, ci)]
 		if !ok || a.Type != TypeNoul {
-			return decision.Answer{}, fmt.Errorf("%w: question %q: expected a noul answer for candidate %d", ErrBadResponse, q.ID, ci)
+			return decision.Answer{}, fmt.Errorf("%w: question %d: expected a noul answer for candidate %d", ErrBadResponse, qi, ci)
 		}
 		scores = append(scores, decision.Score{ID: cand.ID, Probability: a.Noul})
 	}

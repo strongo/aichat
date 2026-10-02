@@ -83,17 +83,19 @@ type decidePlan struct {
 //   - one Choice over entity types plus "none" -> Reference.Kind, only if the
 //     policy selects it;
 //   - one Choice over presentations plus "none" -> Presentation, same rule;
-//   - one Choice over the Interaction enum, asked only when the request carries
-//     session state or recent turns; otherwise Interaction is "question" without
-//     asking, because Validate requires a known value.
+//   - one Choice over the Interaction enum, always asked (Validate requires a
+//     known value, and no value is assumed): the Decision has no per-interaction
+//     confidence, so Interaction is the model's top option. A choose:<role>
+//     request is one closed question by construction and has Interaction
+//     "question".
 //
 // The state is the message, the recent tail, the entity titles of the session
 // state and Request.Context, as one object. InteractionID, ClientContext, Now
 // and TZ are never forwarded.
 //
-// The Decision is Calibrated, carries Scores, and has NeedsLLM set: the model
-// says which route to take, not that the product can answer without a language
-// model.
+// The Decision is Calibrated, carries Scores and the model id the API reported
+// (Decision.Model), and has NeedsLLM set: the model says which route to take, not
+// that the product can answer without a language model.
 func (c *Client) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
 	plan := c.plan(req)
 	resp, err := c.Ask(ctx, AskRequest{State: decideState(req), Questions: plan.questions})
@@ -167,14 +169,12 @@ func (c *Client) plan(req decision.Request) decidePlan {
 			}
 			p.questions["presentation"] = Choice("How should the answer to the message in `state.message` be presented?", e)
 		}
-		if askInteraction(req) {
-			p.interact = true
-			e := map[string]any{}
-			for _, i := range interactionOrder {
-				e[string(i)] = interactionDescriptions[i]
-			}
-			p.questions["interaction"] = Choice("What kind of turn is the user's message in `state.message`, given the earlier conversation?", e)
+		p.interact = true
+		e := map[string]any{}
+		for _, i := range interactionOrder {
+			e[string(i)] = interactionDescriptions[i]
 		}
+		p.questions["interaction"] = Choice("What kind of turn is the user's message in `state.message`, given the earlier conversation, if any?", e)
 	}
 	return p
 }
@@ -207,11 +207,6 @@ func moduleScopes(m decision.ModuleSpec) []string {
 		return m.Scopes
 	}
 	return []string{m.Name}
-}
-
-func askInteraction(req decision.Request) bool {
-	st := req.State
-	return len(req.Recent) > 0 || st.Focused != nil || len(st.Selection) > 0 || len(st.Sidebar) > 0 || st.Previous != nil
 }
 
 // decideState builds the state object: names and titles only.
@@ -257,7 +252,7 @@ func (c *Client) fold(req decision.Request, p decidePlan, resp *AskResponse) (de
 	}
 	ref, known := p.options[intent.top]
 	if !known {
-		return decision.Decision{}, false, fmt.Errorf("%w: intent answer %q is not an option", ErrBadResponse, intent.top)
+		return decision.Decision{}, false, fmt.Errorf("%w: the intent answer is not one of the options", ErrBadResponse)
 	}
 	d := decision.Decision{
 		Module:      decision.Scored{Value: ref.module, Confidence: intent.confidence},
@@ -266,6 +261,7 @@ func (c *Client) fold(req decision.Request, p decidePlan, resp *AskResponse) (de
 		Scores:      intent.probabilities,
 		Calibrated:  true,
 		NeedsLLM:    true,
+		Model:       resp.Model,
 	}
 
 	if p.role == "" {
@@ -302,11 +298,14 @@ func (c *Client) fold(req decision.Request, p decidePlan, resp *AskResponse) (de
 		}
 	}
 	if p.interact {
-		if v, ok, err := selectedChoice(resp, "interaction", "", pol); err != nil {
+		v, err := choiceAnswer(resp, "interaction")
+		if err != nil {
 			return decision.Decision{}, false, err
-		} else if ok {
-			d.Interaction = decision.Interaction(v)
 		}
+		if !slices.Contains(interactionOrder, decision.Interaction(v.top)) {
+			return decision.Decision{}, false, fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
+		}
+		d.Interaction = decision.Interaction(v.top)
 	}
 	return d, true, nil
 }

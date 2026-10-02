@@ -13,6 +13,23 @@
 //
 // The schema is intentionally evolvable: new fields are additive, and
 // consumers treat unknown module/intent/presentation values as "not decided".
+//
+// # What is sent to an engine
+//
+// Everything placed in Request (Text, Recent, State titles, Context, Taxonomy
+// descriptions) or in a ScoreRequest (Text, Context, question instructions,
+// candidate descriptions) is sent VERBATIM to the engine's operator: a hosted
+// decision model or LLM, or a cloud decision endpoint. Send metadata (names,
+// schemas, public descriptions), never row data, credentials or user
+// identifiers; the product is responsible for what it puts there.
+//
+// # Acting on a chain's answer
+//
+// A Chain with a Policy only returns ok=true for an answer the policy selected
+// (or an unscored one that passed the confidence floor); an uncertain or "none"
+// answer falls through to the next provider. A chain built with KeepNonSelected
+// can return ok=true for an uncertain or "none" answer: such a caller MUST
+// check Decision.Actionable before acting on the decision.
 package decision
 
 import (
@@ -82,9 +99,26 @@ type Decision struct {
 	// calibrated scores.
 	Calibrated bool `json:"calibrated,omitempty"`
 	// Outcome is set by Chain when it has a SelectionPolicy: the policy's
-	// verdict. Callers of a policy chain MUST act on Outcome (use the decision
-	// only when it is OutcomeSelected; OutcomeUnscored decisions are proposals).
+	// verdict. A caller that cannot rule out a chain with KeepNonSelected MUST
+	// act only on a decision for which Actionable is true.
 	Outcome Outcome `json:"outcome,omitempty"`
+	// Model is the model id the engine reported for this decision ("" when it
+	// reports none). Thresholds only hold for the model they were measured on.
+	Model string `json:"model,omitempty"`
+}
+
+// Actionable reports whether a caller may act on d: it has no policy verdict
+// (a chain without a Policy, whose answers passed MinConfidence), or the verdict
+// is OutcomeSelected, or OutcomeUnscored (an engine that gives no calibrated
+// probabilities, accepted by the confidence floor). An uncertain or "none"
+// decision, which only a KeepNonSelected chain returns, is not actionable.
+func (d Decision) Actionable() bool {
+	switch d.Outcome {
+	case "", OutcomeSelected, OutcomeUnscored:
+		return true
+	default:
+		return false
+	}
 }
 
 // ModuleSpec declares a product module and its intents.
@@ -240,9 +274,11 @@ type Trace struct {
 	Strategy      string `json:"strategy,omitempty"`
 	FallbackFired bool   `json:"fallbackFired,omitempty"`
 	HedgeFired    bool   `json:"hedgeFired,omitempty"`
-	// Calibrated and Outcome echo the decision's flag and the policy's verdict.
+	// Calibrated, Outcome and Model echo the decision's flag, the policy's
+	// verdict and the model id the answering engine reported.
 	Calibrated bool    `json:"calibrated,omitempty"`
 	Outcome    Outcome `json:"outcome,omitempty"`
+	Model      string  `json:"model,omitempty"`
 }
 
 // Chain runs providers in order; the first valid, confident decision wins.
@@ -268,11 +304,18 @@ type Chain struct {
 	// decision call reasonably wants more time than a local one.
 	Timeout time.Duration
 	// Policy, when non-nil, replaces MinConfidence for answers that carry
-	// calibrated Scores: the policy alone decides selected / several /
-	// uncertain / none, and Chain returns the decision with Decision.Outcome
-	// set instead of discarding a non-clear answer. A nil Policy keeps the
-	// legacy MinConfidence behaviour exactly.
+	// calibrated Scores: the policy alone decides selected / uncertain / none.
+	// Only a selected answer stops the chain; an uncertain or "none" answer is
+	// recorded in the trace (outcomes "uncertain" and "none") and the chain
+	// falls through to the next provider, exactly as a low-confidence answer
+	// does without a policy. A nil Policy keeps the legacy MinConfidence
+	// behaviour exactly.
 	Policy *SelectionPolicy
+	// KeepNonSelected, with a Policy, makes an uncertain or "none" answer stop
+	// the chain and be returned with ok=true and Decision.Outcome set, so a
+	// caller can show "not sure" instead of escalating. It is off by default
+	// because ok=true is then not enough to act on: check Decision.Actionable.
+	KeepNonSelected bool
 }
 
 // decisionTimeouter is the optional per-provider timeout override.
@@ -322,6 +365,10 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 		switch {
 		case err != nil && errors.Is(err, ErrUnavailable):
 			a.Outcome, a.Detail = AttemptUnavailable, err.Error()
+		case err != nil && errors.Is(err, ErrAuth):
+			a.Outcome, a.Detail = AttemptAuth, err.Error()
+		case err != nil && errors.Is(err, ErrInvalidRequest):
+			a.Outcome, a.Detail = AttemptRejected, err.Error()
 		case err != nil && timedOut:
 			a.Outcome, a.Detail = AttemptTimeout, err.Error()
 		case err != nil:
@@ -344,7 +391,10 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 				tr.Engine = rep.Engine
 				tr.Strategy, tr.FallbackFired, tr.HedgeFired = rep.Strategy, rep.FallbackFired, rep.HedgeFired
 			}
-			tr.Calibrated, tr.Outcome = d.Calibrated, d.Outcome
+			tr.Calibrated, tr.Outcome, tr.Model = d.Calibrated, d.Outcome, d.Model
+			if rep != nil && rep.Model != "" {
+				tr.Model = rep.Model
+			}
 			return d, true, tr
 		}
 		if ctx.Err() != nil {
@@ -356,21 +406,26 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 
 // judge classifies a provider's answer: invalid, rejected by the confidence
 // floor, or decided. With a SelectionPolicy set and calibrated scores present,
-// the policy alone owns the floor and every outcome (selected, several,
-// uncertain, none) is "decided": the caller reads Decision.Outcome. Without
-// scores the legacy MinConfidence floor still applies and, under a policy,
-// the outcome is OutcomeUnscored.
+// the policy alone owns the floor: a selected answer is "decided"; any other
+// verdict is recorded as "uncertain" and the chain falls through, unless
+// KeepNonSelected makes it "decided" for the caller to read Decision.Outcome.
+// Without scores the legacy MinConfidence floor still applies and, under a
+// policy, the outcome is OutcomeUnscored.
 func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decision, Attempt) {
 	if verr := Validate(d, req.Taxonomy); verr != nil {
-		a.Outcome, a.Detail = AttemptInvalid, verr.Error()
+		a.Outcome, a.Detail = AttemptInvalid, InvalidDetail(verr)
 		return d, a
 	}
 	if c.Policy != nil && d.Calibrated && len(d.Scores) > 0 {
 		sel := c.Policy.EvaluateDecision(d)
 		d.Outcome = sel.Outcome
-		a.Outcome, a.Detail = AttemptDecided, string(sel.Outcome)
+		a.Detail = string(sel.Outcome)
 		if sel.Reason != "" {
 			a.Detail += ": " + sel.Reason
+		}
+		a.Outcome = AttemptUncertain
+		if sel.Outcome == OutcomeSelected || c.KeepNonSelected {
+			a.Outcome = AttemptDecided
 		}
 		return d, a
 	}

@@ -12,14 +12,32 @@
 // Properties of this package that callers can rely on:
 //
 //   - HTTP goes through the HTTPDoer interface; tests use a fake and never the
-//     network.
+//     network. The default client never follows redirects (a 307/308 would
+//     re-send the state, and the bearer key, to another host), and the base URL
+//     must be https (http only for a loopback host, for tests). A caller that
+//     supplies its own HTTPDoer must make it refuse redirects too.
 //   - There are no retries here. Failing over to another engine, and not hammering
 //     an engine that is down, belong to the compose combinators and breaker.
-//   - Nothing is logged. Error values carry a status, an error type and a request
-//     id, never the response body or the submitted state. The API key is only ever
-//     placed in the Authorization header and is redacted from String().
+//   - Nothing is logged. Error values carry a status, an error type, a request
+//     id and counts, never the response body, the submitted state or any
+//     candidate or question id. The API key is only ever placed in the
+//     Authorization header and is redacted from String().
 //   - Answers are calibrated probabilities, so the decision types it returns have
-//     Calibrated set.
+//     Calibrated set. Calibration holds for one model version: Config.Model is
+//     required, pin a versioned id so thresholds measured against it stay valid,
+//     and the model id the API reports is recorded in every Decision and
+//     ScoreResult.
+//   - Requests are checked locally before any call (state size, number of
+//     questions, number of options); a refused request is an error that matches
+//     decision.ErrInvalidRequest, which a circuit breaker does not count against
+//     the engine.
+//
+// # What is sent
+//
+// The state is built from the request's text, recent turns, session entity
+// titles, Context and taxonomy or candidate descriptions, and all of it is sent
+// verbatim to the engine's operator. Callers must send metadata (names, schemas,
+// public descriptions), never row data, credentials or user identifiers.
 //
 // The package is product-neutral: the product supplies the taxonomy.
 package typesafe
@@ -31,7 +49,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -41,9 +61,12 @@ import (
 // Defaults and API limits (from the published model documentation).
 const (
 	DefaultBaseURL = "https://api.typesafe.ai"
-	// DefaultModel is the alias of the most recent stable release. Pin a
-	// versioned id (for example "jev-1.13.0") to keep answers reproducible.
-	DefaultModel = "jev-latest"
+	// ModelLatest is the alias of the most recent stable release. It moves when
+	// TypeSafe releases a model, and probabilities, and so every threshold
+	// measured against them, move with it: use it only as an explicit choice
+	// (for example while measuring). Production configuration should pin a
+	// versioned id such as "jev-1.13.0".
+	ModelLatest = "jev-latest"
 	// DefaultName names the engine in traces.
 	DefaultName = "typesafe"
 	// DefaultTimeout is how long decision.Chain should wait for one call. The
@@ -56,6 +79,14 @@ const (
 	MaxChoiceOptions = 255
 	// MaxScoreLevels is the API's limit on levels in one Score.
 	MaxScoreLevels = 10
+	// DefaultMaxStateTokens is the published limit on the state plus the longest
+	// question (32k tokens). It is checked locally with an approximate estimate
+	// (bytes/4), so it can differ from the API's own tokenizer.
+	DefaultMaxStateTokens = 32000
+	// MaxQuestionsPerCall is a local guard against a runaway request (a relevance
+	// question costs one wire question per candidate); it is not a published
+	// limit.
+	MaxQuestionsPerCall = 255
 
 	systemOnePath = "/v1/systemone"
 )
@@ -89,19 +120,28 @@ type Usage struct {
 type Config struct {
 	// APIKey is required. It is never logged or returned in an error.
 	APIKey string
-	// BaseURL defaults to DefaultBaseURL.
+	// BaseURL defaults to DefaultBaseURL. It must be https, except that http is
+	// accepted for a loopback host (tests), and it must not carry credentials.
 	BaseURL string
-	// Model defaults to DefaultModel.
+	// Model is the model id to ask, and is REQUIRED: pin a versioned id such as
+	// "jev-1.13.0" so the probabilities, and the thresholds measured on them,
+	// stay valid. ModelLatest is available as an explicit choice.
 	Model string
 	// Name is the engine's name in decision.Trace (default DefaultName).
 	Name string
-	// HTTPClient defaults to a plain *http.Client (no client-side timeout: the
-	// context bounds each call).
+	// HTTPClient defaults to an *http.Client that never follows redirects and has
+	// no client-side timeout (the context bounds each call). A client you supply
+	// must refuse redirects too: following one re-sends the state and the key to
+	// whatever host answers.
 	HTTPClient HTTPDoer
 	// Timeout is reported by DecisionTimeout (default DefaultTimeout).
 	Timeout time.Duration
 	// MaxResponseBytes bounds how much of a response is read.
 	MaxResponseBytes int64
+	// MaxStateTokens bounds the estimated size of the state plus the longest
+	// question (default DefaultMaxStateTokens; negative disables the check). The
+	// estimate is approximate (bytes/4).
+	MaxStateTokens int
 	// OnCall, when set, receives a CallEvent after every call.
 	OnCall func(CallEvent)
 	// Clock is the time source for latency (default time.Now); tests only.
@@ -114,22 +154,32 @@ type Client struct {
 	policy *decision.SelectionPolicy
 }
 
-// New builds a Client. It fails only when APIKey is empty.
+// New builds a Client. It fails when APIKey or Model is empty or BaseURL is not
+// acceptable (see Config).
 func New(cfg Config) (*Client, error) {
 	if cfg.APIKey == "" {
 		return nil, errors.New("typesafe: APIKey is required")
 	}
+	if cfg.Model == "" {
+		return nil, errors.New("typesafe: Model is required (pin a versioned model id; ModelLatest is an explicit choice)")
+	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = DefaultBaseURL
 	}
-	if cfg.Model == "" {
-		cfg.Model = DefaultModel
+	if err := checkBaseURL(cfg.BaseURL); err != nil {
+		return nil, err
 	}
 	if cfg.Name == "" {
 		cfg.Name = DefaultName
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{}
+		cfg.HTTPClient = &http.Client{
+			// Never follow a redirect: it would re-send the state and the key.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
+	}
+	if cfg.MaxStateTokens == 0 {
+		cfg.MaxStateTokens = DefaultMaxStateTokens
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultTimeout
@@ -141,6 +191,34 @@ func New(cfg Config) (*Client, error) {
 		cfg.Clock = time.Now
 	}
 	return &Client{cfg: cfg}, nil
+}
+
+// checkBaseURL accepts https, and http only for a loopback host. The error
+// never repeats the URL (it might carry credentials).
+func checkBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return errors.New("typesafe: BaseURL is not a valid URL")
+	}
+	if u.User != nil {
+		return errors.New("typesafe: BaseURL must not carry credentials")
+	}
+	switch {
+	case u.Scheme == "https":
+		return nil
+	case u.Scheme == "http" && isLoopback(u.Hostname()):
+		return nil
+	default:
+		return errors.New("typesafe: BaseURL must be https (http is accepted only for a loopback host)")
+	}
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // String describes the client without its key.
@@ -224,9 +302,41 @@ type AskResponse struct {
 }
 
 type wireRequest struct {
-	State     any                 `json:"state"`
+	State     json.RawMessage     `json:"state"`
 	Model     string              `json:"model"`
 	Questions map[string]Question `json:"questions"`
+}
+
+// estimateTokens is the approximate token count of n bytes of JSON (bytes/4).
+func estimateTokens(n int) int { return (n + 3) / 4 }
+
+// encode checks req locally and builds the request body. Nothing in its errors
+// quotes the request.
+func (c *Client) encode(req AskRequest) ([]byte, error) {
+	if len(req.Questions) > MaxQuestionsPerCall {
+		return nil, fmt.Errorf("%w: %d (limit %d)", ErrTooManyQuestions, len(req.Questions), MaxQuestionsPerCall)
+	}
+	state, err := json.Marshal(req.State)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the state cannot be encoded", ErrInvalidRequest)
+	}
+	longest := 0
+	for _, q := range req.Questions {
+		if opts, ok := q.Criteria.(map[string]any); ok && q.Type == TypeChoice && len(opts) > MaxChoiceOptions {
+			return nil, fmt.Errorf("%w: %d (limit %d)", ErrTooManyOptions, len(opts), MaxChoiceOptions)
+		}
+		qb, err := json.Marshal(q)
+		if err != nil {
+			return nil, fmt.Errorf("%w: a question cannot be encoded", ErrInvalidRequest)
+		}
+		longest = max(longest, len(qb))
+	}
+	if limit := c.cfg.MaxStateTokens; limit > 0 {
+		if est := estimateTokens(len(state) + longest); est > limit {
+			return nil, fmt.Errorf("%w: about %d tokens (limit %d, estimate is approximate)", ErrStateTooLarge, est, limit)
+		}
+	}
+	return json.Marshal(wireRequest{State: state, Model: c.cfg.Model, Questions: req.Questions})
 }
 
 // Ask makes one call. It does not retry.
@@ -244,9 +354,9 @@ func (c *Client) Ask(ctx context.Context, req AskRequest) (*AskResponse, error) 
 }
 
 func (c *Client) do(ctx context.Context, req AskRequest) (*AskResponse, int, error) {
-	body, err := json.Marshal(wireRequest{State: req.State, Model: c.cfg.Model, Questions: req.Questions})
+	body, err := c.encode(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("typesafe: encode request: %w", err)
+		return nil, 0, err
 	}
 	url := strings.TrimRight(c.cfg.BaseURL, "/") + systemOnePath
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -270,7 +380,7 @@ func (c *Client) do(ctx context.Context, req AskRequest) (*AskResponse, int, err
 	}
 
 	if hresp.StatusCode < 200 || hresp.StatusCode > 299 {
-		return nil, hresp.StatusCode, newAPIError(hresp, raw)
+		return nil, hresp.StatusCode, newAPIError(hresp, raw, c.cfg.Clock())
 	}
 	if int64(len(raw)) > c.cfg.MaxResponseBytes {
 		return nil, hresp.StatusCode, fmt.Errorf("%w: response larger than %d bytes", ErrBadResponse, c.cfg.MaxResponseBytes)
@@ -290,11 +400,11 @@ func (c *Client) do(ctx context.Context, req AskRequest) (*AskResponse, int, err
 // error type from the body. The live API answers {"detail": {"error_type": ...,
 // "message": ...}} or {"detail": "<text>"}; the text is dropped because a
 // validation message can echo submitted content.
-func newAPIError(resp *http.Response, body []byte) *APIError {
+func newAPIError(resp *http.Response, body []byte, now time.Time) *APIError {
 	e := &APIError{
 		Status:     resp.StatusCode,
 		RequestID:  resp.Header.Get("x-typesafe-request-id"),
-		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), now),
 		kind:       kindForStatus(resp.StatusCode),
 	}
 	var shape struct {

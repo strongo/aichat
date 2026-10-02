@@ -3,19 +3,39 @@ package typesafe
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/strongo/aichat/ai/decision"
 )
+
+// sentinel is an error value with a fixed message that also matches (errors.Is)
+// a parent error: ErrAuth matches decision.ErrAuth, and the local request checks
+// match ErrInvalidRequest and so decision.ErrInvalidRequest, which is how a
+// circuit breaker learns that the caller, not the engine, is at fault.
+type sentinel struct {
+	msg    string
+	parent error
+}
+
+func (s *sentinel) Error() string { return s.msg }
+func (s *sentinel) Unwrap() error { return s.parent }
 
 // Sentinels matched with errors.Is against an *APIError (or the errors this
 // package returns for a malformed exchange).
 var (
 	// ErrAuth: the API key is missing, invalid or not allowed (HTTP 401/403).
-	ErrAuth = errors.New("typesafe: authentication failed")
+	// It matches decision.ErrAuth too. It is not an engine-health failure: a
+	// circuit breaker does not count it, and combinators record it as "auth".
+	ErrAuth error = &sentinel{"typesafe: authentication failed", decision.ErrAuth}
 	// ErrInvalidRequest: the request body failed validation (HTTP 400/422;
-	// the documented status is 422, the live API answers 400).
-	ErrInvalidRequest = errors.New("typesafe: invalid request")
+	// the documented status is 422, the live API answers 400), or a local check
+	// refused it before any call. It matches decision.ErrInvalidRequest too: the
+	// caller's request is at fault, not the engine, so a circuit breaker does not
+	// count it.
+	ErrInvalidRequest error = &sentinel{"typesafe: invalid request", decision.ErrInvalidRequest}
 	// ErrRateLimited: the rate limit was exceeded (HTTP 429). The caller (a
 	// combinator or breaker) decides whether to try another engine; this package
 	// never retries.
@@ -29,13 +49,22 @@ var (
 	// ErrBadResponse: a 2xx response that is not the documented shape, or whose
 	// answers do not match the questions asked.
 	ErrBadResponse = errors.New("typesafe: malformed response")
-	// ErrTooManyOptions: a Choice has more than MaxChoiceOptions options.
-	ErrTooManyOptions = errors.New("typesafe: too many choice options")
+	// ErrTooManyOptions: a Choice has more than MaxChoiceOptions options. Checked
+	// locally; also an ErrInvalidRequest.
+	ErrTooManyOptions error = &sentinel{"typesafe: too many choice options", ErrInvalidRequest}
+	// ErrTooManyQuestions: a call carries more than MaxQuestionsPerCall
+	// questions (a relevance question costs one per candidate). Checked locally;
+	// also an ErrInvalidRequest.
+	ErrTooManyQuestions error = &sentinel{"typesafe: too many questions in one call", ErrInvalidRequest}
+	// ErrStateTooLarge: the state plus the longest question is estimated above
+	// Config.MaxStateTokens. The estimate is approximate (bytes/4). Checked
+	// locally; also an ErrInvalidRequest.
+	ErrStateTooLarge error = &sentinel{"typesafe: state too large", ErrInvalidRequest}
 )
 
 // APIError is a non-2xx answer from the API. It carries only the status, the
-// error type and the request id; it never carries the response body, which can
-// echo the submitted state.
+// error type, the request id and the retry delay; it never carries the response
+// body, which can echo the submitted state.
 type APIError struct {
 	Status int
 	// ErrorType is the API's machine-readable type (for example
@@ -43,7 +72,8 @@ type APIError struct {
 	ErrorType string
 	// RequestID is the x-typesafe-request-id response header, for support.
 	RequestID string
-	// RetryAfter is the Retry-After header, when present.
+	// RetryAfter is the Retry-After header (seconds or an HTTP date), when
+	// present and in the future.
 	RetryAfter time.Duration
 	kind       error
 }
@@ -60,8 +90,14 @@ func (e *APIError) Error() string {
 	return s
 }
 
-// Is makes errors.Is(err, ErrRateLimited) and friends work.
-func (e *APIError) Is(target error) bool { return target == e.kind }
+// Unwrap makes errors.Is(err, ErrRateLimited), errors.Is(err, ErrAuth) and
+// friends work, and lets errors.Is(err, decision.ErrAuth) and
+// decision.ErrInvalidRequest see through to the engine-neutral sentinels.
+func (e *APIError) Unwrap() error { return e.kind }
+
+// RetryDelay implements decision.RetryDelayer: a circuit breaker keeps the
+// engine out of service at least this long.
+func (e *APIError) RetryDelay() time.Duration { return e.RetryAfter }
 
 // kindForStatus maps an HTTP status to its sentinel.
 func kindForStatus(status int) error {
@@ -81,11 +117,16 @@ func kindForStatus(status int) error {
 	}
 }
 
-// parseRetryAfter reads a Retry-After header given in seconds.
-func parseRetryAfter(v string) time.Duration {
-	secs, err := strconv.Atoi(v)
-	if err != nil || secs < 0 {
-		return 0
+// parseRetryAfter reads a Retry-After header: a number of seconds or an HTTP
+// date (relative to now). It returns 0 for a missing, malformed, negative or
+// past value, and never more than decision.MaxRetryDelay.
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	var d time.Duration
+	if secs, err := strconv.Atoi(v); err == nil {
+		d = time.Duration(min(secs, int(decision.MaxRetryDelay/time.Second)+1)) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		d = t.Sub(now)
 	}
-	return time.Duration(secs) * time.Second
+	return min(max(d, 0), decision.MaxRetryDelay)
 }

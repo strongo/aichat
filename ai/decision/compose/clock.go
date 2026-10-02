@@ -1,6 +1,9 @@
 package compose
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Clock is the source of time the combinators and the breaker use, so tests can
 // drive timeouts, hedge delays and cooldowns deterministically.
@@ -24,4 +27,14 @@ func SystemClock() Clock { return systemClock{} }
 func (systemClock) Now() time.Time { return time.Now() }
 func (systemClock) AfterFunc(d time.Duration, f func()) Timer {
 	return time.AfterFunc(d, f)
+}
+
+// withTimeout derives a context that is cancelled with the cause
+// context.DeadlineExceeded after d on clk (so deadlines follow a fake clock in
+// tests, and callers can tell a timeout from a cancellation). The returned
+// function releases the timer and the context.
+func withTimeout(ctx context.Context, clk Clock, d time.Duration) (context.Context, func()) {
+	c, cancel := context.WithCancelCause(ctx)
+	t := clk.AfterFunc(d, func() { cancel(context.DeadlineExceeded) })
+	return c, func() { t.Stop(); cancel(nil) }
 }

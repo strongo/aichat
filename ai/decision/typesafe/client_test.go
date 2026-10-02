@@ -29,18 +29,21 @@ func TestNew(t *testing.T) {
 	if _, err := New(Config{}); err == nil {
 		t.Fatal("empty key accepted")
 	}
-	c, err := New(Config{APIKey: testKey})
+	if _, err := New(Config{APIKey: testKey}); err == nil || !strings.Contains(err.Error(), "Model is required") {
+		t.Fatalf("a client with no explicit model was built: %v", err)
+	}
+	c, err := New(Config{APIKey: testKey, Model: ModelLatest})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.Name() != "typesafe" || c.DecisionTimeout() != DefaultTimeout {
 		t.Fatalf("name=%q timeout=%v", c.Name(), c.DecisionTimeout())
 	}
-	c, _ = New(Config{APIKey: testKey, Name: "jev", Timeout: time.Second})
+	c, _ = New(Config{APIKey: testKey, Model: ModelLatest, Name: "jev", Timeout: time.Second})
 	if c.Name() != "jev" || c.DecisionTimeout() != time.Second {
 		t.Fatalf("name=%q timeout=%v", c.Name(), c.DecisionTimeout())
 	}
-	if s := c.String(); strings.Contains(s, testKey) || !strings.Contains(s, DefaultModel) || !strings.Contains(s, DefaultBaseURL) {
+	if s := c.String(); strings.Contains(s, testKey) || !strings.Contains(s, ModelLatest) || !strings.Contains(s, DefaultBaseURL) {
 		t.Fatalf("String() = %q", s)
 	}
 }
@@ -73,7 +76,7 @@ func TestAsk_RequestShapeAndDecodedResponse(t *testing.T) {
 		t.Fatalf("headers = %v", r.Header)
 	}
 	sent := d.sent(t)
-	if sent["model"] != "jev-latest" || sent["state"] != "Help! My payouts have been failing for 3 days." {
+	if sent["model"] != testModel || sent["state"] != "Help! My payouts have been failing for 3 days." {
 		t.Fatalf("sent = %v", sent)
 	}
 	q := d.questions(t)
@@ -236,12 +239,14 @@ func TestAsk_MalformedResponses(t *testing.T) {
 }
 
 func TestAsk_RequestConstructionErrors(t *testing.T) {
-	c := newClient(t, &fakeDoer{}, func(c *Config) { c.BaseURL = "http://[::1" })
-	if _, err := c.Ask(context.Background(), AskRequest{State: "x", Questions: map[string]Question{"q": Noul("?")}}); err == nil {
-		t.Fatal("bad base URL accepted")
+	// A nil context is the one thing left that makes the HTTP request unbuildable
+	// (the base URL is validated by New).
+	var noContext context.Context
+	if _, err := newClient(t, &fakeDoer{}).Ask(noContext, AskRequest{State: "x", Questions: map[string]Question{"q": Noul("?")}}); err == nil {
+		t.Fatal("nil context accepted")
 	}
 	d := &fakeDoer{}
-	c = newClient(t, d)
+	c := newClient(t, d)
 	if _, err := c.Ask(context.Background(), AskRequest{State: make(chan int), Questions: map[string]Question{"q": Noul("?")}}); err == nil || d.calls != 0 {
 		t.Fatalf("unencodable state: err=%v calls=%d", err, d.calls)
 	}

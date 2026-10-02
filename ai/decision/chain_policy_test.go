@@ -21,32 +21,59 @@ func constProvider(name string, d Decision) Provider {
 	return providerFunc{name: name, fn: func(context.Context, Request) (Decision, bool, error) { return d, true, nil }}
 }
 
-func TestChain_PolicyReturnsNonClearAnswersWithOutcome(t *testing.T) {
+func TestChain_PolicySelectedStopsTheChain(t *testing.T) {
 	pol := NarrowingPolicy()
-	cases := []struct {
-		name    string
-		d       Decision
-		outcome Outcome
-		detail  string
-	}{
-		{"selected", scoredDecision(0.9, true, map[string]float64{"calendar/show": 0.9, "calendar/create": 0.1}), OutcomeSelected, "selected"},
-		// 0.38/0.35/0.33: with the legacy 0.7 floor this vanished into an empty
-		// decision; under a policy it reaches the caller as uncertain.
-		{"uncertain", scoredDecision(0.07, true, map[string]float64{"calendar/show": 0.38, "calendar/create": 0.35, "x": 0.33}), OutcomeUncertain, "uncertain: low_confidence"},
+	d, ok, tr := chainOf(&pol, constProvider("jev", scoredDecision(0.9, true, map[string]float64{"calendar/show": 0.9, "calendar/create": 0.1}))).Decide(context.Background(), req())
+	if !ok || d.Outcome != OutcomeSelected || !d.Actionable() {
+		t.Fatalf("ok=%v outcome=%q", ok, d.Outcome)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			d, ok, tr := chainOf(&pol, constProvider("jev", tc.d)).Decide(context.Background(), req())
-			if !ok || d.Outcome != tc.outcome {
-				t.Fatalf("ok=%v outcome=%q", ok, d.Outcome)
-			}
-			if tr.Outcome != tc.outcome || !tr.Calibrated || tr.DecidedBy != "jev" || tr.Engine != "jev" {
-				t.Fatalf("trace = %+v", tr)
-			}
-			if got := tr.Attempts[0]; got.Outcome != AttemptDecided || got.Detail != tc.detail {
-				t.Fatalf("attempt = %+v", got)
-			}
-		})
+	if tr.Outcome != OutcomeSelected || !tr.Calibrated || tr.DecidedBy != "jev" || tr.Engine != "jev" {
+		t.Fatalf("trace = %+v", tr)
+	}
+	if got := tr.Attempts[0]; got.Outcome != AttemptDecided || got.Detail != "selected" {
+		t.Fatalf("attempt = %+v", got)
+	}
+}
+
+// 0.38/0.35/0.33 is not a clear answer: by default the chain records it as
+// "uncertain" and falls through to the next provider rather than returning a
+// decision a caller could act on by accident.
+func TestChain_PolicyUncertainFallsThrough(t *testing.T) {
+	pol := NarrowingPolicy()
+	uncertain := scoredDecision(0.07, true, map[string]float64{"calendar/show": 0.38, "calendar/create": 0.35, "x": 0.33})
+	good := scoredDecision(0.9, true, map[string]float64{"calendar/show": 0.9, "y": 0.1})
+	d, ok, tr := chainOf(&pol, constProvider("a", uncertain), constProvider("b", good)).Decide(context.Background(), req())
+	if !ok || tr.DecidedBy != "b" || d.Outcome != OutcomeSelected {
+		t.Fatalf("ok=%v tr=%+v", ok, tr)
+	}
+	if got := tr.Attempts[0]; got.Outcome != AttemptUncertain || got.Detail != "uncertain: low_confidence" {
+		t.Fatalf("attempt = %+v", got)
+	}
+	// Alone, an uncertain answer leaves the chain undecided.
+	d, ok, tr = chainOf(&pol, constProvider("a", uncertain)).Decide(context.Background(), req())
+	if ok || d.Outcome != "" || tr.DecidedBy != "" {
+		t.Fatalf("ok=%v d=%+v tr=%+v", ok, d, tr)
+	}
+}
+
+func TestChain_KeepNonSelectedReturnsTheAnswerButItIsNotActionable(t *testing.T) {
+	pol := NarrowingPolicy()
+	uncertain := scoredDecision(0.07, true, map[string]float64{"calendar/show": 0.38, "calendar/create": 0.35, "x": 0.33})
+	c := Chain{Providers: []Provider{constProvider("jev", uncertain)}, Policy: &pol, KeepNonSelected: true}
+	d, ok, tr := c.Decide(context.Background(), req())
+	if !ok || d.Outcome != OutcomeUncertain || d.Actionable() || tr.Outcome != OutcomeUncertain {
+		t.Fatalf("ok=%v d=%+v tr=%+v", ok, d, tr)
+	}
+	if got := tr.Attempts[0]; got.Outcome != AttemptDecided || got.Detail != "uncertain: low_confidence" {
+		t.Fatalf("attempt = %+v", got)
+	}
+}
+
+func TestDecision_Actionable(t *testing.T) {
+	for outcome, want := range map[Outcome]bool{"": true, OutcomeSelected: true, OutcomeUnscored: true, OutcomeUncertain: false, OutcomeNone: false, OutcomeSeveral: false} {
+		if got := (Decision{Outcome: outcome}).Actionable(); got != want {
+			t.Errorf("%q: %v", outcome, got)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package decision
 import (
 	"errors"
 	"fmt"
+	"math"
 )
 
 // SelectionPolicy turns a scored answer into an Outcome. It replaces scattered
@@ -12,10 +13,12 @@ import (
 // candidates or none.
 //
 // A policy is applied only to CALIBRATED answers. An uncalibrated answer gets
-// OutcomeUnscored whatever its numbers say.
+// OutcomeUnscored whatever its numbers say, with a PROPOSAL in Selection.Picks
+// (see Evaluate) that is never a selection.
 //
 // Use NarrowingPolicy or DurablePolicy, or build a value and Validate it. The
-// zero value accepts everything and is not a sensible policy; Chain treats a
+// zero value is invalid (it would select everything): Validate rejects it, and
+// Evaluate refuses to select anything with an invalid policy. Chain treats a
 // nil *SelectionPolicy as "no policy" (the legacy MinConfidence behaviour).
 type SelectionPolicy struct {
 	// Name identifies the policy in traces.
@@ -42,20 +45,24 @@ type SelectionPolicy struct {
 	MaxPicks int `json:"maxPicks,omitempty"`
 }
 
-// Documented defaults of the two named policies. They are starting values, to
-// be calibrated on a product's own corpus and overridden per product or
-// decision type; they live here so no caller hard-codes its own.
+// Documented defaults of the two named policies. They are PROVISIONAL: they come
+// from a single small measurement against one decision model version, they are
+// not a calibration, and they MUST be re-measured on a product's own corpus and
+// for the exact model id in use (a moved model alias moves the numbers; see
+// typesafe.Config.Model) before anything depends on them. Override them per
+// product or decision type through configuration; they live here so no caller
+// hard-codes its own.
 const (
-	// Narrowing policy: read-only narrowing of a search space. A wrong answer
-	// costs a wasted look, not a wrong fact.
+	// Narrowing policy: choosing which candidates to examine first. A wrong
+	// pick costs extra work, nothing more.
 	NarrowingMinConfidence        = 0.50
 	NarrowingMinGap               = 0.20
 	NarrowingMinProbability       = 0.60
 	NarrowingStrongProbability    = 0.85
 	NarrowingPotentialProbability = 0.30
 
-	// Durable policy: writing knowledge that will be reused without asking
-	// again. The bar is raised; callers should still add a deterministic check
+	// Durable policy: answers that will be stored and reused as fact. The bar
+	// is higher; callers should still add a deterministic check
 	// or a person's confirmation.
 	DurableMinConfidence        = 0.90
 	DurableMinGap               = 0.20
@@ -64,7 +71,7 @@ const (
 	DurablePotentialProbability = 0.60
 )
 
-// NarrowingPolicy is the default policy for read-only narrowing.
+// NarrowingPolicy is the default policy for narrowing a set of candidates.
 func NarrowingPolicy() SelectionPolicy {
 	return SelectionPolicy{
 		Name:                 "narrowing",
@@ -76,7 +83,7 @@ func NarrowingPolicy() SelectionPolicy {
 	}
 }
 
-// DurablePolicy is the stricter policy for answers that become durable knowledge.
+// DurablePolicy is the stricter policy for answers that will be stored and reused as fact.
 func DurablePolicy() SelectionPolicy {
 	return SelectionPolicy{
 		Name:                 "durable",
@@ -88,18 +95,24 @@ func DurablePolicy() SelectionPolicy {
 	}
 }
 
-// Validate reports a misconfigured policy: every threshold in [0,1], thresholds
-// ordered potential <= min <= strong, and MaxPicks not negative.
+// Validate reports a misconfigured policy: every threshold in [0,1],
+// MinConfidence and MinProbability above zero (so the zero value, which would
+// select everything, is invalid), thresholds ordered potential <= min <=
+// strong, and MaxPicks not negative.
 func (p SelectionPolicy) Validate() error {
 	var errs []error
-	for name, v := range map[string]float64{
-		"minConfidence": p.MinConfidence, "minGap": p.MinGap,
-		"minProbability": p.MinProbability, "strongProbability": p.StrongProbability,
-		"potentialProbability": p.PotentialProbability,
-	} {
-		if v < 0 || v > 1 {
+	check := func(name string, v float64) {
+		if math.IsNaN(v) || v < 0 || v > 1 {
 			errs = append(errs, fmt.Errorf("%s %.2f out of [0,1]", name, v))
 		}
+	}
+	check("minConfidence", p.MinConfidence)
+	check("minGap", p.MinGap)
+	check("minProbability", p.MinProbability)
+	check("strongProbability", p.StrongProbability)
+	check("potentialProbability", p.PotentialProbability)
+	if p.MinConfidence <= 0 || p.MinProbability <= 0 {
+		errs = append(errs, errors.New("minConfidence and minProbability must be above 0 (a zero threshold selects everything)"))
 	}
 	if p.PotentialProbability > p.MinProbability || p.MinProbability > p.StrongProbability {
 		errs = append(errs, errors.New("thresholds must satisfy potentialProbability <= minProbability <= strongProbability"))
@@ -114,8 +127,16 @@ func (p SelectionPolicy) Validate() error {
 type Selection struct {
 	Outcome Outcome `json:"outcome"`
 	// Picks are the selected candidate ids, best first (empty unless Selected
-	// or Several).
+	// or Several). When Proposal is true they are only a proposal.
 	Picks []string `json:"picks,omitempty"`
+	// Proposal is true when Picks is a PROPOSAL from an engine that gives no
+	// calibrated probabilities (Outcome is OutcomeUnscored): for a relevance
+	// answer the candidates at or above MinProbability, for a choice its top
+	// candidate. It is never "strong", it never means the policy selected
+	// anything, and a caller may use it only where a wrong guess is cheap (for
+	// example choosing which candidates to examine first, with the full set as the
+	// fallback). Use Actionable to tell the two apart.
+	Proposal bool `json:"proposal,omitempty"`
 	// Strong is the subset of Picks at or above the strong threshold
 	// (relevance answers only).
 	Strong []string `json:"strong,omitempty"`
@@ -125,8 +146,14 @@ type Selection struct {
 	// Reason is a short machine-readable explanation of a non-selected
 	// outcome, or of a truncation: not_calibrated, no_scores, none_of_these,
 	// low_confidence, narrow_gap, nothing_above_floor, only_potential,
-	// truncated_to_max_picks.
+	// truncated_to_max_picks, invalid_policy.
 	Reason string `json:"reason,omitempty"`
+}
+
+// Actionable reports whether the policy selected the answer: Outcome is
+// OutcomeSelected or OutcomeSeveral and Picks is not a proposal.
+func (s Selection) Actionable() bool {
+	return !s.Proposal && (s.Outcome == OutcomeSelected || s.Outcome == OutcomeSeveral)
 }
 
 // Reasons reported in Selection.Reason.
@@ -139,22 +166,58 @@ const (
 	ReasonNothingAbove   = "nothing_above_floor"
 	ReasonOnlyPotential  = "only_potential"
 	ReasonTruncatedToMax = "truncated_to_max_picks"
+	ReasonInvalidPolicy  = "invalid_policy"
 )
 
 // Evaluate applies the policy to one answer.
+//
+// An invalid policy (see Validate) selects nothing: the outcome is
+// OutcomeUncertain with ReasonInvalidPolicy. An uncalibrated answer is
+// OutcomeUnscored with ReasonNotCalibrated and a PROPOSAL in Picks (Proposal is
+// true, Strong and Potential stay empty): a relevance answer proposes the
+// candidates at or above MinProbability (capped by MaxPicks), a choice answer
+// proposes its top candidate unless that is the NoneID. A proposal lets a caller
+// narrow a search space with an LLM engine's self-reported numbers; it is never
+// a selection.
 func (p SelectionPolicy) Evaluate(a Answer) Selection {
-	if !a.Calibrated {
-		return Selection{Outcome: OutcomeUnscored, Reason: ReasonNotCalibrated}
+	if p.Validate() != nil {
+		return Selection{Outcome: OutcomeUncertain, Reason: ReasonInvalidPolicy}
 	}
 	if len(a.Scores) == 0 {
+		if !a.Calibrated {
+			return Selection{Outcome: OutcomeUnscored, Reason: ReasonNotCalibrated}
+		}
 		return Selection{Outcome: OutcomeUncertain, Reason: ReasonNoScores}
 	}
 	// Scores may come from a caller that did not use NewAnswer; rank defensively.
 	ranked := NewAnswer(a.QuestionID, a.Kind, a.Scores).Scores
+	if !a.Calibrated {
+		return p.propose(a, ranked)
+	}
 	if a.Kind == KindRelevance {
 		return p.evaluateRelevance(ranked)
 	}
 	return p.evaluateChoice(a, ranked)
+}
+
+// propose builds the proposal for an uncalibrated answer.
+func (p SelectionPolicy) propose(a Answer, ranked []Score) Selection {
+	sel := Selection{Outcome: OutcomeUnscored, Reason: ReasonNotCalibrated, Proposal: true}
+	if a.Kind == KindRelevance {
+		for _, s := range ranked {
+			if s.Probability >= p.MinProbability {
+				sel.Picks = append(sel.Picks, s.ID)
+			}
+		}
+		if p.MaxPicks > 0 && len(sel.Picks) > p.MaxPicks {
+			sel.Picks = sel.Picks[:p.MaxPicks]
+		}
+		return sel
+	}
+	if top := ranked[0]; top.ID != a.NoneID {
+		sel.Picks = []string{top.ID}
+	}
+	return sel
 }
 
 func (p SelectionPolicy) evaluateChoice(a Answer, ranked []Score) Selection {
@@ -162,7 +225,13 @@ func (p SelectionPolicy) evaluateChoice(a Answer, ranked []Score) Selection {
 	if a.NoneID != "" && top.ID == a.NoneID {
 		return Selection{Outcome: OutcomeNone, Reason: ReasonNoneOfThese}
 	}
-	if a.HasConfidence && a.Confidence < p.MinConfidence {
+	// An engine that reports no confidence leaves the top probability as the only
+	// evidence of certainty, so it must reach MinConfidence itself.
+	confidence := top.Probability
+	if a.HasConfidence {
+		confidence = a.Confidence
+	}
+	if confidence < p.MinConfidence {
 		return Selection{Outcome: OutcomeUncertain, Reason: ReasonLowConfidence}
 	}
 	if len(ranked) > 1 && top.Probability-ranked[1].Probability < p.MinGap {
