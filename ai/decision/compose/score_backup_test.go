@@ -116,11 +116,11 @@ func expectLLMAnswered(t *testing.T, s scored, wantAttempts ...string) {
 		t.Fatalf("an LLM answer must not look calibrated: %+v", rel)
 	}
 	sel := decision.NarrowingPolicy().Evaluate(rel)
-	if sel.Outcome != decision.OutcomeUnscored || !sel.Proposal || sel.Actionable() || !reflect.DeepEqual(sel.Picks, []string{"a"}) {
+	if sel.Outcome != decision.OutcomeUnscored || sel.Actionable() || len(sel.Picks) != 0 || !reflect.DeepEqual(sel.Proposals, []string{"a"}) {
 		t.Fatalf("the policy must narrow with a proposal: %+v", sel)
 	}
 	pick := decision.NarrowingPolicy().Evaluate(s.res.Answers["pick"])
-	if !pick.Proposal || !reflect.DeepEqual(pick.Picks, []string{"a"}) {
+	if len(pick.Picks) != 0 || !reflect.DeepEqual(pick.Proposals, []string{"a"}) {
 		t.Fatalf("choice proposal: %+v", pick)
 	}
 }

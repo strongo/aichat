@@ -70,9 +70,18 @@ func TestChain_KeepNonSelectedReturnsTheAnswerButItIsNotActionable(t *testing.T)
 }
 
 func TestDecision_Actionable(t *testing.T) {
-	for outcome, want := range map[Outcome]bool{"": true, OutcomeSelected: true, OutcomeUnscored: true, OutcomeUncertain: false, OutcomeNone: false, OutcomeSeveral: false} {
-		if got := (Decision{Outcome: outcome}).Actionable(); got != want {
-			t.Errorf("%q: %v", outcome, got)
+	want := map[Outcome]bool{"": true, OutcomeSelected: true, OutcomeSeveral: true, OutcomeAccepted: true,
+		OutcomeUnscored: false, OutcomeUncertain: false, OutcomeNone: false}
+	for outcome, w := range want {
+		if got := (Decision{Outcome: outcome}).Actionable(); got != w {
+			t.Errorf("Decision %q: %v", outcome, got)
+		}
+		// One rule: a Selection with the same verdict agrees (the empty outcome
+		// is "no policy ran", which a Selection never is).
+		if outcome != "" {
+			if got := (Selection{Outcome: outcome}).Actionable(); got != w {
+				t.Errorf("Selection %q: %v", outcome, got)
+			}
 		}
 	}
 }
@@ -85,18 +94,91 @@ func TestChain_NilPolicyKeepsLegacyBehaviour(t *testing.T) {
 	}
 }
 
-func TestChain_PolicyUncalibratedIsUnscoredAndKeepsFloor(t *testing.T) {
-	pol := NarrowingPolicy()
-	// An emulator's confident, score-less answer is accepted but unscored.
-	d, ok, tr := chainOf(&pol, constProvider("llm", decided("calendar", "show", 0.95))).Decide(context.Background(), req())
-	if !ok || d.Outcome != OutcomeUnscored || tr.Outcome != OutcomeUnscored || tr.Calibrated {
-		t.Fatalf("ok=%v d=%+v tr=%+v", ok, d, tr)
+// Under a policy, an uncalibrated decision is accepted only by the policy's
+// explicit AcceptUncalibratedAt bar: narrowing opts in at 0.70, durable never.
+func TestChain_PolicyUncalibratedNeedsTheExplicitOptIn(t *testing.T) {
+	nar, dur := NarrowingPolicy(), DurablePolicy()
+	llm := func(conf float64) Provider { return constProvider("llm", decided("calendar", "show", conf)) }
+
+	d, ok, tr := chainOf(&nar, llm(0.95)).Decide(context.Background(), req())
+	if !ok || d.Outcome != OutcomeAccepted || !d.Actionable() || d.Calibrated || tr.Outcome != OutcomeAccepted || tr.Calibrated {
+		t.Fatalf("narrowing 0.95: ok=%v d=%+v tr=%+v", ok, d, tr)
 	}
-	// Uncalibrated numbers are never thresholded by the policy; the legacy
-	// floor still rejects a low self-reported confidence.
+	if got := tr.Attempts[0]; got.Outcome != AttemptDecided || got.Detail != "accepted: accepted_uncalibrated" {
+		t.Fatalf("attempt = %+v", got)
+	}
+	if _, ok, tr := chainOf(&nar, llm(0.72)).Decide(context.Background(), req()); !ok || tr.Outcome != OutcomeAccepted {
+		t.Fatalf("narrowing 0.72 clears its 0.70 bar: ok=%v tr=%+v", ok, tr)
+	}
+	// Below the bar: unscored, not actionable, falls through.
+	if _, ok, tr := chainOf(&nar, llm(0.6)).Decide(context.Background(), req()); ok || tr.Attempts[0].Outcome != AttemptUncertain || tr.Attempts[0].Detail != "unscored: low_confidence" {
+		t.Fatalf("narrowing 0.6: ok=%v tr=%+v", ok, tr)
+	}
+	// The probed bypass: a durable chain whose calibrated engine is down must NOT
+	// act on an LLM's self-reported 0.72 (the durable bar is 0.90, calibrated).
+	d, ok, tr = chainOf(&dur, llm(0.72)).Decide(context.Background(), req())
+	if ok || d.Outcome != "" || tr.Attempts[0].Outcome != AttemptUncertain || tr.Attempts[0].Detail != "unscored: not_calibrated" {
+		t.Fatalf("durable 0.72: ok=%v d=%+v tr=%+v", ok, d, tr)
+	}
+	if _, ok, _ := chainOf(&dur, llm(0.99)).Decide(context.Background(), req()); ok {
+		t.Fatal("a durable chain never acts on an uncalibrated decision")
+	}
+	// KeepNonSelected returns it, and it is not actionable.
+	keep := Chain{Providers: []Provider{llm(0.72)}, Policy: &dur, KeepNonSelected: true}
+	d, ok, tr = keep.Decide(context.Background(), req())
+	if !ok || d.Outcome != OutcomeUnscored || d.Actionable() || tr.Outcome != OutcomeUnscored {
+		t.Fatalf("keep: ok=%v d=%+v tr=%+v", ok, d, tr)
+	}
+	// A calibrated claim with no Scores cannot be judged by probabilities either.
+	cal := decided("calendar", "show", 0.72)
+	cal.Calibrated = true
+	if _, ok, tr := chainOf(&dur, constProvider("jev", cal)).Decide(context.Background(), req()); ok || tr.Attempts[0].Detail != "unscored: no_scores" {
+		t.Fatalf("calibrated without scores: ok=%v tr=%+v", ok, tr)
+	}
+	// The explicit opt-in is a policy value.
+	custom := dur
+	custom.AcceptUncalibratedAt = 0.8
+	if _, ok, _ := chainOf(&custom, llm(0.85)).Decide(context.Background(), req()); !ok {
+		t.Fatal("a durable policy that opts in at 0.8 accepts 0.85")
+	}
+	if _, ok, _ := chainOf(&custom, llm(0.75)).Decide(context.Background(), req()); ok {
+		t.Fatal("... and rejects 0.75")
+	}
+}
+
+// With a policy the policy's bar replaces the chain's MinConfidence floor, and a
+// score-bearing uncalibrated decision is judged by self-reported confidence only.
+func TestChain_PolicyDoesNotThresholdUncalibratedScores(t *testing.T) {
+	pol := NarrowingPolicy()
 	low := scoredDecision(0.3, false, map[string]float64{"calendar/show": 0.99})
-	if _, ok, tr := chainOf(&pol, constProvider("llm", low)).Decide(context.Background(), req()); ok || tr.Attempts[0].Outcome != AttemptLowConfidence {
+	if _, ok, tr := chainOf(&pol, constProvider("llm", low)).Decide(context.Background(), req()); ok || tr.Attempts[0].Outcome != AttemptUncertain {
 		t.Fatalf("ok=%v tr=%+v", ok, tr)
+	}
+	hi := scoredDecision(0.8, false, map[string]float64{"calendar/show": 0.1})
+	if d, ok, _ := chainOf(&pol, constProvider("llm", hi)).Decide(context.Background(), req()); !ok || d.Outcome != OutcomeAccepted {
+		t.Fatalf("ok=%v d=%+v", ok, d)
+	}
+}
+
+// A provider that carries its own uncertain or none verdict (an engine built
+// with a policy) is honoured even by a chain without a policy.
+func TestChain_NoPolicyHonoursAProvidersExplicitNonActionableVerdict(t *testing.T) {
+	for _, o := range []Outcome{OutcomeUncertain, OutcomeNone} {
+		d := decided("calendar", "show", 0.95)
+		d.Outcome = o
+		if got, ok, tr := chainOf(nil, constProvider("e", d)).Decide(context.Background(), req()); ok || tr.Attempts[0].Outcome != AttemptUncertain || tr.Attempts[0].Detail != string(o) {
+			t.Fatalf("%s: ok=%v got=%+v tr=%+v", o, ok, got, tr)
+		}
+		got, ok, tr := Chain{Providers: []Provider{constProvider("e", d)}, KeepNonSelected: true}.Decide(context.Background(), req())
+		if !ok || got.Outcome != o || got.Actionable() || tr.Outcome != o {
+			t.Fatalf("%s keep: ok=%v got=%+v tr=%+v", o, ok, got, tr)
+		}
+	}
+	// A selected verdict still passes the chain's own floor.
+	d := decided("calendar", "show", 0.95)
+	d.Outcome = OutcomeSelected
+	if got, ok, _ := chainOf(nil, constProvider("e", d)).Decide(context.Background(), req()); !ok || got.Outcome != OutcomeSelected {
+		t.Fatalf("ok=%v got=%+v", ok, got)
 	}
 }
 

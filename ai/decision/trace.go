@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -36,6 +39,18 @@ const (
 	// loud on purpose: retrying or failing over hides a misconfiguration that a
 	// person has to fix. It says nothing about the engine's health.
 	AttemptAuth = "auth"
+	// AttemptQuota: the engine refused because the caller's allowance is
+	// exhausted (ErrQuota). It is not a fault of the engine (a circuit breaker
+	// ignores it) and not transient (retrying cannot help), so a combinator does
+	// not hand the call to a backup unless configured to (compose.OnQuota): a
+	// paid backup would silently take over a metered caller's traffic.
+	AttemptQuota = "quota"
+	// AttemptMisconfigured: the engine's endpoint answered in a way that means
+	// the CONFIGURATION is wrong (an unknown product, a base URL that does not
+	// speak the protocol; ErrMisconfigured). A person has to fix it, so it is
+	// loud: a breaker ignores it and a combinator does not hide it behind a
+	// backup.
+	AttemptMisconfigured = "misconfigured"
 )
 
 var (
@@ -56,11 +71,40 @@ var (
 	// refused (HTTP 401/403). It does not count against a circuit breaker
 	// either, and is recorded as AttemptAuth so it stays visible.
 	ErrAuth = errors.New("decision: authentication failed")
+	// ErrQuota is matched by an engine error that says the caller's allowance is
+	// exhausted (an HTTP 429 with the error code "quota"). Neither the engine's
+	// fault (a breaker ignores it) nor transient: retrying cannot help, and
+	// handing the call to a paid backup is an explicit choice (compose.OnQuota).
+	// It is recorded as AttemptQuota and surfaced to the caller. A plain
+	// rate limit (429 "rate_limited") is NOT a quota: it is transient and counts
+	// as an engine-health failure.
+	ErrQuota = errors.New("decision: allowance exhausted")
+	// ErrMisconfigured is matched by an engine error that says the endpoint is
+	// configured wrongly (for example a base URL that does not speak the
+	// protocol, or an unknown product). A breaker ignores it and Fallback does
+	// not start its backup for it: it must be seen and fixed, not absorbed by an
+	// uncalibrated backup forever.
+	ErrMisconfigured = errors.New("decision: engine misconfigured")
 )
 
 // MaxRetryDelay caps any retry delay an engine asks for, so a bad header cannot
 // take an engine out of service for longer.
 const MaxRetryDelay = 10 * time.Minute
+
+// ParseRetryAfter reads a Retry-After header value: a number of seconds or an
+// HTTP date (relative to now). It returns 0 for a missing, malformed, negative or
+// past value, and never more than MaxRetryDelay (a huge number of seconds cannot
+// overflow).
+func ParseRetryAfter(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	var d time.Duration
+	if secs, err := strconv.Atoi(v); err == nil {
+		d = time.Duration(min(secs, int(MaxRetryDelay/time.Second)+1)) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		d = t.Sub(now)
+	}
+	return min(max(d, 0), MaxRetryDelay)
+}
 
 // RetryDelayer is implemented by an engine error that carries the delay the
 // engine asked callers to wait before trying again (a Retry-After header).

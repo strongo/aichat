@@ -85,17 +85,18 @@ func TestDecide_FullTaxonomyFoldsIntoADecision(t *testing.T) {
 		t.Fatalf("ok=%v err=%v", ok, err)
 	}
 	want := decision.Decision{
-		Module:         decision.Scored{Value: "calendar", Confidence: 0.82},
-		Intent:         decision.Scored{Value: "show", Confidence: 0.82},
-		Interaction:    decision.InteractionQuestion,
-		Reference:      &decision.Reference{Kind: "happening"},
-		RequiredScopes: []string{"calendar"},
-		RequiredData:   []string{"relevant_happenings"},
-		Presentation:   "day_calendar",
-		NeedsLLM:       true,
-		Calibrated:     true,
-		Model:          "jev-1.13.0",
-		Scores:         map[string]float64{"calendar/show": 0.9, "calendar/create": 0.05, "contacts/find": 0.03, "other": 0.02},
+		Module:                decision.Scored{Value: "calendar", Confidence: 0.82},
+		Intent:                decision.Scored{Value: "show", Confidence: 0.82},
+		Interaction:           decision.InteractionQuestion,
+		InteractionConfidence: 0.9,
+		Reference:             &decision.Reference{Kind: "happening"},
+		RequiredScopes:        []string{"calendar"},
+		RequiredData:          []string{"relevant_happenings"},
+		Presentation:          "day_calendar",
+		NeedsLLM:              true,
+		Calibrated:            true,
+		Model:                 "jev-1.13.0",
+		Scores:                map[string]float64{"calendar/show": 0.9, "calendar/create": 0.05, "contacts/find": 0.03, "other": 0.02},
 	}
 	if !reflect.DeepEqual(dec, want) {
 		t.Fatalf("decision = %+v\nwant       %+v", dec, want)
@@ -175,10 +176,9 @@ func TestDecide_StateCarriesTitlesRecentAndContext(t *testing.T) {
 }
 
 // The interaction is never assumed: the question is asked on an empty state
-// too, and the model's top option is the Interaction (the Decision has no
-// per-interaction confidence, so even a doubtful one is used).
-func TestDecide_InteractionIsAlwaysAskedAndTheTopOptionIsUsed(t *testing.T) {
-	d := &fakeDoer{body: response(append(baseAnswers(), choiceJSON("interaction", "chat", 0.1, `"chat":0.4,"question":0.35,"command":0.25`))...)}
+// too, and it is used only when the selection policy selects it.
+func TestDecide_InteractionIsAskedAndUsedOnlyWhenSelected(t *testing.T) {
+	d := &fakeDoer{body: response(append(baseAnswers(), choiceJSON("interaction", "chat", 0.9, `"chat":0.9,"question":0.07,"command":0.03`))...)}
 	dec, ok, err := newClient(t, d).Decide(context.Background(), decideRequest())
 	if err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
@@ -187,8 +187,68 @@ func TestDecide_InteractionIsAlwaysAskedAndTheTopOptionIsUsed(t *testing.T) {
 	if !asked || len(q["criteria"].(map[string]any)) != len(interactionOrder) {
 		t.Fatalf("the interaction question must be asked on an empty state: %v", q)
 	}
-	if dec.Interaction != decision.InteractionChat {
-		t.Fatalf("interaction = %q", dec.Interaction)
+	if dec.Interaction != decision.InteractionChat || dec.InteractionConfidence != 0.9 {
+		t.Fatalf("interaction = %q (%.2f)", dec.Interaction, dec.InteractionConfidence)
+	}
+}
+
+// A doubtful interaction is not used: the provider abstains, so a confident
+// intent never reaches a caller carrying a guessed interaction. The probed case:
+// intent 0.97, but the top interaction option is `confirmation` at p=0.19 with
+// confidence 0.04, which a downstream client would map to "confirm the pending
+// action".
+func TestDecide_AnUnselectedInteractionAbstains(t *testing.T) {
+	doubtful := map[string]string{
+		"low confidence":    choiceJSON("interaction", "chat", 0.1, `"chat":0.4,"question":0.35,"command":0.25`),
+		"narrow gap":        choiceJSON("interaction", "chat", 0.9, `"chat":0.45,"question":0.4,"command":0.15`),
+		"the probed answer": choiceJSON("interaction", "confirmation", 0.04, `"confirmation":0.19,"question":0.18,"command":0.18,"chat":0.15,"rejection":0.1,"correction":0.05,"continuation":0.05,"cancellation":0.05,"undo":0.05`),
+	}
+	for name, ia := range doubtful {
+		t.Run(name, func(t *testing.T) {
+			body := response(append(baseAnswers(), ia)...)
+			dec, ok, err := newClient(t, &fakeDoer{body: body}).Decide(context.Background(), decideRequest())
+			if ok || err != nil || !reflect.DeepEqual(dec, decision.Decision{}) {
+				t.Fatalf("dec=%+v ok=%v err=%v", dec, ok, err)
+			}
+			// Under a durable chain the answer is no more actionable than before.
+			pol := decision.DurablePolicy()
+			d, ok, tr := decision.Chain{Providers: []decision.Provider{newClient(t, &fakeDoer{body: body})}, Policy: &pol}.Decide(context.Background(), decideRequest())
+			if ok || d.Interaction != "" || tr.Attempts[0].Outcome != decision.AttemptAbstained {
+				t.Fatalf("chain: ok=%v d=%+v tr=%+v", ok, d, tr)
+			}
+		})
+	}
+}
+
+// An interaction that acts on a pending or previous action (a "yes", a "no", a
+// correction, a cancellation, an undo) is a side effect when wrong, so it must
+// clear the durable bar even under the looser narrowing policy.
+func TestDecide_SideEffectfulInteractionsNeedTheDurableBar(t *testing.T) {
+	for _, top := range []decision.Interaction{decision.InteractionConfirmation, decision.InteractionRejection,
+		decision.InteractionCorrection, decision.InteractionCancellation, decision.InteractionUndo} {
+		t.Run(string(top), func(t *testing.T) {
+			// Clear under narrowing (0.8 confidence, 0.7 gap), short of durable's 0.90.
+			mid := response(append(baseAnswers(), choiceJSON("interaction", string(top), 0.8, `"`+string(top)+`":0.85,"command":0.15`))...)
+			if dec, ok, err := newClient(t, &fakeDoer{body: mid}).Decide(context.Background(), decideRequest()); ok || err != nil {
+				t.Fatalf("a %s at 0.80 must abstain: %+v ok=%v err=%v", top, dec, ok, err)
+			}
+			high := response(append(baseAnswers(), choiceJSON("interaction", string(top), 0.97, `"`+string(top)+`":0.97,"command":0.03`))...)
+			dec, ok, err := newClient(t, &fakeDoer{body: high}).Decide(context.Background(), decideRequest())
+			if err != nil || !ok || dec.Interaction != top || dec.InteractionConfidence != 0.97 {
+				t.Fatalf("dec=%+v ok=%v err=%v", dec, ok, err)
+			}
+		})
+	}
+	// A harmless interaction needs only the configured policy.
+	mid := response(append(baseAnswers(), choiceJSON("interaction", "chat", 0.8, `"chat":0.85,"command":0.15`))...)
+	if dec, ok, err := newClient(t, &fakeDoer{body: mid}).Decide(context.Background(), decideRequest()); !ok || err != nil || dec.Interaction != decision.InteractionChat {
+		t.Fatalf("dec=%+v ok=%v err=%v", dec, ok, err)
+	}
+	// The configured policy is honoured: durable rejects the same harmless 0.8.
+	c := newClient(t, &fakeDoer{body: mid})
+	c.SetPolicy(decision.DurablePolicy())
+	if _, ok, err := c.Decide(context.Background(), decideRequest()); ok || err != nil {
+		t.Fatalf("ok=%v err=%v", ok, err)
 	}
 }
 
@@ -197,6 +257,16 @@ func TestDecide_AnInteractionOutsideTheEnumIsABadResponse(t *testing.T) {
 	_, _, err := newClient(t, d).Decide(context.Background(), decideRequest())
 	if !errors.Is(err, ErrBadResponse) || strings.Contains(err.Error(), "SECRET-ECHO") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// The probabilities decide, not the `choice` field: a top probability outside
+// the enum is as bad a response as a top choice outside it.
+func TestDecide_AnInteractionWhoseTopProbabilityIsOutsideTheEnumIsABadResponse(t *testing.T) {
+	d := &fakeDoer{body: response(append(baseAnswers(), choiceJSON("interaction", "chat", 0.9, `"SECRET-ECHO":0.9,"chat":0.1`))...)}
+	_, ok, err := newClient(t, d).Decide(context.Background(), decideRequest())
+	if ok || !errors.Is(err, ErrBadResponse) || strings.Contains(err.Error(), "SECRET-ECHO") {
+		t.Fatalf("ok=%v err=%v", ok, err)
 	}
 }
 

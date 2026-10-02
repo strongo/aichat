@@ -34,6 +34,7 @@ package decision
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -77,7 +78,13 @@ type Decision struct {
 	Module      Scored      `json:"module"`
 	Intent      Scored      `json:"intent"`
 	Interaction Interaction `json:"interaction"`
-	Reference   *Reference  `json:"reference,omitempty"`
+	// InteractionConfidence is the engine's own confidence in Interaction, in
+	// [0,1], when the engine reports one (0 otherwise). It is additive:
+	// Interaction is only ever set from an answer the engine's selection policy
+	// selected, so a caller need not threshold it, but it may apply a stricter
+	// bar of its own to an interaction that acts on a pending action.
+	InteractionConfidence float64    `json:"interactionConfidence,omitempty"`
+	Reference             *Reference `json:"reference,omitempty"`
 	// RequiredScopes is the MINIMUM context needed. It does not mean other
 	// cached scopes must be dropped; see package ctxmgr.
 	RequiredScopes []string `json:"requiredScopes,omitempty"`
@@ -98,27 +105,27 @@ type Decision struct {
 	// self-reported confidence. A SelectionPolicy is applied only to
 	// calibrated scores.
 	Calibrated bool `json:"calibrated,omitempty"`
-	// Outcome is set by Chain when it has a SelectionPolicy: the policy's
-	// verdict. A caller that cannot rule out a chain with KeepNonSelected MUST
-	// act only on a decision for which Actionable is true.
+	// Outcome is the policy's verdict, set by a Chain with a SelectionPolicy and
+	// by an engine built with a policy. A caller that cannot rule out a chain
+	// with KeepNonSelected, or that calls an engine directly, MUST act only on a
+	// decision for which Actionable is true.
 	Outcome Outcome `json:"outcome,omitempty"`
 	// Model is the model id the engine reported for this decision ("" when it
 	// reports none). Thresholds only hold for the model they were measured on.
 	Model string `json:"model,omitempty"`
 }
 
-// Actionable reports whether a caller may act on d: it has no policy verdict
-// (a chain without a Policy, whose answers passed MinConfidence), or the verdict
-// is OutcomeSelected, or OutcomeUnscored (an engine that gives no calibrated
-// probabilities, accepted by the confidence floor). An uncertain or "none"
-// decision, which only a KeepNonSelected chain returns, is not actionable.
+// Actionable reports whether a caller may act on d. The rule is one and
+// explicit, the same as Selection.Actionable: a policy selected a calibrated
+// answer (OutcomeSelected) or explicitly accepted an uncalibrated one at its
+// stated bar (OutcomeAccepted, SelectionPolicy.AcceptUncalibratedAt). Uncertain,
+// none and unscored decisions are not actionable. The one other actionable
+// state is the empty Outcome, which means NO policy judged d: the answer of a
+// Chain without a Policy, whose own MinConfidence is then the caller's explicit
+// bar. Every engine built with a policy (compose.WithPolicy) and every Chain with
+// a Policy sets an Outcome, so a decision is never actionable by omission.
 func (d Decision) Actionable() bool {
-	switch d.Outcome {
-	case "", OutcomeSelected, OutcomeUnscored:
-		return true
-	default:
-		return false
-	}
+	return d.Outcome == "" || d.Outcome.Actionable()
 }
 
 // ModuleSpec declares a product module and its intents.
@@ -253,13 +260,56 @@ func Validate(d Decision, t Taxonomy) error {
 
 // Attempt records one provider's outcome for diagnostics.
 type Attempt struct {
-	Provider string        `json:"provider"`
-	Outcome  string        `json:"outcome"` // see the Attempt* constants
-	Detail   string        `json:"detail,omitempty"`
-	Latency  time.Duration `json:"latency"`
+	Provider string `json:"provider"`
+	Outcome  string `json:"outcome"` // see the Attempt* constants
+	Detail   string `json:"detail,omitempty"`
+	// Latency is the wall-clock time the attempt took. On the wire it is the
+	// integer "latencyMs" (milliseconds, rounded down); a reader that still sees
+	// the legacy "latency" field (nanoseconds, the encoding of a Go duration) uses
+	// it only when "latencyMs" is absent, and the encoder still writes it, so
+	// readers of either vintage work. See Attempt.MarshalJSON.
+	Latency time.Duration `json:"-"`
 	// Role is the engine's part in a combinator: "primary", "backup" or
 	// "racer"; empty for a plain chain provider.
 	Role string `json:"role,omitempty"`
+	// Usage is what THIS attempt consumed, when its engine reported it (a scored
+	// call answered by the engine). A hedged or fallen-back call has several
+	// attempts, each possibly billed, so metering per engine needs the per-attempt
+	// figure, not only the answering engine's ScoreResult.Usage. An attempt that
+	// reported none (a cancelled loser, a failure) carries nil, not zero: its true
+	// cost is unknown.
+	Usage *Usage `json:"usage,omitempty"`
+}
+
+// attemptWire is the JSON form of an Attempt.
+type attemptWire struct {
+	Provider  string        `json:"provider"`
+	Outcome   string        `json:"outcome"`
+	Detail    string        `json:"detail,omitempty"`
+	Latency   time.Duration `json:"latency"` // legacy, nanoseconds
+	LatencyMs *int64        `json:"latencyMs,omitempty"`
+	Role      string        `json:"role,omitempty"`
+	Usage     *Usage        `json:"usage,omitempty"`
+}
+
+// MarshalJSON writes Latency as the integer "latencyMs" and, for readers that
+// predate it, as the legacy "latency" in nanoseconds.
+func (a Attempt) MarshalJSON() ([]byte, error) {
+	ms := a.Latency.Milliseconds()
+	return json.Marshal(attemptWire{a.Provider, a.Outcome, a.Detail, a.Latency, &ms, a.Role, a.Usage})
+}
+
+// UnmarshalJSON reads "latencyMs" when present, else the legacy "latency".
+func (a *Attempt) UnmarshalJSON(b []byte) error {
+	var w attemptWire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	*a = Attempt{Provider: w.Provider, Outcome: w.Outcome, Detail: w.Detail, Latency: w.Latency, Role: w.Role, Usage: w.Usage}
+	if w.LatencyMs != nil {
+		a.Latency = time.Duration(*w.LatencyMs) * time.Millisecond
+	}
+	return nil
 }
 
 // Trace is the chain's diagnostic record.
@@ -311,10 +361,11 @@ type Chain struct {
 	// does without a policy. A nil Policy keeps the legacy MinConfidence
 	// behaviour exactly.
 	Policy *SelectionPolicy
-	// KeepNonSelected, with a Policy, makes an uncertain or "none" answer stop
-	// the chain and be returned with ok=true and Decision.Outcome set, so a
-	// caller can show "not sure" instead of escalating. It is off by default
-	// because ok=true is then not enough to act on: check Decision.Actionable.
+	// KeepNonSelected makes a non-actionable answer (uncertain, "none",
+	// unscored) stop the chain and be returned with ok=true and Decision.Outcome
+	// set, so a caller can show "not sure" instead of escalating. It is off by
+	// default because ok=true is then not enough to act on: check
+	// Decision.Actionable.
 	KeepNonSelected bool
 }
 
@@ -367,6 +418,10 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 			a.Outcome, a.Detail = AttemptUnavailable, err.Error()
 		case err != nil && errors.Is(err, ErrAuth):
 			a.Outcome, a.Detail = AttemptAuth, err.Error()
+		case err != nil && errors.Is(err, ErrQuota):
+			a.Outcome, a.Detail = AttemptQuota, err.Error()
+		case err != nil && errors.Is(err, ErrMisconfigured):
+			a.Outcome, a.Detail = AttemptMisconfigured, err.Error()
 		case err != nil && errors.Is(err, ErrInvalidRequest):
 			a.Outcome, a.Detail = AttemptRejected, err.Error()
 		case err != nil && timedOut:
@@ -404,27 +459,35 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 	return Decision{}, false, tr
 }
 
-// judge classifies a provider's answer: invalid, rejected by the confidence
-// floor, or decided. With a SelectionPolicy set and calibrated scores present,
-// the policy alone owns the floor: a selected answer is "decided"; any other
-// verdict is recorded as "uncertain" and the chain falls through, unless
-// KeepNonSelected makes it "decided" for the caller to read Decision.Outcome.
-// Without scores the legacy MinConfidence floor still applies and, under a
-// policy, the outcome is OutcomeUnscored.
+// judge classifies a provider's answer: invalid, rejected, or decided. With a
+// SelectionPolicy set the policy alone owns the bar (EvaluateDecision): a
+// calibrated answer is judged by its probabilities, an uncalibrated one is
+// accepted only if the policy opts in (AcceptUncalibratedAt) and is unscored,
+// not actionable, otherwise. An actionable verdict is "decided"; any other is
+// recorded as "uncertain" and the chain falls through, unless KeepNonSelected
+// makes it "decided" for the caller to read Decision.Outcome. Without a policy
+// the MinConfidence floor is the bar; a provider that returned an explicit
+// uncertain or none verdict of its own (an engine built with a policy) is still
+// honoured, never acted on by omission.
 func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decision, Attempt) {
 	if verr := Validate(d, req.Taxonomy); verr != nil {
 		a.Outcome, a.Detail = AttemptInvalid, InvalidDetail(verr)
 		return d, a
 	}
-	if c.Policy != nil && d.Calibrated && len(d.Scores) > 0 {
+	if c.Policy != nil {
 		sel := c.Policy.EvaluateDecision(d)
 		d.Outcome = sel.Outcome
-		a.Detail = string(sel.Outcome)
-		if sel.Reason != "" {
-			a.Detail += ": " + sel.Reason
-		}
+		a.Detail = verdictDetail(sel)
 		a.Outcome = AttemptUncertain
-		if sel.Outcome == OutcomeSelected || c.KeepNonSelected {
+		if sel.Actionable() || c.KeepNonSelected {
+			a.Outcome = AttemptDecided
+		}
+		return d, a
+	}
+	if d.Outcome == OutcomeUncertain || d.Outcome == OutcomeNone {
+		a.Detail = string(d.Outcome)
+		a.Outcome = AttemptUncertain
+		if c.KeepNonSelected {
 			a.Outcome = AttemptDecided
 		}
 		return d, a
@@ -435,10 +498,15 @@ func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decis
 		return d, a
 	}
 	a.Outcome = AttemptDecided
-	if c.Policy != nil {
-		d.Outcome = OutcomeUnscored
-	}
 	return d, a
+}
+
+// verdictDetail is the trace text of a policy verdict.
+func verdictDetail(sel Selection) string {
+	if sel.Reason == "" {
+		return string(sel.Outcome)
+	}
+	return string(sel.Outcome) + ": " + sel.Reason
 }
 
 // MergeReport returns the attempts to record for a TracedProvider: the engines
@@ -455,6 +523,9 @@ func MergeReport(rep Report, judged Attempt, answered bool) []Attempt {
 		for i := len(out) - 1; i >= 0; i-- {
 			if out[i].Provider == rep.Engine && out[i].Outcome == AttemptDecided {
 				out[i].Outcome, out[i].Detail = judged.Outcome, judged.Detail
+				if out[i].Usage == nil {
+					out[i].Usage = judged.Usage
+				}
 				break
 			}
 		}

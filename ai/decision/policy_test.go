@@ -155,14 +155,14 @@ func TestPolicy_UncalibratedIsAProposalNeverASelection(t *testing.T) {
 	a := choice(0.99, "", Score{"a", 0.99}, Score{"b", 0.01})
 	a.Calibrated = false
 	sel := NarrowingPolicy().Evaluate(a)
-	if sel.Outcome != OutcomeUnscored || sel.Reason != ReasonNotCalibrated || !sel.Proposal ||
-		!reflect.DeepEqual(sel.Picks, []string{"a"}) || len(sel.Strong) != 0 || sel.Actionable() {
+	if sel.Outcome != OutcomeUnscored || sel.Reason != ReasonNotCalibrated || len(sel.Picks) != 0 ||
+		!reflect.DeepEqual(sel.Proposals, []string{"a"}) || len(sel.Strong) != 0 || sel.Actionable() {
 		t.Fatalf("choice: %+v", sel)
 	}
 	// A choice whose top candidate is "none of these" proposes nothing.
 	n := choice(0.9, "none", Score{"none", 0.8}, Score{"a", 0.2})
 	n.Calibrated = false
-	if sel := NarrowingPolicy().Evaluate(n); !sel.Proposal || len(sel.Picks) != 0 {
+	if sel := NarrowingPolicy().Evaluate(n); len(sel.Proposals) != 0 || len(sel.Picks) != 0 || sel.Actionable() {
 		t.Fatalf("none: %+v", sel)
 	}
 	// Relevance proposes every candidate at or above MinProbability, best first,
@@ -170,19 +170,19 @@ func TestPolicy_UncalibratedIsAProposalNeverASelection(t *testing.T) {
 	r := relevance(Score{"x", 0.95}, Score{"y", 0.7}, Score{"z", 0.2}, Score{"w", 0.65})
 	r.Calibrated = false
 	p := NarrowingPolicy()
-	if sel := p.Evaluate(r); sel.Outcome != OutcomeUnscored || !reflect.DeepEqual(sel.Picks, []string{"x", "y", "w"}) || len(sel.Strong) != 0 || len(sel.Potential) != 0 {
+	if sel := p.Evaluate(r); sel.Outcome != OutcomeUnscored || len(sel.Picks) != 0 || !reflect.DeepEqual(sel.Proposals, []string{"x", "y", "w"}) || len(sel.Strong) != 0 || len(sel.Potential) != 0 {
 		t.Fatalf("relevance: %+v", sel)
 	}
 	p.MaxPicks = 2
-	if sel := p.Evaluate(r); !reflect.DeepEqual(sel.Picks, []string{"x", "y"}) {
+	if sel := p.Evaluate(r); !reflect.DeepEqual(sel.Proposals, []string{"x", "y"}) {
 		t.Fatalf("capped: %+v", sel)
 	}
 	r.Calibrated = true
-	if sel := p.Evaluate(r); !sel.Actionable() || sel.Proposal {
+	if sel := p.Evaluate(r); !sel.Actionable() || len(sel.Proposals) != 0 {
 		t.Fatalf("calibrated: %+v", sel)
 	}
 	// No scores at all: nothing to propose.
-	if sel := p.Evaluate(Answer{Kind: KindChoice}); sel.Outcome != OutcomeUnscored || sel.Proposal || len(sel.Picks) != 0 {
+	if sel := p.Evaluate(Answer{Kind: KindChoice}); sel.Outcome != OutcomeUnscored || len(sel.Proposals) != 0 || len(sel.Picks) != 0 {
 		t.Fatalf("empty: %+v", sel)
 	}
 }

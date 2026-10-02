@@ -3,8 +3,6 @@ package typesafe
 import (
 	"errors"
 	"fmt"
-	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -115,18 +113,4 @@ func kindForStatus(status int) error {
 	default:
 		return ErrUnexpectedStatus
 	}
-}
-
-// parseRetryAfter reads a Retry-After header: a number of seconds or an HTTP
-// date (relative to now). It returns 0 for a missing, malformed, negative or
-// past value, and never more than decision.MaxRetryDelay.
-func parseRetryAfter(v string, now time.Time) time.Duration {
-	v = strings.TrimSpace(v)
-	var d time.Duration
-	if secs, err := strconv.Atoi(v); err == nil {
-		d = time.Duration(min(secs, int(decision.MaxRetryDelay/time.Second)+1)) * time.Second
-	} else if t, err := http.ParseTime(v); err == nil {
-		d = t.Sub(now)
-	}
-	return min(max(d, 0), decision.MaxRetryDelay)
 }

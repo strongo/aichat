@@ -131,7 +131,7 @@ func TestScore_CalibratedNeedsBothTheAnswerAndTheResponse(t *testing.T) {
 		}
 	}
 	sel := decision.NarrowingPolicy().Evaluate(res.Answers["needed"])
-	if sel.Outcome != decision.OutcomeUnscored || !sel.Proposal {
+	if sel.Outcome != decision.OutcomeUnscored || len(sel.Picks) != 0 || len(sel.Proposals) == 0 {
 		t.Fatalf("selection = %+v", sel)
 	}
 }

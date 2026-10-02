@@ -93,10 +93,10 @@ func TestScore_UncalibratedScoresBecomeAProposalUnderTheNarrowingPolicy(t *testi
 	}
 	pol := decision.NarrowingPolicy()
 	sel := pol.Evaluate(res.Answers["needed"])
-	if sel.Outcome != decision.OutcomeUnscored || !sel.Proposal || sel.Actionable() || !reflect.DeepEqual(sel.Picks, []string{"loans", "members"}) {
+	if sel.Outcome != decision.OutcomeUnscored || sel.Actionable() || len(sel.Picks) != 0 || !reflect.DeepEqual(sel.Proposals, []string{"loans", "members"}) {
 		t.Fatalf("relevance: %+v", sel)
 	}
-	if sel := pol.Evaluate(res.Answers["primary"]); !sel.Proposal || !reflect.DeepEqual(sel.Picks, []string{"loans"}) {
+	if sel := pol.Evaluate(res.Answers["primary"]); len(sel.Picks) != 0 || !reflect.DeepEqual(sel.Proposals, []string{"loans"}) {
 		t.Fatalf("choice: %+v", sel)
 	}
 }

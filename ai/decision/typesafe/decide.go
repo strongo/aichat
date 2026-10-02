@@ -84,8 +84,16 @@ type decidePlan struct {
 //     policy selects it;
 //   - one Choice over presentations plus "none" -> Presentation, same rule;
 //   - one Choice over the Interaction enum, always asked (Validate requires a
-//     known value, and no value is assumed): the Decision has no per-interaction
-//     confidence, so Interaction is the model's top option. A choose:<role>
+//     known value, and no value is assumed). It goes through the selection
+//     policy like every other Choice: only a SELECTED option becomes
+//     Interaction (with InteractionConfidence), and an interaction that acts on
+//     a pending or previous action (confirmation, rejection, correction,
+//     cancellation, undo) must clear the stricter of the policy and
+//     decision.DurablePolicy, because a wrong "yes" is a side effect. When the
+//     policy does not select the interaction the provider ABSTAINS (ok=false,
+//     no error): a confident intent must not reach a caller carrying a guessed
+//     turn kind, and an abstention hands the turn to the next provider or the
+//     product's main-LLM path, which classify it themselves. A choose:<role>
 //     request is one closed question by construction and has Interaction
 //     "question".
 //
@@ -298,16 +306,51 @@ func (c *Client) fold(req decision.Request, p decidePlan, resp *AskResponse) (de
 		}
 	}
 	if p.interact {
-		v, err := choiceAnswer(resp, "interaction")
-		if err != nil {
+		it, conf, ok, err := selectedInteraction(resp, pol)
+		if err != nil || !ok {
 			return decision.Decision{}, false, err
 		}
-		if !slices.Contains(interactionOrder, decision.Interaction(v.top)) {
-			return decision.Decision{}, false, fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
-		}
-		d.Interaction = decision.Interaction(v.top)
+		d.Interaction, d.InteractionConfidence = it, conf
 	}
 	return d, true, nil
+}
+
+// sideEffectful lists the interactions that act on a pending or previous
+// action: when wrong they are a side effect (confirming, cancelling or undoing
+// something the user never meant), so they need the durable bar.
+var sideEffectful = map[decision.Interaction]bool{
+	decision.InteractionConfirmation: true,
+	decision.InteractionRejection:    true,
+	decision.InteractionCorrection:   true,
+	decision.InteractionCancellation: true,
+	decision.InteractionUndo:         true,
+}
+
+// selectedInteraction runs the interaction Choice through the selection policy.
+// It returns the interaction and its confidence when the policy selects it, and
+// ok=false (no error) when it does not. An answer outside the enum is
+// ErrBadResponse, whatever the policy says.
+func selectedInteraction(resp *AskResponse, pol decision.SelectionPolicy) (decision.Interaction, float64, bool, error) {
+	v, err := choiceAnswer(resp, "interaction")
+	if err != nil {
+		return "", 0, false, err
+	}
+	if !slices.Contains(interactionOrder, decision.Interaction(v.top)) {
+		return "", 0, false, fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
+	}
+	ans := v.asAnswer("interaction")
+	sel := pol.Evaluate(ans)
+	if sel.Outcome != decision.OutcomeSelected {
+		return "", 0, false, nil
+	}
+	top := decision.Interaction(sel.Picks[0])
+	if !slices.Contains(interactionOrder, top) {
+		return "", 0, false, fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
+	}
+	if sideEffectful[top] && pol.AtLeast(decision.DurablePolicy()).Evaluate(ans).Outcome != decision.OutcomeSelected {
+		return "", 0, false, nil
+	}
+	return top, v.confidence, true, nil
 }
 
 type choiceView struct {
@@ -315,6 +358,17 @@ type choiceView struct {
 	confidence    float64
 	probabilities map[string]float64
 	answer        Answer
+}
+
+// asAnswer views the choice as a calibrated decision.Answer for the policy.
+func (v choiceView) asAnswer(key string) decision.Answer {
+	scores := make([]decision.Score, 0, len(v.probabilities))
+	for id, p := range v.probabilities {
+		scores = append(scores, decision.Score{ID: id, Probability: p})
+	}
+	ans := decision.NewAnswer(key, decision.KindChoice, scores)
+	ans.Calibrated, ans.HasConfidence, ans.Confidence = true, true, v.confidence
+	return ans
 }
 
 func choiceAnswer(resp *AskResponse, key string) (choiceView, error) {
@@ -332,12 +386,8 @@ func selectedChoice(resp *AskResponse, key, none string, pol decision.SelectionP
 	if err != nil {
 		return "", false, err
 	}
-	scores := make([]decision.Score, 0, len(v.probabilities))
-	for id, p := range v.probabilities {
-		scores = append(scores, decision.Score{ID: id, Probability: p})
-	}
-	ans := decision.NewAnswer(key, decision.KindChoice, scores)
-	ans.Calibrated, ans.HasConfidence, ans.Confidence, ans.NoneID = true, true, v.confidence, none
+	ans := v.asAnswer(key)
+	ans.NoneID = none
 	sel := pol.Evaluate(ans)
 	if sel.Outcome != decision.OutcomeSelected {
 		return "", false, nil

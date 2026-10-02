@@ -164,7 +164,7 @@ func TestErrors_RetryAfterInBothFormsAndCapped(t *testing.T) {
 		httpDate(90 * time.Second): 90 * time.Second, httpDate(-time.Hour): 0, httpDate(48 * time.Hour): decision.MaxRetryDelay,
 	}
 	for v, want := range cases {
-		if got := parseRetryAfter(v, base); got != want {
+		if got := decision.ParseRetryAfter(v, base); got != want {
 			t.Errorf("%q: %v, want %v", v, got, want)
 		}
 	}

@@ -404,7 +404,7 @@ func newAPIError(resp *http.Response, body []byte, now time.Time) *APIError {
 	e := &APIError{
 		Status:     resp.StatusCode,
 		RequestID:  resp.Header.Get("x-typesafe-request-id"),
-		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), now),
+		RetryAfter: decision.ParseRetryAfter(resp.Header.Get("Retry-After"), now),
 		kind:       kindForStatus(resp.StatusCode),
 	}
 	var shape struct {

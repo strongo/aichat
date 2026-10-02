@@ -13,8 +13,16 @@ import (
 // candidates or none.
 //
 // A policy is applied only to CALIBRATED answers. An uncalibrated answer gets
-// OutcomeUnscored whatever its numbers say, with a PROPOSAL in Selection.Picks
-// (see Evaluate) that is never a selection.
+// OutcomeUnscored whatever its numbers say, with a PROPOSAL in
+// Selection.Proposals (see Evaluate) that is never a selection. The one
+// exception is a Decision (EvaluateDecision) under a policy whose
+// AcceptUncalibratedAt is set: that opt-in names the self-reported confidence
+// at which an uncalibrated decision is accepted (OutcomeAccepted).
+//
+// There is ONE rule for "may a caller act on this": Selection.Actionable and
+// Decision.Actionable are true for a calibrated selection (selected, several)
+// and for an explicitly accepted uncalibrated decision (accepted), and for
+// nothing else.
 //
 // Use NarrowingPolicy or DurablePolicy, or build a value and Validate it. The
 // zero value is invalid (it would select everything): Validate rejects it, and
@@ -43,6 +51,19 @@ type SelectionPolicy struct {
 	// MaxPicks caps how many candidates are selected (0 = no cap). When the cap
 	// bites, the best are kept and the reason says so.
 	MaxPicks int `json:"maxPicks,omitempty"`
+
+	// AcceptUncalibratedAt is the explicit opt-in to acting on an UNCALIBRATED
+	// decision (an LLM emulator's self-reported confidence, a deterministic
+	// rule): a Decision whose Module and Intent confidences are both at or above
+	// it is accepted (OutcomeAccepted, actionable); anything lower is unscored.
+	// 0 (the zero value) means never: an uncalibrated decision is then only a
+	// non-actionable proposal. It applies to decisions only; an uncalibrated
+	// answer to a scored question is always a proposal (see Selection.Proposals).
+	// DurablePolicy leaves it off; NarrowingPolicy sets it to
+	// NarrowingAcceptUncalibratedAt. Without this opt-in, a calibrated engine
+	// that goes down would silently lower the bar from the calibrated threshold
+	// to an LLM's self-reported number.
+	AcceptUncalibratedAt float64 `json:"acceptUncalibratedAt,omitempty"`
 }
 
 // Documented defaults of the two named policies. They are PROVISIONAL: they come
@@ -60,6 +81,11 @@ const (
 	NarrowingMinProbability       = 0.60
 	NarrowingStrongProbability    = 0.85
 	NarrowingPotentialProbability = 0.30
+	// NarrowingAcceptUncalibratedAt is the self-reported confidence at which an
+	// uncalibrated decision is accepted under the narrowing policy: the same 0.70
+	// floor decision.Chain applies without a policy. A decision acted on at that
+	// bar is a proposal for narrowing the work, never durable knowledge.
+	NarrowingAcceptUncalibratedAt = 0.70
 
 	// Durable policy: answers that will be stored and reused as fact. The bar
 	// is higher; callers should still add a deterministic check
@@ -69,6 +95,9 @@ const (
 	DurableMinProbability       = 0.90
 	DurableStrongProbability    = 0.95
 	DurablePotentialProbability = 0.60
+	// DurableAcceptUncalibratedAt is 0: the durable policy never acts on an
+	// uncalibrated decision. A product that must may set AcceptUncalibratedAt.
+	DurableAcceptUncalibratedAt = 0
 )
 
 // NarrowingPolicy is the default policy for narrowing a set of candidates.
@@ -80,6 +109,7 @@ func NarrowingPolicy() SelectionPolicy {
 		MinProbability:       NarrowingMinProbability,
 		StrongProbability:    NarrowingStrongProbability,
 		PotentialProbability: NarrowingPotentialProbability,
+		AcceptUncalibratedAt: NarrowingAcceptUncalibratedAt,
 	}
 }
 
@@ -92,13 +122,40 @@ func DurablePolicy() SelectionPolicy {
 		MinProbability:       DurableMinProbability,
 		StrongProbability:    DurableStrongProbability,
 		PotentialProbability: DurablePotentialProbability,
+		AcceptUncalibratedAt: DurableAcceptUncalibratedAt,
 	}
+}
+
+// AtLeast returns a policy at least as strict as both p and o: each threshold
+// is the larger of the two, MaxPicks the smaller non-zero cap, and an
+// uncalibrated decision is accepted only when BOTH accept it (the larger bar,
+// and never when either never does). Its name is p's with "+strict" appended.
+func (p SelectionPolicy) AtLeast(o SelectionPolicy) SelectionPolicy {
+	r := p
+	r.Name += "+strict"
+	r.MinConfidence = max(p.MinConfidence, o.MinConfidence)
+	r.MinGap = max(p.MinGap, o.MinGap)
+	r.MinProbability = max(p.MinProbability, o.MinProbability)
+	r.StrongProbability = max(p.StrongProbability, o.StrongProbability)
+	r.PotentialProbability = max(p.PotentialProbability, o.PotentialProbability)
+	switch {
+	case p.MaxPicks == 0:
+		r.MaxPicks = o.MaxPicks
+	case o.MaxPicks != 0:
+		r.MaxPicks = min(p.MaxPicks, o.MaxPicks)
+	}
+	if p.AcceptUncalibratedAt <= 0 || o.AcceptUncalibratedAt <= 0 {
+		r.AcceptUncalibratedAt = 0
+	} else {
+		r.AcceptUncalibratedAt = max(p.AcceptUncalibratedAt, o.AcceptUncalibratedAt)
+	}
+	return r
 }
 
 // Validate reports a misconfigured policy: every threshold in [0,1],
 // MinConfidence and MinProbability above zero (so the zero value, which would
 // select everything, is invalid), thresholds ordered potential <= min <=
-// strong, and MaxPicks not negative.
+// strong, MaxPicks not negative and AcceptUncalibratedAt in [0,1].
 func (p SelectionPolicy) Validate() error {
 	var errs []error
 	check := func(name string, v float64) {
@@ -111,6 +168,7 @@ func (p SelectionPolicy) Validate() error {
 	check("minProbability", p.MinProbability)
 	check("strongProbability", p.StrongProbability)
 	check("potentialProbability", p.PotentialProbability)
+	check("acceptUncalibratedAt", p.AcceptUncalibratedAt)
 	if p.MinConfidence <= 0 || p.MinProbability <= 0 {
 		errs = append(errs, errors.New("minConfidence and minProbability must be above 0 (a zero threshold selects everything)"))
 	}
@@ -123,20 +181,22 @@ func (p SelectionPolicy) Validate() error {
 	return errors.Join(errs...)
 }
 
-// Selection is a policy's verdict on one Answer.
+// Selection is a policy's verdict on one Answer (or one Decision).
 type Selection struct {
 	Outcome Outcome `json:"outcome"`
-	// Picks are the selected candidate ids, best first (empty unless Selected
-	// or Several). When Proposal is true they are only a proposal.
+	// Picks are the candidate ids the policy SELECTED, best first: non-empty
+	// only for a calibrated selected or several verdict (and the decision key
+	// for an accepted decision). Code that sees len(Picks) > 0 may act on them;
+	// it never holds a proposal.
 	Picks []string `json:"picks,omitempty"`
-	// Proposal is true when Picks is a PROPOSAL from an engine that gives no
-	// calibrated probabilities (Outcome is OutcomeUnscored): for a relevance
-	// answer the candidates at or above MinProbability, for a choice its top
-	// candidate. It is never "strong", it never means the policy selected
-	// anything, and a caller may use it only where a wrong guess is cheap (for
-	// example choosing which candidates to examine first, with the full set as the
-	// fallback). Use Actionable to tell the two apart.
-	Proposal bool `json:"proposal,omitempty"`
+	// Proposals are the candidates an uncalibrated engine's self-reported numbers
+	// point at (OutcomeUnscored): for a relevance answer the candidates at or
+	// above MinProbability (capped by MaxPicks), for a choice answer its top
+	// candidate unless that is the NoneID. A proposal is never a selection; a
+	// caller may use it only where a wrong guess is cheap (for example choosing
+	// which candidates to examine first, with the full set as the fallback).
+	// Picks and Proposals are never both set.
+	Proposals []string `json:"proposals,omitempty"`
 	// Strong is the subset of Picks at or above the strong threshold
 	// (relevance answers only).
 	Strong []string `json:"strong,omitempty"`
@@ -146,15 +206,15 @@ type Selection struct {
 	// Reason is a short machine-readable explanation of a non-selected
 	// outcome, or of a truncation: not_calibrated, no_scores, none_of_these,
 	// low_confidence, narrow_gap, nothing_above_floor, only_potential,
-	// truncated_to_max_picks, invalid_policy.
+	// truncated_to_max_picks, invalid_policy, accepted_uncalibrated.
 	Reason string `json:"reason,omitempty"`
 }
 
-// Actionable reports whether the policy selected the answer: Outcome is
-// OutcomeSelected or OutcomeSeveral and Picks is not a proposal.
-func (s Selection) Actionable() bool {
-	return !s.Proposal && (s.Outcome == OutcomeSelected || s.Outcome == OutcomeSeveral)
-}
+// Actionable reports whether a caller may act on the verdict: the policy
+// selected a calibrated answer (OutcomeSelected, OutcomeSeveral) or accepted an
+// uncalibrated decision at its explicit bar (OutcomeAccepted). Decision.Actionable
+// applies the same rule.
+func (s Selection) Actionable() bool { return s.Outcome.Actionable() }
 
 // Reasons reported in Selection.Reason.
 const (
@@ -167,18 +227,21 @@ const (
 	ReasonOnlyPotential  = "only_potential"
 	ReasonTruncatedToMax = "truncated_to_max_picks"
 	ReasonInvalidPolicy  = "invalid_policy"
+	// ReasonAcceptedUncalibrated marks OutcomeAccepted: the policy's
+	// AcceptUncalibratedAt opt-in, not a calibrated selection.
+	ReasonAcceptedUncalibrated = "accepted_uncalibrated"
 )
 
 // Evaluate applies the policy to one answer.
 //
 // An invalid policy (see Validate) selects nothing: the outcome is
 // OutcomeUncertain with ReasonInvalidPolicy. An uncalibrated answer is
-// OutcomeUnscored with ReasonNotCalibrated and a PROPOSAL in Picks (Proposal is
-// true, Strong and Potential stay empty): a relevance answer proposes the
-// candidates at or above MinProbability (capped by MaxPicks), a choice answer
-// proposes its top candidate unless that is the NoneID. A proposal lets a caller
-// narrow a search space with an LLM engine's self-reported numbers; it is never
-// a selection.
+// OutcomeUnscored with ReasonNotCalibrated and a PROPOSAL in Proposals (Picks,
+// Strong and Potential stay empty): a relevance answer proposes the candidates
+// at or above MinProbability (capped by MaxPicks), a choice answer proposes its
+// top candidate unless that is the NoneID. A proposal lets a caller narrow a
+// search space with an LLM engine's self-reported numbers; it is never a
+// selection, and AcceptUncalibratedAt does not apply to it.
 func (p SelectionPolicy) Evaluate(a Answer) Selection {
 	if p.Validate() != nil {
 		return Selection{Outcome: OutcomeUncertain, Reason: ReasonInvalidPolicy}
@@ -202,20 +265,20 @@ func (p SelectionPolicy) Evaluate(a Answer) Selection {
 
 // propose builds the proposal for an uncalibrated answer.
 func (p SelectionPolicy) propose(a Answer, ranked []Score) Selection {
-	sel := Selection{Outcome: OutcomeUnscored, Reason: ReasonNotCalibrated, Proposal: true}
+	sel := Selection{Outcome: OutcomeUnscored, Reason: ReasonNotCalibrated}
 	if a.Kind == KindRelevance {
 		for _, s := range ranked {
 			if s.Probability >= p.MinProbability {
-				sel.Picks = append(sel.Picks, s.ID)
+				sel.Proposals = append(sel.Proposals, s.ID)
 			}
 		}
-		if p.MaxPicks > 0 && len(sel.Picks) > p.MaxPicks {
-			sel.Picks = sel.Picks[:p.MaxPicks]
+		if p.MaxPicks > 0 && len(sel.Proposals) > p.MaxPicks {
+			sel.Proposals = sel.Proposals[:p.MaxPicks]
 		}
 		return sel
 	}
 	if top := ranked[0]; top.ID != a.NoneID {
-		sel.Picks = []string{top.ID}
+		sel.Proposals = []string{top.ID}
 	}
 	return sel
 }
@@ -290,7 +353,39 @@ func answerOf(d Decision) Answer {
 	return a
 }
 
-// EvaluateDecision applies the policy to a Decision that carries Scores.
+// EvaluateDecision applies the policy to a Decision. A calibrated decision with
+// Scores is judged like a Choice (the policy's confidence and gap thresholds). A
+// decision the policy cannot judge by probabilities (uncalibrated, or calibrated
+// but without Scores) is OutcomeAccepted when AcceptUncalibratedAt is set and
+// both its Module and Intent confidences reach it (the module confidence is
+// exempt for a module-optional interaction, as in Chain), and OutcomeUnscored,
+// which is not actionable, otherwise. An invalid policy selects nothing.
 func (p SelectionPolicy) EvaluateDecision(d Decision) Selection {
-	return p.Evaluate(answerOf(d))
+	if p.Validate() != nil {
+		return Selection{Outcome: OutcomeUncertain, Reason: ReasonInvalidPolicy}
+	}
+	if d.Calibrated && len(d.Scores) > 0 {
+		return p.Evaluate(answerOf(d))
+	}
+	sel := Selection{Outcome: OutcomeUnscored, Reason: ReasonNotCalibrated}
+	if d.Calibrated {
+		sel.Reason = ReasonNoScores
+	}
+	switch {
+	case p.AcceptUncalibratedAt <= 0:
+	case lowConfidence(d, p.AcceptUncalibratedAt):
+		sel.Reason = ReasonLowConfidence
+	default:
+		sel.Outcome, sel.Reason = OutcomeAccepted, ReasonAcceptedUncalibrated
+		sel.Picks = []string{decisionKey(d)}
+	}
+	return sel
+}
+
+// decisionKey names a decision's pick as Decision.Scores does.
+func decisionKey(d Decision) string {
+	if d.Intent.Value == "" {
+		return d.Module.Value
+	}
+	return d.Module.Value + "/" + d.Intent.Value
 }

@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strings"
 )
 
 // Outcome is a SelectionPolicy's verdict on a scored answer. Callers act on
@@ -24,9 +25,23 @@ const (
 	OutcomeNone Outcome = "none"
 	// OutcomeUnscored: the engine produced no calibrated probabilities (an LLM
 	// emulator, a deterministic rule), so no threshold can be applied. The
-	// answer is a proposal, never a "clear winner by margin".
+	// answer is a proposal, never a "clear winner by margin", and it is NOT
+	// actionable.
 	OutcomeUnscored Outcome = "unscored"
+	// OutcomeAccepted: an UNCALIBRATED decision accepted because the caller's
+	// policy explicitly opted in (SelectionPolicy.AcceptUncalibratedAt) and its
+	// self-reported confidence reached that bar. It is actionable, and it is
+	// never a calibrated selection: Decision.Calibrated stays false.
+	OutcomeAccepted Outcome = "accepted"
 )
+
+// Actionable reports whether an outcome lets a caller act: a calibrated
+// selection (OutcomeSelected, OutcomeSeveral) or an explicitly accepted
+// uncalibrated decision (OutcomeAccepted). Uncertain, none and unscored are not.
+// The empty outcome (no policy ran) is not an Outcome; see Decision.Actionable.
+func (o Outcome) Actionable() bool {
+	return o == OutcomeSelected || o == OutcomeSeveral || o == OutcomeAccepted
+}
 
 // QuestionKind says how the probabilities of one Question relate to each other.
 type QuestionKind string
@@ -158,40 +173,48 @@ type TracedScorer interface {
 // ValidateScoreRequest checks req is well formed: at least one question, unique
 // non-empty question ids, a known kind, at least one candidate, unique
 // non-empty candidate ids, and a NoneID (if set) that names a candidate of a
-// KindChoice question.
+// KindChoice question. The error matches ErrInvalidRequest (the caller is at
+// fault, not the engine) and names problems by position (question 2, candidate
+// 3), never by id: ids are the caller's content, and an error ends up in traces
+// and logs.
 func ValidateScoreRequest(req ScoreRequest) error {
 	if len(req.Questions) == 0 {
-		return errors.New("no questions")
+		return fmt.Errorf("%w: no questions", ErrInvalidRequest)
 	}
-	var errs []error
+	var problems []string
+	add := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 	seenQ := map[string]bool{}
-	for _, q := range req.Questions {
+	for i, q := range req.Questions {
+		n := i + 1
 		if q.ID == "" {
-			errs = append(errs, errors.New("question id is required"))
+			add("question %d: id is required", n)
 		} else if seenQ[q.ID] {
-			errs = append(errs, fmt.Errorf("duplicate question id %q", q.ID))
+			add("question %d: duplicate question id", n)
 		}
 		seenQ[q.ID] = true
 		if q.Kind != KindChoice && q.Kind != KindRelevance {
-			errs = append(errs, fmt.Errorf("question %q: unknown kind %q", q.ID, q.Kind))
+			add("question %d: unknown kind", n)
 		}
 		if len(q.Candidates) == 0 {
-			errs = append(errs, fmt.Errorf("question %q: no candidates", q.ID))
+			add("question %d: no candidates", n)
 		}
 		seenC := map[string]bool{}
-		for _, c := range q.Candidates {
+		for j, c := range q.Candidates {
 			if c.ID == "" {
-				errs = append(errs, fmt.Errorf("question %q: candidate id is required", q.ID))
+				add("question %d: candidate %d: id is required", n, j+1)
 			} else if seenC[c.ID] {
-				errs = append(errs, fmt.Errorf("question %q: duplicate candidate %q", q.ID, c.ID))
+				add("question %d: candidate %d: duplicate candidate id", n, j+1)
 			}
 			seenC[c.ID] = true
 		}
 		if q.NoneID != "" && (q.Kind != KindChoice || !seenC[q.NoneID]) {
-			errs = append(errs, fmt.Errorf("question %q: noneId %q must name a candidate of a choice question", q.ID, q.NoneID))
+			add("question %d: noneId must name a candidate of a choice question", n)
 		}
 	}
-	return errors.Join(errs...)
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %d problem(s): %s", ErrInvalidRequest, len(problems), strings.Join(problems, "; "))
 }
 
 // ValidateScoreResult checks res answers every question of req with only
