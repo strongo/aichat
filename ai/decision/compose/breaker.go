@@ -52,12 +52,13 @@ const (
 )
 
 type breakerConfig struct {
-	threshold    int
-	window       time.Duration
-	cooldown     time.Duration
-	probeTimeout time.Duration
-	clock        Clock
-	onChange     func(engine string, from, to BreakerState)
+	slowThreshold int
+	threshold     int
+	window        time.Duration
+	cooldown      time.Duration
+	probeTimeout  time.Duration
+	clock         Clock
+	onChange      func(engine string, from, to BreakerState)
 }
 
 // BreakerOption configures a Breaker.
@@ -65,6 +66,20 @@ type BreakerOption func(*breakerConfig)
 
 // WithBreakerThreshold sets how many consecutive failures open the breaker.
 func WithBreakerThreshold(n int) BreakerOption { return func(c *breakerConfig) { c.threshold = n } }
+
+// WithBreakerSlowThreshold makes n consecutive "slow" calls open the breaker. A
+// call is slow when a Hedged primary was still running when its backup answered
+// (see ErrSuperseded): it missed its latency budget but did not fail. By default
+// (0) slowness never opens the breaker, because a healthy engine whose p50 is
+// above the hedge delay would otherwise be taken out of service by its own
+// hedge. Set it for an engine that can hang without ever failing (the hedge then
+// answers every call): the hung engine is paid for and cancelled on each call
+// until the breaker opens. A call that completes in time resets the run. Either
+// way, a primary that also exceeds its own timeout is a failure (see
+// WithBreakerThreshold). Set the hedge delay above the primary's p99.
+func WithBreakerSlowThreshold(n int) BreakerOption {
+	return func(c *breakerConfig) { c.slowThreshold = n }
+}
 
 // WithBreakerWindow sets the span the consecutive failures must fall within.
 func WithBreakerWindow(d time.Duration) BreakerOption { return func(c *breakerConfig) { c.window = d } }
@@ -97,13 +112,19 @@ func WithBreakerOnChange(f func(engine string, from, to BreakerState)) BreakerOp
 // success closes the breaker, failure reopens it.
 //
 // What counts as a failure is the engine's health only: a transport error, a
-// timeout, a server error, a rate limit or overload, and a hedge that had to
-// answer for a primary that exceeded its latency budget (see ErrSuperseded).
-// These do NOT count: a request the engine rejected as invalid or an
-// authentication failure (decision.ErrInvalidRequest, decision.ErrAuth: the
-// caller's fault, which must not take a healthy engine out of service for
-// everyone), an unsupported operation, an abstention, an invalid answer, and a
-// cancellation by the caller or by a race winner.
+// timeout (including a Hedged primary that outran its OWN timeout), a server
+// error, and a rate limit or overload. These do NOT count: a request the engine
+// rejected as invalid or an authentication failure (decision.ErrInvalidRequest,
+// decision.ErrAuth: the caller's fault, which must not take a healthy engine out
+// of service for everyone), an exhausted allowance (decision.ErrQuota), a
+// misconfigured endpoint (decision.ErrMisconfigured), an unsupported operation,
+// an abstention, an invalid answer, and a cancellation by the caller or by a race
+// winner.
+//
+// A Hedged primary that is still running when its backup answers is "slow", a
+// separate tally (Stats): it missed its latency budget, which says little about
+// its health, so it does NOT open the breaker unless WithBreakerSlowThreshold is
+// set. Set the hedge delay above the primary's p99.
 //
 // A failure that carries a retry delay (decision.RetryDelay, for example an HTTP
 // Retry-After) makes the breaker stay open at least that long (capped by
@@ -126,6 +147,7 @@ type Breaker struct {
 	state      BreakerState
 	gen        uint64 // bumped each time the breaker opens
 	failures   int
+	slow       int // consecutive slow calls (a Hedged primary superseded by its backup)
 	firstFail  time.Time
 	openedAt   time.Time
 	openFor    time.Duration
@@ -137,6 +159,22 @@ var (
 	_ decision.Provider       = (*Breaker)(nil)
 	_ decision.ScoredProvider = (*Breaker)(nil)
 )
+
+// BreakerStats is a breaker's running tally.
+type BreakerStats struct {
+	// Failures is the current run of consecutive engine-health failures.
+	Failures int
+	// Slow is the current run of consecutive slow calls (see
+	// WithBreakerSlowThreshold). A call that completes in time resets it.
+	Slow int
+}
+
+// Stats returns the current failure and slow runs.
+func (b *Breaker) Stats() BreakerStats {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return BreakerStats{Failures: b.failures, Slow: b.slow}
+}
 
 // NewBreaker wraps p. A nil p gives a breaker whose calls fail with ErrNoEngine.
 func NewBreaker(p decision.Provider, opts ...BreakerOption) *Breaker {
@@ -210,6 +248,7 @@ const (
 	verdictSuccess verdict = iota
 	verdictFailure
 	verdictNeutral
+	verdictSlow
 )
 
 // judge classifies a call's error (see Breaker for the rules).
@@ -218,12 +257,13 @@ func judge(ctx context.Context, err error) verdict {
 	switch {
 	case err == nil:
 		return verdictSuccess
-	case errors.Is(err, decision.ErrUnsupported), errors.Is(err, decision.ErrInvalidRequest), errors.Is(err, decision.ErrAuth):
+	case errors.Is(err, decision.ErrUnsupported), errors.Is(err, decision.ErrInvalidRequest), errors.Is(err, decision.ErrAuth),
+		errors.Is(err, decision.ErrQuota), errors.Is(err, decision.ErrMisconfigured):
 		return verdictNeutral
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded):
 		return verdictFailure
 	case errors.Is(cause, ErrSuperseded):
-		return verdictFailure
+		return verdictSlow
 	case errors.Is(err, context.Canceled) || ctx.Err() != nil:
 		return verdictNeutral
 	default:
@@ -241,8 +281,15 @@ func (b *Breaker) record(v verdict, probe bool, gen uint64, retry time.Duration)
 		b.probing = false
 	}
 	switch v {
+	case verdictSlow:
+		// Slowness is not failure: it leaves the failure run alone and opens the
+		// breaker only when a slow threshold was asked for.
+		b.slow++
+		if b.cfg.slowThreshold > 0 && b.slow >= b.cfg.slowThreshold {
+			b.open(b.cfg.clock.Now())
+		}
 	case verdictSuccess:
-		b.failures, b.retryFloor = 0, 0
+		b.failures, b.slow, b.retryFloor = 0, 0, 0
 		b.setState(BreakerClosed)
 	case verdictFailure:
 		now := b.cfg.clock.Now()
@@ -268,6 +315,7 @@ func (b *Breaker) open(now time.Time) {
 	b.openedAt = now
 	b.openFor = max(b.cfg.cooldown, b.retryFloor)
 	b.retryFloor = 0
+	b.slow = 0
 	b.gen++
 	b.setState(BreakerOpen)
 }
@@ -326,10 +374,13 @@ func (b *Breaker) Decide(ctx context.Context, req decision.Request) (decision.De
 	return r.d, r.ok, err
 }
 
-// Score implements decision.ScoredProvider. When the wrapped engine is not a
-// scored provider it returns decision.ErrUnsupported without touching the
-// breaker.
+// Score implements decision.ScoredProvider. A breaker with no engine returns
+// ErrNoEngine, and when the wrapped engine is not a scored provider it returns
+// decision.ErrUnsupported, neither touching the breaker.
 func (b *Breaker) Score(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, error) {
+	if b.inner == nil {
+		return decision.ScoreResult{}, fmt.Errorf("%s: %w", b.Name(), ErrNoEngine)
+	}
 	sp, isScorer := b.inner.(decision.ScoredProvider)
 	if !isScorer {
 		return decision.ScoreResult{}, fmt.Errorf("%s: %w", b.Name(), decision.ErrUnsupported)

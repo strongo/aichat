@@ -23,9 +23,11 @@
 //     outcome "cancelled", which is not a failure and does not count against a
 //     Breaker -- with one exception: a Hedged primary that was still running when
 //     its hedge answered missed its latency budget, and is cancelled with the
-//     cause ErrSuperseded, which a Breaker counts as a failure (otherwise a
-//     primary that hangs would never open its breaker). A Race loser is never
-//     counted.
+//     cause ErrSuperseded, which a Breaker tallies as SLOW, apart from failures
+//     (BreakerStats). Slowness opens a breaker only with WithBreakerSlowThreshold
+//     (default: never), and a primary that outruns its OWN timeout is a plain
+//     timeout failure. Set the hedge delay above the primary's p99, or a healthy
+//     primary is paid for twice on every slow call. A Race loser is never counted.
 //   - An abstention or an uncertain answer is an answer, not a failure: by
 //     default it does NOT start the backup engine. Asking a second model the
 //     same question until one sounds surer would make answers depend on timing.
@@ -47,6 +49,21 @@
 //     "rejected" and "auth"): those are the caller's fault, and counting them
 //     would take a healthy engine out of service for everyone. They still make
 //     Fallback and Hedged start the backup.
+//   - An exhausted allowance (decision.ErrQuota, outcome "quota") is neither a
+//     health failure nor transient, and a backup is typically a paid engine: it
+//     does NOT start the backup unless WithFallbackOn(OnQuota) says so, and the
+//     error is returned to the caller. A misconfigured endpoint
+//     (decision.ErrMisconfigured, outcome "misconfigured") never starts a backup
+//     and never opens a breaker: it is loud on purpose.
+//   - With WithPolicy, every decision an engine returns carries the policy's
+//     Outcome, and only an actionable one counts as decided: an answer the policy
+//     judged uncertain, none or unscored is recorded "uncertain" (and returned, as
+//     an answer, when nothing better exists) and Decision.Actionable is false for
+//     it. Without WithPolicy an engine has no bar to judge by and returns the
+//     decision unjudged (empty Outcome): wrap it in a decision.Chain, which owns
+//     the bar.
+//   - Each answered scored attempt carries its own decision.Usage, so a hedged or
+//     fallen-back call can be metered per engine.
 //   - A Breaker honours a failure's retry delay (a Retry-After, see
 //     decision.RetryDelay) as a minimum open time, ignores the result of a call
 //     that started before it last opened, returns when its context is done even

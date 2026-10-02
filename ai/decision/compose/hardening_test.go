@@ -263,18 +263,21 @@ func TestBreaker_NilEngine(t *testing.T) {
 	if _, _, err := b.Decide(context.Background(), request()); !errors.Is(err, ErrNoEngine) {
 		t.Fatalf("decide: %v", err)
 	}
-	if _, err := b.Score(context.Background(), scoreRequest()); !errors.Is(err, decision.ErrUnsupported) {
+	if _, err := b.Score(context.Background(), scoreRequest()); !errors.Is(err, ErrNoEngine) || errors.Is(err, decision.ErrUnsupported) {
 		t.Fatalf("score: %v", err)
 	}
 }
 
-// ---- Hedged: a hung primary opens its breaker ----
+// ---- Hedged: a slow primary is tallied apart from failures ----
 
-func TestHedged_HungPrimaryOpensItsBreaker(t *testing.T) {
+// A primary that hangs but never fails is answered for by its hedge on every
+// call. By default that is slowness, not a failure, and never opens its breaker;
+// WithBreakerSlowThreshold opts in to taking such an engine out of service.
+func TestHedged_HungPrimaryOpensItsBreakerOnlyWithASlowThreshold(t *testing.T) {
 	noLeak(t)
 	clk := newFakeClock()
 	hang := cooperative("jev")
-	b := NewBreaker(hang, WithBreakerClock(clk), WithBreakerThreshold(3))
+	b := NewBreaker(hang, WithBreakerClock(clk), WithBreakerThreshold(1), WithBreakerSlowThreshold(3))
 	backup := instant("llm", "j")
 	e := Hedged(b, backup, 100*time.Millisecond, WithClock(clk))
 	for i := 1; i <= 3; i++ {
@@ -293,6 +296,12 @@ func TestHedged_HungPrimaryOpensItsBreaker(t *testing.T) {
 			want = BreakerOpen
 		}
 		waitFor(t, func() bool { return b.State() == want }, fmt.Sprintf("breaker state %v after call %d", want, i))
+		if i < 3 {
+			waitFor(t, func() bool { return b.Stats().Slow == i }, fmt.Sprintf("slow tally %d", i))
+			if st := b.Stats(); st.Failures != 0 {
+				t.Fatalf("call %d: stats = %+v (slow is its own tally)", i, st)
+			}
+		}
 	}
 	// Open now: the primary fails fast and the backup starts at once.
 	o := <-startDecide(e)

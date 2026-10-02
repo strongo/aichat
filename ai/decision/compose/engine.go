@@ -22,7 +22,9 @@ const (
 
 // Trigger names an extra condition under which a failed-over strategy
 // (Fallback, Hedged) starts its backup. Failures (error, timeout, an open
-// breaker, an unsupported operation, an invalid answer) always start it.
+// breaker, an unsupported operation, an invalid answer, a request or credentials
+// the engine refused) always start it. An exhausted allowance (OnQuota) and a
+// misconfigured endpoint never do, unless OnQuota asks for the former.
 type Trigger uint
 
 const (
@@ -32,6 +34,13 @@ const (
 	// judged uncertain by the engine's policy (see WithPolicy). Off by default:
 	// an uncertain answer is information, not a failure.
 	OnUncertain
+	// OnQuota also starts the backup when the primary refuses because the
+	// caller's allowance is exhausted (decision.ErrQuota). Off by default: the
+	// backup is typically a paid engine, and quietly moving a metered caller's
+	// traffic onto it is a spending decision, not a failover. Without it the quota
+	// error is surfaced to the caller. A misconfigured endpoint
+	// (decision.ErrMisconfigured) never starts a backup, with or without it.
+	OnQuota
 )
 
 // DefaultHedgeAfter is the latency budget of a Hedged engine when configuration
@@ -46,11 +55,13 @@ const DefaultTimeout = 1500 * time.Millisecond
 var (
 	// ErrSuperseded is the cause (context.Cause) of the context of a Hedged
 	// primary that was cancelled because its backup answered after the hedge
-	// fired: the primary had not answered within the latency budget, so a
-	// Breaker counts that cancellation as a failure of the primary. Without it a
-	// primary that hangs forever would be cancelled neutrally on every call and
-	// its breaker would never open. A Race loser is NOT superseded in this sense:
-	// all racers start together, so losing a race says nothing about health.
+	// fired: the primary had not answered within the latency budget. A Breaker
+	// tallies that as SLOW (BreakerStats.Slow), separately from failures, and
+	// opens only if WithBreakerSlowThreshold asks for it: a healthy primary whose
+	// latency sits above the hedge delay must not be taken out of service by its
+	// own hedge. (A primary that also outruns its own timeout is a plain timeout
+	// failure.) A Race loser is NOT superseded in this sense: all racers start
+	// together, so losing a race says nothing about health or speed.
 	ErrSuperseded = errors.New("compose: engine superseded by its hedge")
 	// ErrNoEngine is returned by an engine or breaker built without a provider
 	// to run.
@@ -230,7 +241,11 @@ func (e *Engine) triggers(outcome string) bool {
 		return e.cfg.also&OnUncertain != 0
 	case decision.AttemptCancelled:
 		return false // the caller gave up: nothing to fail over to
-	default: // error, timeout, unavailable, unsupported, invalid
+	case decision.AttemptQuota:
+		return e.cfg.also&OnQuota != 0
+	case decision.AttemptMisconfigured:
+		return false // a person must fix it; a backup would hide it
+	default: // error, timeout, unavailable, unsupported, invalid, rejected, auth
 		return true
 	}
 }
@@ -268,9 +283,10 @@ func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decisi
 		if err := decision.Validate(v.d, req.Taxonomy); err != nil {
 			return decision.AttemptInvalid, decision.InvalidDetail(err)
 		}
-		if e.cfg.policy != nil && v.d.Calibrated && len(v.d.Scores) > 0 &&
-			e.cfg.policy.EvaluateDecision(v.d).Outcome == decision.OutcomeUncertain {
-			return decision.AttemptUncertain, ""
+		if e.cfg.policy != nil {
+			if sel := e.cfg.policy.EvaluateDecision(v.d); !sel.Actionable() {
+				return decision.AttemptUncertain, sel.Detail()
+			}
 		}
 		return decision.AttemptDecided, ""
 	}
@@ -278,6 +294,12 @@ func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decisi
 	rep := out.report(e)
 	if v, ok := out.value(); ok {
 		rep.Model = v.d.Model
+		if e.cfg.policy != nil {
+			// With a policy every answer carries its verdict, so a direct caller of
+			// the engine can tell an accepted answer from one that was only
+			// returned because an uncertain answer is an answer (Actionable).
+			v.d.Outcome = e.cfg.policy.EvaluateDecision(v.d).Outcome
+		}
 		return v.d, true, rep, nil
 	}
 	if out.abstained() {
@@ -301,12 +323,12 @@ func (e *Engine) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (de
 		return decision.ScoreResult{}, decision.Report{Strategy: string(e.strategy)}, err
 	}
 	if err := decision.ValidateScoreRequest(req); err != nil {
-		return decision.ScoreResult{}, decision.Report{Strategy: string(e.strategy)}, fmt.Errorf("compose: %s: invalid score request: %w", e.cfg.name, err)
+		return decision.ScoreResult{}, decision.Report{Strategy: string(e.strategy)}, fmt.Errorf("compose: %s: %w", e.cfg.name, err)
 	}
 	legs := make([]leg[decision.ScoreResult], len(e.providers))
 	for i, p := range e.providers {
 		legs[i] = leg[decision.ScoreResult]{
-			name: p.Name(), role: e.role(i), timeout: e.legTimeout(p),
+			name: p.Name(), role: e.role(i), timeout: e.legTimeout(p), usage: scoreUsage,
 			call: func(ctx context.Context) (decision.ScoreResult, bool, *decision.Report, error) {
 				switch sp := p.(type) {
 				case decision.TracedScorer:
@@ -348,6 +370,16 @@ func (e *Engine) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (de
 	return decision.ScoreResult{}, rep, out.failure(e)
 }
 
+// scoreUsage is what an answered score call consumed, nil when the engine
+// reported nothing.
+func scoreUsage(res decision.ScoreResult) *decision.Usage {
+	if res.Usage == (decision.Usage{}) {
+		return nil
+	}
+	u := res.Usage
+	return &u
+}
+
 // ---- generic runner ----
 
 // leg is one provider invocation: call returns the value, whether it answered
@@ -358,6 +390,8 @@ type leg[T any] struct {
 	role    string
 	timeout time.Duration
 	call    func(ctx context.Context) (T, bool, *decision.Report, error)
+	// usage, when set, reads what an answer consumed, for the attempt record.
+	usage func(T) *decision.Usage
 }
 
 type legResult[T any] struct {
@@ -416,6 +450,9 @@ func runLeg[T any](ctx context.Context, e *Engine, l leg[T], judge func(T) (stri
 	}
 
 	a := decision.Attempt{Provider: l.name, Outcome: res.outcome, Detail: res.detail, Latency: res.latency, Role: l.role}
+	if l.usage != nil && res.err == nil && res.answered {
+		a.Usage = l.usage(res.val)
+	}
 	if rep != nil {
 		res.engine = rep.Engine
 		res.attempts = decision.MergeReport(*rep, a, res.err == nil && res.answered)
@@ -436,6 +473,10 @@ func classify(err, cause error) (outcome, detail string) {
 		return decision.AttemptUnsupported, err.Error()
 	case errors.Is(err, decision.ErrAuth):
 		return decision.AttemptAuth, err.Error()
+	case errors.Is(err, decision.ErrQuota):
+		return decision.AttemptQuota, err.Error()
+	case errors.Is(err, decision.ErrMisconfigured):
+		return decision.AttemptMisconfigured, err.Error()
 	case errors.Is(err, decision.ErrInvalidRequest):
 		return decision.AttemptRejected, err.Error()
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded):

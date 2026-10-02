@@ -477,7 +477,7 @@ func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decis
 	if c.Policy != nil {
 		sel := c.Policy.EvaluateDecision(d)
 		d.Outcome = sel.Outcome
-		a.Detail = verdictDetail(sel)
+		a.Detail = sel.Detail()
 		a.Outcome = AttemptUncertain
 		if sel.Actionable() || c.KeepNonSelected {
 			a.Outcome = AttemptDecided
@@ -499,14 +499,6 @@ func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decis
 	}
 	a.Outcome = AttemptDecided
 	return d, a
-}
-
-// verdictDetail is the trace text of a policy verdict.
-func verdictDetail(sel Selection) string {
-	if sel.Reason == "" {
-		return string(sel.Outcome)
-	}
-	return string(sel.Outcome) + ": " + sel.Reason
 }
 
 // MergeReport returns the attempts to record for a TracedProvider: the engines

@@ -210,6 +210,15 @@ type Selection struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// Detail is the verdict as a trace line: the outcome, and ": reason" when there
+// is one ("uncertain: low_confidence", "accepted: accepted_uncalibrated").
+func (s Selection) Detail() string {
+	if s.Reason == "" {
+		return string(s.Outcome)
+	}
+	return string(s.Outcome) + ": " + s.Reason
+}
+
 // Actionable reports whether a caller may act on the verdict: the policy
 // selected a calibrated answer (OutcomeSelected, OutcomeSeveral) or accepted an
 // uncalibrated decision at its explicit bar (OutcomeAccepted). Decision.Actionable
