@@ -11,7 +11,7 @@ status: Draft
 
 ## Summary
 
-The shared, product-neutral AI provider layer under `github.com/strongo/aichat`: the streaming event model and `LLMProvider` contract (`ai`), tool calling and extended-reasoning support across the adapters plus a tool-calling agent loop (`ai/agent`), a decision chain of pluggable `decision.Provider`s including a deterministic rule engine (`ai/decision/rules`) and a single-inference LLM decider (`ai/decision/llmdecider`), three concrete providers (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`), a context manager that keeps a provider-cacheable prompt prefix stable (`ai/ctxmgr`), product-facing config that wires cloud vs. BYOK independently for chat and decision (`ai/aiconfig`), and diagnostics (`ai/diag`). It is consumed first by Sneat's chat MVP and by DataTug (whose chat agent and tool-calling migrated onto `ai/agent` and the adapters' tool support).
+The shared, product-neutral AI provider layer under `github.com/strongo/aichat`: the streaming event model and `LLMProvider` contract (`ai`), tool calling and extended-reasoning support across the adapters plus a tool-calling agent loop (`ai/agent`), a decision chain of pluggable `decision.Provider`s including a deterministic rule engine (`ai/decision/rules`), a single-inference LLM decider (`ai/decision/llmdecider`, an uncalibrated fallback or emulator for decisions and scored questions), a real decision-model client for TypeSafe AI's System One API (`ai/decision/typesafe`, calibrated probabilities, model id required), a selection policy and engine combinators (`ai/decision`, `ai/decision/compose`: fallback, hedged, race, circuit breaker), three concrete providers (`ai/openaicompat`, `ai/anthropic`, `ai/cloud`), a context manager that keeps a provider-cacheable prompt prefix stable (`ai/ctxmgr`), product-facing config that wires cloud vs. BYOK independently for chat and decision (`ai/aiconfig`), and diagnostics (`ai/diag`). It is consumed first by Sneat's chat MVP and by DataTug (whose chat agent and tool-calling migrated onto `ai/agent` and the adapters' tool support).
 
 ## Problem
 
@@ -21,7 +21,8 @@ Putting it in `strongo/aichat` (Apache-2.0, dependency-free of any product) mean
 
 - one streaming event model and one `LLMProvider` contract every adapter and every product's UI renders the same way;
 - one place that gets OpenAI-compatible and Anthropic SSE parsing, HTTP error mapping, and retry-before-first-byte right, instead of N places;
-- a decision chain that lets a product register its own fast, deterministic rules ahead of a shared LLM decider or a cloud-hosted one ("Jev"), with a single, uniform fallback: no decider (or none confident) means the product's main LLM path classifies and answers in one inference;
+- a decision chain that lets a product register its own fast, deterministic rules ahead of a decision model, an LLM decider or a cloud-hosted one, with a single, uniform fallback: no decider (or none confident) means the product's main LLM path classifies and answers in one inference;
+- decision engines that are swappable by configuration and combinable (fallback, hedged, race, circuit breaker), so a real decision model can be primary and an LLM decider its backup, and a decision always says which engine answered;
 - a context manager whose caching policy (retain the sent static prefix, only compact under budget pressure) is written and tested once, not re-derived per product;
 - BYOK (bring your own key) that always talks to the provider directly — the cloud is never a required relay — while a cloud LLM and a cloud-hosted decision service can still be used independently of each other.
 
@@ -31,7 +32,7 @@ Putting it in `strongo/aichat` (Apache-2.0, dependency-free of any product) mean
 
 #### REQ: package-boundaries
 
-The module MUST be organised as: `ai` (event model, `LLMProvider`, `Collect`), `ai/session` (conversational working state), `ai/decision` (the `Provider` contract, `Chain`, `Validate`), `ai/cloudproto` (the wire protocol between clients and a cloud AI boundary), `ai/openaicompat`, `ai/openairesponses`, `ai/anthropic`, `ai/cloud` (four `LLMProvider`/`decision.Provider` adapters), `ai/decision/rules` (deterministic table-driven provider), `ai/decision/llmdecider` (single-inference LLM provider), `ai/ctxmgr` (context selection), `ai/aiconfig` (config + wiring), `ai/diag` (turn diagnostics), and `ai/internal/{retry,sse}` (unexported HTTP-adapter helpers: bounded retry-before-first-byte, and the shared SSE line-scanner). No package outside `ai/internal/...` MAY depend on another product's code; `strongo/aichat` has no Sneat- or DataTug-specific types anywhere.
+The module MUST be organised as: `ai` (event model, `LLMProvider`, `Collect`), `ai/session` (conversational working state), `ai/decision` (the `Provider` contract, `Chain`, `Validate`), `ai/cloudproto` (the wire protocol between clients and a cloud AI boundary), `ai/openaicompat`, `ai/openairesponses`, `ai/anthropic`, `ai/cloud` (four `LLMProvider`/`decision.Provider` adapters), `ai/decision/rules` (deterministic table-driven provider), `ai/decision/llmdecider` (single-inference LLM provider), `ai/decision/compose` (engine combinators and circuit breaker), `ai/decision/typesafe` (TypeSafe System One client), `ai/ctxmgr` (context selection), `ai/aiconfig` (config + wiring), `ai/diag` (turn diagnostics), and `ai/internal/{retry,sse}` (unexported HTTP-adapter helpers: bounded retry-before-first-byte, and the shared SSE line-scanner). No package outside `ai/internal/...` MAY depend on another product's code; `strongo/aichat` has no Sneat- or DataTug-specific types anywhere.
 
 This module also contains a second, independent tree, `tui/*` (the Bubble Tea chat kit: `tui`, `strongo-tui/pkg/focus`, `tui/transcript`, `strongo-tui/pkg/grid`, `tui/sidebar`, `tui/stream`, `tui/chatshell`), specified separately in `spec/features/tui-kit/README.md`. `tui/*` MAY depend on `ai/*` (the event model, `session.EntityRef`) but the reverse is never true, and `ai/*` remains fully usable — by a non-interactive product, a server, a script — without ever importing `tui/*`.
 
@@ -144,7 +145,7 @@ By contrast, a TOOL-level failure -- no handler registered for the call's tool n
 
 #### REQ: llmdecider-single-inference
 
-`ai/decision/llmdecider.Decider` MUST make exactly one `ai.LLMProvider.Stream` call per `Decide`, with `ResponseSchema` set to the static, tested, STRICT-VALID JSON Schema of `decision.Decision` (see REQ: llmdecider-strict-schema), a system prompt that lists the request's `Taxonomy` (modules/intents/scopes/presentations/data kinds/entity types) and the product-neutral rules (never invent entity IDs; `reference` is an expression to resolve, not an ID; `requiredScopes` is the minimum; `canHandleDeterministically`/`needsLLM` are only true together when the product can fully answer from data alone), and a context block carrying session state (entity refs and titles only, never rendered data) plus a bounded tail of `Request.Recent` (`Options.MaxRecent`: zero/unset means the default of 8; a NEGATIVE value, not zero, means "no limit") and `Now`/`TZ`. It MUST parse the decision from the `EventStructured` event, falling back to extracting a JSON object from the collected text (tolerating a fenced block) when no structured event arrived; malformed JSON in either path MUST return an error (which `Chain` treats as a fall-through, per REQ: chain-semantics). This is the product-neutral implementation a cloud-hosted decision service ("Jev") can host directly — nothing in it is Sneat- or DataTug-specific.
+`ai/decision/llmdecider.Decider` MUST make exactly one `ai.LLMProvider.Stream` call per `Decide`, with `ResponseSchema` set to the static, tested, STRICT-VALID JSON Schema of `decision.Decision` (see REQ: llmdecider-strict-schema), a system prompt that lists the request's `Taxonomy` (modules/intents/scopes/presentations/data kinds/entity types) and the product-neutral rules (never invent entity IDs; `reference` is an expression to resolve, not an ID; `requiredScopes` is the minimum; `canHandleDeterministically`/`needsLLM` are only true together when the product can fully answer from data alone), and a context block carrying session state (entity refs and titles only, never rendered data) plus a bounded tail of `Request.Recent` (`Options.MaxRecent`: zero/unset means the default of 8; a NEGATIVE value, not zero, means "no limit") and `Now`/`TZ`. It MUST parse the decision from the `EventStructured` event, falling back to extracting a JSON object from the collected text (tolerating a fenced block) when no structured event arrived; malformed JSON in either path MUST return an error (which `Chain` treats as a fall-through, per REQ: chain-semantics). It is an LLM decider, not a calibrated decision model: its confidences are the model's self-report (`Decision.Calibrated` stays false), so a `SelectionPolicy` never thresholds them (REQ: selection-policy). It is useful as a fallback engine or an emulator behind a real one (REQ: engine-combinators). Nothing in it is Sneat- or DataTug-specific.
 
 #### REQ: llmdecider-strict-schema
 
@@ -154,11 +155,67 @@ The wire JSON Schema `ai/decision/llmdecider` sends is written to satisfy OpenAI
 
 The `decision.Decision` JSON Schema embedded in `ai/decision/llmdecider` is intentionally evolvable: new fields are additive, and both `decision.Validate` and any consumer MUST treat unknown `module`/`intent`/`presentation` values as "not decided" rather than erroring the whole turn. A schema change is a reviewed diff to a static Go constant, not a struct-reflection surprise (`TestDecisionSchema_MatchesFields` pins the field-name correspondence).
 
+### Scored decisions, policy and engines
+
+#### REQ: decision-additive-scores
+
+`decision.Decision` MUST gain only additive fields: `Scores` (probability per option of the Choice that picked the intent, keyed by option id, `"module/intent"` for a multi-module taxonomy), `Calibrated` (true only when the numbers are calibrated probabilities; false for an LLM decider's self-reported confidence and for rule matches), `Outcome` (the policy verdict, set by a `Chain` with a `Policy` and by an engine built with `compose.WithPolicy`), `InteractionConfidence` (the engine's confidence in `Interaction`, 0 when it reports none) and `Model` (the model id the engine reported, empty when it reports none; `decision.Trace` and `decision.Report` carry it too, so every answer says which model produced it). ONE rule MUST say whether a caller may act on an answer, and `Decision.Actionable()` and `Selection.Actionable()` MUST agree: it is true only when a policy SELECTED a calibrated answer (`selected`, `several`) or the caller's policy explicitly opted in to an uncalibrated decision at a stated bar (`accepted`, see REQ: selection-policy); `uncertain`, `none` and `unscored` are never actionable. The one other actionable state is the empty `Outcome`, which means no policy judged the answer (a `Chain` without a `Policy`, whose own `MinConfidence` is then the caller's explicit bar); every engine built with a policy and every `Chain` with a `Policy` sets an `Outcome`, so an answer is never actionable by omission. `decision.Request` MUST gain optional `Context` (JSON-able names and public metadata only, never row data, credentials or user identifiers) and `decision.Taxonomy` optional `Descriptions` (one line per taxonomy entry, keyed by module name, `"module/intent"`, presentation, data kind or entity type). Everything placed in a `Request` or `ScoreRequest` (text, recent turns, context, descriptions) is sent verbatim to the engine's operator, and the package documentation of `ai/decision` and `ai/decision/typesafe` MUST say so and tell callers to send metadata, never row data. Existing decisions, requests and `Chain` behaviour with no `Policy` MUST be unchanged.
+
+#### REQ: scored-candidates
+
+`decision.ScoredProvider` MUST answer a `ScoreRequest` (a state text, optional context, and one or more `Question`s) with a `ScoreResult` holding one `Answer` per question: a probability per candidate, sorted best first, plus the engine name and the model id the engine reported. A `Question` is `KindChoice` (exactly one candidate is right; probabilities sum to 1; may name a `NoneID`) or `KindRelevance` (each candidate is judged independently; probabilities need not sum to 1). An `Answer` carries `Confidence` only when the engine reports one (`HasConfidence`) and `Calibrated` (true for a real decision model, false for an LLM emulator). `ValidateScoreRequest` and `ValidateScoreResult` MUST reject a malformed request (no questions, duplicate or empty ids, unknown kind, a `NoneID` that is not a candidate of a choice question) and a result that does not answer every question with known candidates and finite probabilities in [0,1] (a choice answer must also sum to about 1).
+
+#### REQ: selection-policy
+
+`decision.SelectionPolicy` MUST turn an `Answer` into an `Outcome` (`selected`, `several`, `uncertain`, `none`, `unscored`) so no caller compares a probability to a number of its own. An uncalibrated answer to a scored question MUST be `unscored`, never a selection, but it MUST carry a PROPOSAL so a read-only narrowing still works with an LLM engine: `Selection.Proposals` (not `Picks`) holds, for a relevance answer, the candidates at or above `MinProbability` (best first, capped by `MaxPicks`) and, for a choice answer, its top candidate (none when that is the `NoneID`); `Picks`, `Strong` and `Potential` stay empty and `Selection.Actionable()` is false, so a caller that sees `len(Picks) > 0` is looking at policy-selected, calibrated picks only. An uncalibrated DECISION (an LLM emulator's self-reported confidence, a deterministic rule) is acted on only through the policy's explicit opt-in `AcceptUncalibratedAt`: when both its module and intent confidences reach it (the module confidence is exempt for a module-optional interaction) the verdict is `accepted` (actionable; `Calibrated` stays false), otherwise `unscored` (not actionable). `AcceptUncalibratedAt` is 0, never, by default and for `DurablePolicy`, and 0.70 for `NarrowingPolicy` (the floor a chain applies without a policy; a narrowing decision is a proposal for choosing what to examine, never durable knowledge); a calibrated decision without `Scores` is judged like an uncalibrated one. Only a calibrated `selected` or `several` selection and an `accepted` decision are actionable. `SelectionPolicy.AtLeast` MUST return the stricter of two policies (each threshold the larger, an uncalibrated decision accepted only if both accept it). A `KindChoice` answer MUST be `none` when the top option is the question's `NoneID`, `uncertain` when the confidence is below `MinConfidence` (the engine's own, or, when it reports none, the top probability) or the top option leads the runner-up by less than `MinGap`, and `selected` otherwise (so a lone candidate at probability 0.1 is not selected). A `KindRelevance` answer MUST select every candidate at or above `MinProbability` (best first, capped by `MaxPicks`), mark those at or above `StrongProbability` as strong, keep those between `PotentialProbability` and `MinProbability` as potential, and be `selected` (one pick), `several` (more than one), `uncertain` (only potential candidates) or `none`. `Validate` MUST reject a threshold outside [0,1], an unordered set, a negative `MaxPicks`, and a `MinConfidence` or `MinProbability` of 0, so the zero value (which would select everything) is invalid, and `Evaluate` MUST select nothing (`uncertain`, reason `invalid_policy`) with an invalid policy; `Validate` MUST also reject an `AcceptUncalibratedAt` outside [0,1]. The defaults live in named constants and two named policies: `NarrowingPolicy` (narrowing a set of candidates: confidence 0.50, gap 0.20, select 0.60, strong 0.85, potential 0.30) and `DurablePolicy` (answers stored and reused as fact: confidence 0.90, gap 0.20, select 0.90, strong 0.95, potential 0.60). These numbers are PROVISIONAL: they come from a single small measurement against one model version, are not a calibration, and MUST be re-measured on the product's own corpus and for the exact model id in use; the code, the configuration documentation and this specification MUST say so. `0.96/0.91/0.72` independent relevance probabilities MUST be `several`; `0.38/0.35/0.33` MUST be `uncertain` as a choice and as a relevance list.
+
+#### REQ: chain-policy
+
+`decision.Chain` MAY carry a `Policy`. With a policy set the policy alone owns the bar for every answer, and `MinConfidence` is not applied: a calibrated decision with `Scores` is judged by its probabilities, and any other decision (uncalibrated, or calibrated without scores) is `accepted` only if the policy opts in through `AcceptUncalibratedAt` and is `unscored` otherwise (REQ: selection-policy), so a durable chain never silently drops its bar to an LLM's self-reported confidence when the calibrated engine is down. Only an actionable verdict stops the chain: any other MUST be recorded in `Trace.Attempts` as `uncertain` (with the verdict and reason as detail, for example `uncertain: low_confidence`, `unscored: not_calibrated`) and the chain MUST fall through to the next provider. A chain with `KeepNonSelected` set MUST instead return the non-actionable answer with `ok=true`, `Decision.Outcome` and `Trace.Outcome` set, and because `ok=true` is then not enough to act on, a caller MUST check `Decision.Actionable()` (false for `uncertain`, `none` and `unscored`) before acting; the `Chain` and `ai/decision` documentation MUST say so. A provider answer that fails `Validate` MUST still fall through. With no `Policy` the chain MUST behave exactly as before (`MinConfidence` floor, empty `Outcome`), except that a provider's own non-actionable verdict (`uncertain`, `none` or `unscored`, from an engine built with a policy) is honoured as `uncertain` and never acted on by omission.
+
+#### REQ: llmdecider-scores
+
+`llmdecider.Decider` MUST also be a `decision.ScoredProvider`, so a `Fallback` from a decision model to an LLM decider answers scored questions (table narrowing is a scored question): `Score` MUST make ONE structured inference for every question of the `ScoreRequest` (a strict JSON Schema of `{answers: [{questionId, scores: [{id, probability}]}]}`), and return a `ScoreResult` that passes `ValidateScoreResult` with `Calibrated` false and `HasConfidence` false on every answer. A choice answer MUST be normalised to sum to 1, probabilities clamped to [0,1], candidates the model left out scored 0 and ids it invented dropped; a question the model did not answer, or a choice with no probability on any candidate, MUST be an error matching `llmdecider.ErrBadScores` that quotes nothing; a request that fails `ValidateScoreRequest` MUST be refused with an error matching `decision.ErrInvalidRequest` that quotes no id. Under a `SelectionPolicy` such an answer is `unscored` with a proposal (REQ: selection-policy), never a selection.
+
+#### REQ: engine-combinators
+
+`ai/decision/compose` MUST provide `Single`, `Fallback(primary, backup)`, `Hedged(primary, backup, after)` and `Race(providers)`, each a `decision.Provider`, a `decision.TracedProvider` and a `decision.ScoredProvider` (a provider that is not scored is recorded `unsupported`), so they nest inside `decision.Chain` and inside each other. An engine's answer is accepted only when valid (`decision.Validate`, or `ValidateScoreResult`). `Fallback` MUST start the backup only when the primary errors, times out, is unavailable (open breaker), is unsupported, is rejected or unauthorised, or returns an invalid answer; it MUST NOT start it for an exhausted allowance (`decision.ErrQuota`, outcome `quota`: the error is surfaced to the caller, because a backup is typically a paid engine) unless `WithFallbackOn(OnQuota)` says so, and MUST NOT start it for a misconfigured endpoint (`decision.ErrMisconfigured`, outcome `misconfigured`) under any option, so a configuration error is loud instead of absorbed by a backup forever. `Hedged` MUST start the primary, start the backup only after the latency budget passes or as soon as the primary fails, accept the first valid answer and cancel the other through its context. `Race` MUST start every engine at once, accept the first valid answer and cancel the rest. An abstention or an uncertain answer is an answer: by default it MUST NOT start the backup in any strategy (`WithFallbackOn(OnAbstain|OnUncertain)` opts in; `OnUncertain` needs `WithPolicy`). `Hedged` MUST apply ONE rule to them whatever the timing: when the primary abstains or answers uncertain and `WithFallbackOn` names that outcome, the backup is used (started at once if the hedge had not fired, waited for if it was running); otherwise the primary's abstention or uncertain answer stands and a still-running backup is cancelled. Each engine MUST run under its own timeout (its `DecisionTimeout()`, else `WithDefaultTimeout`), enforced by the combinator even for an engine that ignores its context; a combinator MUST report its own `DecisionTimeout()` (single/race: the longest, none: 0; fallback: the sum; hedged: the longer of the primary and the hedge delay plus the backup). A cancelled loser MUST be recorded `cancelled`, must not count as a failure, and the combinator MUST NOT wait for it; the one exception is a `Hedged` primary still running when its hedge answered, which is cancelled with the cause `compose.ErrSuperseded` so a `Breaker` tallies it as SLOW, apart from failures (REQ: circuit-breaker); the documentation MUST say to set the hedge delay above the primary's p99. With `WithPolicy` every decision an engine returns MUST carry the policy's `Outcome` and only an actionable one counts as decided (an answer judged uncertain, none or unscored is recorded `uncertain` and, as an answer, returned with `ok=true` and a non-actionable `Outcome` when nothing better exists); without `WithPolicy` an engine has no bar to judge by and returns the decision unjudged (empty `Outcome`) for the `Chain` that owns the bar. Each answered scored attempt MUST carry its own `Attempt.Usage`. An invalid score request MUST return an error matching `decision.ErrInvalidRequest` that quotes no id, only positions and counts. No goroutine of a context-honouring engine may outlive a call. A constructor MUST NOT panic: an engine built with no providers, a nil provider, or as a zero value MUST return an error matching `compose.ErrNoEngine` from its first call, and `DecisionTimeout()` MUST then be 0. Time is read through a `Clock` so tests are deterministic. There are no retries: trying another engine is the only retry.
+
+#### REQ: decision-trace-engine
+
+Every decision MUST say which engine answered, and which model. `decision.Report` (strategy, answering leaf engine, its model id, every attempt with role and latency, `FallbackFired`, `HedgeFired`) is returned by a `TracedProvider`; `decision.Chain` MUST use it so `Trace.Attempts` lists every engine tried rather than the outermost wrapper, set `Trace.Engine`, `Strategy`, `FallbackFired`, `HedgeFired`, `Calibrated`, `Outcome` and `Model`, and relabel the answering attempt when the chain itself rejects the answer (`invalid`, `low_confidence`). `Attempt.Outcome` gains `unavailable` (a circuit breaker was open; an error wrapping `decision.ErrUnavailable` is recorded so), `cancelled`, `uncertain`, `unsupported`, `rejected` (an error matching `decision.ErrInvalidRequest`), `auth` (matching `decision.ErrAuth`), `quota` (matching `decision.ErrQuota`: the allowance is exhausted) and `misconfigured` (matching `decision.ErrMisconfigured`). `Attempt.Latency` is a wall-clock duration whose wire form is the integer `latencyMs` (milliseconds, rounded down); the legacy `latency` (nanoseconds) is still written and read when `latencyMs` is absent. `Attempt.Usage` carries what that attempt consumed (nil, not zero, when its engine reported none) so hedged and fallen-back calls can be metered per engine. A trace MUST carry no caller-supplied content: the detail of an `invalid` attempt states only the number of validation problems (`decision.InvalidDetail`), never candidate, question or module ids.
+
+#### REQ: circuit-breaker
+
+`compose.NewBreaker(p)` MUST wrap a provider so a down engine is not called on every request: after 5 consecutive engine-health failures within 30 seconds it opens and returns an error wrapping `decision.ErrUnavailable` at once, without calling the engine, for a 30 second cooldown; then it lets exactly one probe through (half-open), closes on its success and reopens on its failure. Only engine-health failures count: a transport error, a timeout (including a `Hedged` primary that outran its own timeout), a server error, a rate limit or overload. These MUST NOT count: a request refused as invalid or an authentication failure (errors matching `decision.ErrInvalidRequest` and `decision.ErrAuth`, which are the caller's fault and must not take a healthy engine out of service for everyone), an exhausted allowance (`decision.ErrQuota`), a misconfigured endpoint (`decision.ErrMisconfigured`), an unsupported operation, an abstention, an invalid answer, and a cancellation by the caller or by a race winner. A `Hedged` primary still running when its backup answered (cancelled with `compose.ErrSuperseded`) is SLOW, tallied apart from failures (`Breaker.Stats`), reset by a call that completes in time, and opens the breaker only when `WithBreakerSlowThreshold(n)` asks for it (default: never), so a healthy primary whose latency sits above the hedge delay is not taken out of service by its own hedge; a primary that also outruns its own timeout is a plain timeout failure. A failure whose error carries a retry delay (`decision.RetryDelay`, for example an HTTP `Retry-After`, capped at 10 minutes) MUST keep the breaker open at least that long. A call that started before the breaker last opened MUST be ignored when it finishes, so a late success cannot close an open breaker. The breaker MUST return as soon as its call's context is done even if the engine ignores cancellation, and MUST bound the half-open probe (`WithBreakerProbeTimeout`, default 10 seconds, even when the caller's context has no deadline): a probe that overruns counts as a failure and the breaker returns to open, so a hung engine cannot hold it half-open. Threshold, window, cooldown and probe timeout are options; a state-change callback lets the host log and count changes. A breaker built with no engine MUST return an error matching `compose.ErrNoEngine` from `Decide` and from `Score` alike. The breaker is transparent in traces (it reports the wrapped engine's name and timeout). State is per instance and in memory.
+
+#### REQ: config-selects-engines
+
+`aiconfig.Decision` MUST let configuration (YAML, JSON or `AI_DECISION_ENGINES`, `_STRATEGY`, `_HEDGE_AFTER`, `_POLICY`) choose the decision engines, how they combine and the selection policy, with no code change: `engines` (names resolved against `Deps.Engines`), `strategy` (`single`, `fallback`, `hedged`, `race`; default `single` for one engine and `fallback` for two), `hedgeAfter` (a Go duration, default 600ms), `breaker` (default true: each engine behind a circuit breaker), `breakerSlowThreshold` (consecutive hedge-cancelled calls that open a primary's breaker; default 0, never), `fallbackOn` (`abstain`, `uncertain`, `quota`), `policy` (`narrowing`, `durable`, returned as `Providers.Policy`) and `policyValues` (optional numeric overrides of the named policy: `minConfidence`, `minGap`, `minProbability`, `strongProbability`, `potentialProbability`, `maxPicks`, `acceptUncalibratedAt`; unset values keep the named policy's, the result is validated with `SelectionPolicy.Validate`, and the policy is renamed `<name>+custom`). Configured engines MUST run after the product's `ExtraDecision` providers and before the cloud decider, and `Decision.Provider: disabled` MUST skip them. An unknown engine, strategy, policy or trigger, a wrong engine count for the strategy, a malformed duration, `policyValues` without a `policy`, or an invalid resulting policy MUST be a `Build` error.
+
+### TypeSafe decision model
+
+#### REQ: typesafe-client
+
+`ai/decision/typesafe` MUST be a client for TypeSafe AI's System One API: `POST {BaseURL}/v1/systemone` (default `https://api.typesafe.ai`) with `Authorization: Bearer <key>`, a JSON body `{state, model, questions}`, questions of type `choice`, `score` or `noul`, and a response `{model, answers, usage}`. `Config.Model` MUST be required (`New` fails without it): thresholds are only valid for the model they were measured on, so a versioned id such as `jev-1.13.0` is pinned in production, and the moving alias `jev-latest` (`typesafe.ModelLatest`) is available only as an explicit choice; the model id the API returns MUST be recorded in every `Decision` and `ScoreResult`. `BaseURL` MUST be `https` (`http` only for a loopback host, for tests) and carry no credentials; the default HTTP client MUST NOT follow redirects (a 307/308 would re-send the state and the key to another host; a 3xx is `ErrUnexpectedStatus`), and a caller-supplied `HTTPDoer` is documented to need the same. HTTP MUST go through an `HTTPDoer` seam. It MUST NOT retry. It MUST NOT log. An error MUST carry only the status, the API's `error_type`, the `x-typesafe-request-id`, the retry delay and counts, never the response body, the submitted state, or any caller-supplied id, and the key MUST never appear in an error or `String()`. Status mapping: 401/403 `ErrAuth` (matches `decision.ErrAuth`); 400 and 422 `ErrInvalidRequest` (documented as 422, observed as 400; matches `decision.ErrInvalidRequest`); 429 `ErrRateLimited`; 529 `ErrOverloaded`; other 5xx `ErrServer`; any other non-2xx `ErrUnexpectedStatus`; a malformed 2xx `ErrBadResponse`. `Retry-After` MUST be read in both forms (seconds and HTTP date), capped, and exposed through `decision.RetryDelay`. Requests MUST be checked locally before any call, each failure matching `ErrInvalidRequest`: more than 255 options in a Choice (`ErrTooManyOptions`, on `Decide` as on `Score`), more than 255 questions in one call (`ErrTooManyQuestions`, a local guard: a relevance question costs one per candidate) and an estimated state over the 32k-token budget (`ErrStateTooLarge`; `Config.MaxStateTokens`; the estimate is approximate, bytes/4). A per-call hook MUST report model, usage, latency and status without any content. Published limits not enforced locally: 40 requests and 100K tokens per second, 64k tokens of context per request, price per input token. The package documentation MUST state that everything in the state is sent verbatim to the operator.
+
+#### REQ: typesafe-score-mapping
+
+`typesafe.Client.Score` MUST implement `decision.ScoredProvider` with one API call for all questions. A `KindChoice` question MUST become one Choice (candidate ids as options, descriptions as criteria); a `KindRelevance` question MUST become one Noul per candidate, because a Choice distribution sums to 1 and cannot express several relevant candidates. The state MUST be an object holding the question text, the context and the candidate catalogue of every relevance question, and each Noul MUST refer to its candidate and to the question by path (`state.candidates.q0[3]`, `state.question`): measured against the live API on a catalogue of 11 tables, the relevant ones separated cleanly (0.67-0.78 against at most 0.29) with the catalogue in the state, and did not (0.1-0.4 for all) with a description inside each question. Answers MUST be `Calibrated`; a Choice answer carries the API's confidence and the question's `NoneID`, a Noul answer carries none. A malformed answer MUST be `ErrBadResponse` naming the question by position, not by id.
+
+#### REQ: typesafe-decide-mapping
+
+`typesafe.Client.Decide` MUST implement `decision.Provider` with one API call: one Choice over `"module/intent"` plus `other` (its confidence is both the module and the intent confidence, its probabilities are `Decision.Scores`, `other` abstains); one Noul per scope and per data kind (a scope of the chosen module or a data kind whose probability reaches the policy's select threshold is required); one Choice over entity types plus `none` and one over presentations plus `none`, each used only when the policy selects it; and one Choice over the `Interaction` enum, ALWAYS asked and run through the selection policy like every other Choice: only a SELECTED option becomes `Interaction` (with `InteractionConfidence`), an interaction that acts on a pending or previous action (`confirmation`, `rejection`, `correction`, `cancellation`, `undo`) must additionally clear the stricter of the policy and `DurablePolicy` (a wrong "yes" is a side effect), and when the policy does not select the interaction the provider ABSTAINS (`ok=false`, no error) rather than hand a confident intent to a caller with a guessed turn kind, so the next provider or the product's main-LLM path classifies the turn; an answer whose top option (by the `choice` field or the probabilities) is outside the enum is `ErrBadResponse`, and no interaction is ever assumed; a request whose single module is named `choose:<role>` MUST become exactly one Choice over its intents, with `Interaction` `question` by construction. More than 255 options in the intent Choice MUST be refused locally. `Request.InteractionID`, `ClientContext`, `Now` and `TZ` MUST NEVER be forwarded. The decision is `Calibrated`, carries the API's model id in `Decision.Model`, has `NeedsLLM` set, and validates against the taxonomy.
+
+#### REQ: typesafe-live-test-opt-in
+
+The package MUST include live integration tests that make real API calls only when `JEV_API_KEY` is set AND `AICHAT_LIVE_JEV=1` (the model is `JEV_MODEL`, else `ModelLatest`, an explicit choice there), and are skipped otherwise; they MUST log probabilities, the model id, latency and token usage only, never the key, and use a small invented fixture (a lending-library schema), never real or third-party data.
+
 ### Context Manager
 
 #### REQ: ctxmgr-retain-then-required
 
-`ctxmgr.Manager.Select(required, available, pinnedScopes)` MUST always include every scope in `required` (an empty, non-nil slice is a valid "this decision needs no scopes"), and MUST additionally retain every static scope already sent earlier in the conversation even when no longer required, so the cached prefix does not shrink or shift on a turn that needs less context than a previous one. When there was NO decision at all (Jev off, or every provider abstained/errored), the product MUST call `Manager.SelectAll(available, pinnedScopes)` instead -- a distinct method, not `Select(nil, ...)` -- which includes every available static scope (and its dynamic blocks) so the main-LLM path gets full cached context for a single classify-and-answer inference. Collapsing "no decision" into a nil/empty `required` slice on `Select` itself would make "a decision that needs nothing" indistinguishable from "no decision happened", so the two are separate call shapes.
+`ctxmgr.Manager.Select(required, available, pinnedScopes)` MUST always include every scope in `required` (an empty, non-nil slice is a valid "this decision needs no scopes"), and MUST additionally retain every static scope already sent earlier in the conversation even when no longer required, so the cached prefix does not shrink or shift on a turn that needs less context than a previous one. When there was NO decision at all (decision off, or every provider abstained/errored), the product MUST call `Manager.SelectAll(available, pinnedScopes)` instead -- a distinct method, not `Select(nil, ...)` -- which includes every available static scope (and its dynamic blocks) so the main-LLM path gets full cached context for a single classify-and-answer inference. Collapsing "no decision" into a nil/empty `required` slice on `Select` itself would make "a decision that needs nothing" indistinguishable from "no decision happened", so the two are separate call shapes.
 
 #### REQ: ctxmgr-stable-order
 
@@ -180,7 +237,11 @@ Dynamic blocks MUST be included only for scopes in `required` or `pinnedScopes` 
 
 #### REQ: cloud-client-endpoints
 
-`ai/cloud.Client` MUST implement `ai.LLMProvider` (Name `"cloud"`) by `POST {BaseURL}ai/chat` with `Accept: text/event-stream`, a bearer token from `Config.Token`, and the `X-AI-Product` header set from `Config.Product`, parsing the response with `cloudproto.ReadEvents` and relaying its events (already fatal-error-contract-conformant) unchanged; `Client.Decider()` returns a SEPARATE `decision.Provider` value (Name `"cloud-decision"`) by `POST {BaseURL}ai/decision`, treating `decided=false` as abstention; and `Usage(ctx)` by `GET {BaseURL}ai/usage`. `Config.BaseURL` MUST be normalised to always end with `/` and carries no default of its own -- the product supplies it (`ai/aiconfig.Deps.CloudBaseURL` or `Config.Cloud.BaseURL`). A non-2xx response at any of the three endpoints MUST be decoded as `cloudproto.ErrorResponse` into an `*ai.Error`, and all three retry 429/5xx before the first byte like the BYOK adapters.
+`ai/cloud.Client` MUST implement `ai.LLMProvider` (Name `"cloud"`) by `POST {BaseURL}ai/chat` with `Accept: text/event-stream`, a bearer token from `Config.Token`, and the `X-AI-Product` header set from `Config.Product`, parsing the response with `cloudproto.ReadEvents` and relaying its events (already fatal-error-contract-conformant) unchanged; `Client.Decider()` returns a SEPARATE `decision.Provider` value (Name `"cloud-decision"`) by `POST {BaseURL}ai/decision`, treating `decided=false` as abstention; and `Usage(ctx)` by `GET {BaseURL}ai/usage`. `Config.BaseURL` MUST be normalised to always end with `/` and carries no default of its own -- the product supplies it (`ai/aiconfig.Deps.CloudBaseURL` or `Config.Cloud.BaseURL`). A non-2xx response at any of the three endpoints MUST be decoded as `cloudproto.ErrorResponse` into an `*ai.Error` (carrying the `Retry-After` it asked for, in both header forms, capped at 10 minutes, as `RetryAfterMs`), and all three retry 429/5xx before the first byte like the BYOK adapters. On the decision routes (`ai/decision`, `ai/score`) the error MUST also match the engine-neutral sentinel it stands for, so the circuit breaker and the combinators classify the cloud engine exactly as they classify a TypeSafe one: 401/403 or code `auth` (and a failing token source) `decision.ErrAuth`; 400/422 or code `invalid` `decision.ErrInvalidRequest`; 429 with code `quota` `decision.ErrQuota` (allowance exhausted: not transient, never retried, breaker-neutral); 404/405 (other than ai/score's "no such route") `decision.ErrMisconfigured`; any other 429 and every 5xx a transient engine fault that counts against the breaker. A response that carries a `Retry-After` MUST NOT be retried by the client itself (a breaker keeps the engine out of service at least that long instead). Every request MUST carry the `X-AI-Protocol` header.
+
+#### REQ: cloud-score-route
+
+The cloud boundary MUST offer a scoring route so a client can reach table narrowing through a hosted decision endpoint: `POST {base}ai/score` with the bearer token, the `X-AI-Product` header and the `X-AI-Protocol` header (the protocol version the client speaks, `cloudproto.ProtocolVersion`, in addition to the version prefix of `{base}`), body `cloudproto.ScoreRequest` (the `decision.ScoreRequest` fields `product`, `text`, `context`, `questions[{id, kind, instructions, candidates[{id, description}], noneId}]`, plus `interactionId` and `clientContext` as on a decision request), and a 2xx JSON body `cloudproto.ScoreResponse`: `answers` (an object keyed by question id, each a `decision.Answer` with `scores[{id, probability}]`, optional `confidence` with `hasConfidence`, `calibrated`, `noneId`), `engine` (the answering leaf engine), `model` (its model id), `strategy` (`single`, `fallback`, `hedged`, `race` or empty), `calibrated` (true only when the answering engine is calibrated), `attempts` (each engine tried, as `decision.Attempt`: `provider`, `outcome`, `role`, `latencyMs` in integer milliseconds, and the attempt's own `usage` when its engine reported it, so hedged and fallen-back calls are metered per engine), optional `usage` (the answering engine's) and `protocol` (the version the server answered in, informational). The route is additive within the API version: unknown JSON fields are ignored on both sides and old clients never call it. A server that predates it SHOULD answer 501; a 404 or 405 is accepted. A client MUST treat as `decision.ErrUnsupported` (not retried, neutral for a circuit breaker, so a combinator moves to its next engine) ONLY an unambiguous "route not implemented": a 501, or a 404/405 whose body is not a protocol `ErrorResponse` AND whose base URL answers `GET ai/usage` in the protocol (a 2xx JSON object, or any status with an `ErrorResponse` body); it MUST remember that finding for the client's lifetime, making no further request, until `Client.ResetCapabilities`. Every other 404/405 (an `ErrorResponse` body such as an unknown product, or a base URL that does not speak the protocol) MUST be an error matching `decision.ErrMisconfigured` (outcome `misconfigured`), which a circuit breaker ignores, a `Fallback` does not hide behind its backup and the client does not remember; an inconclusive probe (a transport failure, a 429 or a 5xx without a protocol body) is an engine fault and remembers nothing. A server MUST therefore use 501 or 404/405 on this route for nothing but "no such route" and MUST put an `ErrorResponse` body on every application error. `cloud.Client.Decider()` MUST return a value that is also a `decision.ScoredProvider` and `decision.TracedScorer` backed by this route: the client refuses an invalid request locally, retries 429 and 5xx before the first byte like every other call, validates the answers against the request, sorts them, reports an answer `Calibrated` only when both the answer and the response say so, and puts the server's engine, strategy, model and attempts in the `Report`. Servers live in other repositories; this requirement is their contract.
 
 #### REQ: cloud-decider-is-a-separate-value
 
@@ -362,6 +423,209 @@ A BYOK adapter (`ai/openaicompat` or `ai/anthropic`, selected by `BYOK.Protocol`
 **When** it is walked recursively
 **Then** every object node has `additionalProperties: false` and every key in its `properties` also appears in its `required`, and a `Decision` with `Slots` set round-trips through the wire array-of-`{name,value}` shape back into the same map
 
+### AC: policy-worked-examples
+**Requirements:** ai-layer#req:selection-policy
+
+**Given** the narrowing policy and independent relevance probabilities loans 0.96, loan_items 0.91, members 0.72, and separately a choice 0.38/0.35/0.33 and a relevance list 0.38/0.35/0.33
+**When** each is evaluated
+**Then** the first is `several` with the strong subset loans and loan_items, and both of the others are `uncertain`, never "A wins"
+
+### AC: policy-uncalibrated-is-unscored
+**Requirements:** ai-layer#req:selection-policy
+
+**Given** a choice answer 0.99/0.01 that is not calibrated, and a relevance answer 0.95/0.7/0.2 that is not calibrated
+**When** the narrowing policy evaluates them
+**Then** both are `unscored` with `Proposals` (the top candidate; the candidates at or above 0.60), no `Picks`, nothing strong and not actionable, the same relevance numbers calibrated are an actionable `several` with `Picks` and no `Proposals`, the zero-value policy and a policy with a zero threshold are invalid and select nothing (`invalid_policy`), and a calibrated one-candidate choice with no confidence at probability 0.1 is `uncertain`
+
+### AC: policy-chain-falls-through-on-uncertain
+**Requirements:** ai-layer#req:chain-policy, ai-layer#req:decision-additive-scores
+
+**Given** a `Chain` with the narrowing policy and a provider returning a calibrated decision whose scores are 0.38/0.35/0.33, followed by a second provider that selects
+**When** `Chain.Decide` runs
+**Then** the first attempt is recorded `uncertain` with detail `uncertain: low_confidence`, the chain falls through and the second provider decides; with no second provider the chain returns `ok=false`; with `KeepNonSelected` it returns `ok=true` with `Decision.Outcome == uncertain` and `Actionable()` false; the same chain with a nil `Policy` rejects the first as `low_confidence`
+
+### AC: chain-uncalibrated-needs-an-explicit-opt-in
+**Requirements:** ai-layer#req:chain-policy, ai-layer#req:selection-policy, ai-layer#req:decision-additive-scores
+
+**Given** a `Chain` and a provider returning an uncalibrated decision (an LLM emulator's self-reported confidence), and separately a calibrated decision without `Scores`
+**When** the chain runs under the narrowing policy (`AcceptUncalibratedAt` 0.70) with confidences 0.95, 0.72 and 0.60, under the durable policy (`AcceptUncalibratedAt` 0) with 0.72 and 0.99, and under a durable policy that opts in at 0.80 with 0.85 and 0.75
+**Then** narrowing accepts 0.95 and 0.72 as `accepted` (actionable, `Calibrated` false, attempt `decided`, detail `accepted: accepted_uncalibrated`) and records 0.60 as `uncertain` with the verdict `unscored: low_confidence`; durable never accepts, records `uncertain` with `unscored: not_calibrated` and falls through (so a durable chain whose calibrated engine is down does not act on the LLM backup's 0.72), and with `KeepNonSelected` returns it `unscored` and not actionable; the calibrated decision without scores is `unscored: no_scores`; the opt-in policy accepts 0.85 and rejects 0.75; and for every case `Decision.Actionable()` equals `Selection.Actionable()` of the same policy
+
+### AC: scored-request-and-result-validation
+**Requirements:** ai-layer#req:scored-candidates
+
+**Given** a `ScoreRequest` with a duplicate candidate id, a duplicate question id, an unknown kind, an empty id and a `NoneID` that is no candidate (all using distinctive ids), and a `ScoreResult` missing the answer to one question
+**When** `ValidateScoreRequest` and `ValidateScoreResult` run
+**Then** both return errors, the request error matches `decision.ErrInvalidRequest` and names problems by question and candidate position, never by id, and a well-formed pair passes
+
+### AC: fallback-only-on-failure
+**Requirements:** ai-layer#req:engine-combinators
+
+**Given** `Fallback(jev, llm)` where `jev` and `llm` would answer differently
+**When** `jev` answers, and separately when `jev` errors, times out, reports an open breaker, is rejected or unauthorised, or returns an invalid answer, and when it refuses for an exhausted allowance or a misconfigured endpoint
+**Then** the first call never calls `llm` and uses `jev`'s answer; each failing case uses `llm`'s answer with `FallbackFired` true and the attempts `jev:<outcome>, llm:decided` (`rejected` and `auth` for the caller faults); an abstention or an uncertain answer from `jev` does not start `llm` unless `WithFallbackOn` opts in; a `quota` refusal does not start `llm` (the error matching `decision.ErrQuota` is returned) unless `WithFallbackOn(OnQuota)` opts in; and a `misconfigured` refusal never starts `llm`, with any option
+
+### AC: engine-answers-carry-their-verdict
+**Requirements:** ai-layer#req:engine-combinators, ai-layer#req:decision-trace-engine
+
+**Given** engines built with `WithPolicy` over a calibrated clear answer, a calibrated uncertain answer (0.38/0.35/0.33), an uncalibrated 0.72 decision under the narrowing and the durable policy, and a policy-less engine; and scored attempts, some answered with usage, from a `Fallback` whose primary failed, from an uncertain primary followed by an `OnUncertain` backup, and from a nested engine
+**When** each is called directly, and the decision engines run inside a durable `Chain`
+**Then** every decision from a policy engine carries an `Outcome` (`selected`, `uncertain`, `accepted` at 0.72 under narrowing, `unscored` under durable) and `Actionable()` is true only for the first and third; a non-actionable one is recorded `uncertain` and returned (an uncertain answer is an answer) rather than acted on; a durable chain around a `Fallback(jev down, llm 0.72)` returns `ok=false` with `llm` recorded `uncertain` (`unscored: not_calibrated`); a policy-less engine returns an empty `Outcome` and a `Chain` without a policy still honours an engine's explicit non-actionable (`uncertain`, `none`, `unscored`) verdict; each answered score attempt carries its own `Usage` (nil when none was reported, never zero) and a failed or cancelled one carries nil
+
+### AC: hedged-starts-backup-after-budget
+**Requirements:** ai-layer#req:engine-combinators
+
+**Given** `Hedged(jev, llm, 600ms)` over a fake clock, with `jev` blocked
+**When** the clock advances 600ms and `llm` answers
+**Then** `llm`'s answer wins with `HedgeFired` true, `jev` is recorded `cancelled` with 600ms latency and exits, and when `jev` fails outright the backup starts at once with `FallbackFired` true and `HedgeFired` false
+
+### AC: race-first-valid-wins-and-cancels-losers
+**Requirements:** ai-layer#req:engine-combinators
+
+**Given** `Race` over three engines, one of which returns an invalid answer and two of which wait on their context
+**When** the third answers validly
+**Then** that answer wins, the others are `cancelled`, the call returns without waiting for them, and no goroutine outlives the test
+
+### AC: combinator-enforces-engine-timeout
+**Requirements:** ai-layer#req:engine-combinators
+
+**Given** an engine that ignores its context and a fake clock
+**When** the clock advances past the engine's `DecisionTimeout()`
+**Then** the combinator returns with outcome `timeout` and an error matching `context.DeadlineExceeded`
+
+### AC: combinators-nest-and-trace
+**Requirements:** ai-layer#req:decision-trace-engine, ai-layer#req:engine-combinators
+
+**Given** a `Chain` holding `Fallback(Hedged(jev, llm), rules)` where `jev` errors
+**When** `Chain.Decide` runs
+**Then** `Trace.Attempts` lists `jev:error, llm:decided`, `Trace.Engine` is `llm`, `Trace.DecidedBy` is the outer combinator's name, and a winner the chain rejects is relabelled `low_confidence`
+
+### AC: breaker-opens-probes-and-recovers
+**Requirements:** ai-layer#req:circuit-breaker
+
+**Given** a `Breaker` over an engine that fails, with a fake clock
+**When** 5 consecutive calls fail, then a call is made, then 30 seconds pass and a call is made while another probe is in flight, then the probe succeeds
+**Then** the sixth call returns `ErrUnavailable` without calling the engine; after the cooldown exactly one probe is let through and the concurrent caller gets `ErrUnavailable`; success closes the breaker; a failed probe reopens it and a cancelled one does not count as a failure; and failures more than 30 seconds apart do not accumulate
+
+### AC: breaker-counts-only-engine-health
+**Requirements:** ai-layer#req:circuit-breaker
+
+**Given** a `Breaker` with threshold 1 over an engine that returns, in turn, an error matching `decision.ErrInvalidRequest`, one matching `decision.ErrAuth`, one matching `decision.ErrQuota`, one matching `decision.ErrMisconfigured`, and a 429 carrying `Retry-After: 90s`, and a probe that hangs ignoring its context
+**When** the calls are made with a fake clock, and a late result from a call that started before the breaker opened arrives
+**Then** the first four never open it; the fifth (with threshold 2 and two such failures) keeps it open past the 30 second cooldown until 90 seconds have passed; a late success or failure from a call that started before the opening neither closes the breaker nor extends its cooldown; and the hung probe is abandoned when `WithBreakerProbeTimeout` passes, counts as a failure and returns the breaker to open, after which a later probe is let through
+
+### AC: hedged-hung-primary-opens-its-breaker
+**Requirements:** ai-layer#req:circuit-breaker, ai-layer#req:engine-combinators
+
+**Given** `Hedged(Breaker(jev), llm, 100ms)` over a fake clock where `jev` hangs until cancelled, once with the default breaker and once with `WithBreakerSlowThreshold(3)`, and a healthy primary that merely answers after the hedge delay
+**When** twelve calls are made, each answered by `llm` after the hedge fires
+**Then** each hedged-out `jev` attempt is recorded `cancelled` with detail "superseded by hedge" and counted as SLOW (`Breaker.Stats().Slow`), never as a failure; the default breaker stays closed after twelve (a healthy primary above the hedge delay is not taken out of service by its own hedge); with the slow threshold the breaker is open after the third and the fourth call records `jev:unavailable, llm:decided` with `FallbackFired`; a call that completes in time resets the slow run; a primary that outruns its OWN timeout is a plain timeout failure that opens the default breaker at its failure threshold; and the same hung engine as a `Race` loser is never counted at all
+
+### AC: hedged-abstain-rule-is-independent-of-timing
+**Requirements:** ai-layer#req:engine-combinators
+
+**Given** `Hedged(jev, llm, 100ms)` over a fake clock where `jev` abstains (and, separately, answers uncertain under a policy) only after the hedge fired and `llm` is still running
+**When** `jev` finishes
+**Then** the abstention (or uncertain answer) stands, `llm` is recorded `cancelled`, and the result equals the one when `jev` finishes before the hedge fires; with `WithFallbackOn(OnAbstain)` (or `OnUncertain`) the same late outcome hands the call to `llm`, whose answer wins
+
+### AC: attempt-wire-form-carries-milliseconds-and-usage
+**Requirements:** ai-layer#req:decision-trace-engine, ai-layer#req:cloud-score-route
+
+**Given** an `Attempt` with a latency of 1234ms and its own usage, and JSON with only the legacy `latency` (nanoseconds), with both fields, and with only `latencyMs`
+**When** each is marshalled and unmarshalled, inside a `Report` and a `cloudproto.ScoreResponse`
+**Then** the wire form has the integer `latencyMs` 1234 and (for older readers) `latency` in nanoseconds, `latencyMs` wins when both are present, the legacy field alone still reads, and `usage` round-trips per attempt and is absent when the engine reported none
+
+### AC: engines-are-safe-to-build-empty
+**Requirements:** ai-layer#req:engine-combinators, ai-layer#req:circuit-breaker
+
+**Given** `Race(nil)`, `Single(nil)`, `Hedged(nil, x, d)`, a zero-value `Engine` and `NewBreaker(nil)`
+**When** their names and `DecisionTimeout()` are read and each is called
+**Then** nothing panics, `Race(nil).DecisionTimeout()` is 0, and every call, `Decide` and `Score` alike (the breaker's included), returns an error matching `compose.ErrNoEngine`
+
+### AC: config-builds-engine-chain
+**Requirements:** ai-layer#req:config-selects-engines
+
+**Given** `decision: {engines: [jev, llm-decider], strategy: hedged, hedgeAfter: 600ms, policy: narrowing}` and a `Deps.Engines` registry
+**When** `Build` runs
+**Then** the chain is the product's rules, then one hedged engine over breaker-wrapped `jev` and `llm-decider`, then the cloud decider; `Providers.Policy` is the narrowing policy; `provider: disabled` drops the engine; and an unknown engine name, strategy, policy or a three-engine `fallback` is a `Build` error
+
+### AC: config-policy-values
+**Requirements:** ai-layer#req:config-selects-engines
+
+**Given** `decision: {policy: narrowing, policyValues: {minProbability: 0.7, maxPicks: 3}}`, and separately `policyValues` without a `policy`, a probability above 1, a zero threshold and an unordered set
+**When** `Build` runs
+**Then** `Providers.Policy` is the narrowing policy with those two values replaced and named `narrowing+custom`, and each of the invalid cases is a `Build` error
+
+### AC: typesafe-request-and-error-mapping
+**Requirements:** ai-layer#req:typesafe-client
+
+**Given** a fake `HTTPDoer` and a client with a test key
+**When** a call is made, and then calls are answered 401, 400, 422, 429 with `Retry-After: 7`, 529, 500 and 404 with bodies that echo the state
+**Then** the request is a `POST` to `/v1/systemone` with a bearer header and the `{state, model, questions}` body; each status maps to its sentinel with the request id, error type and retry delay; no error string contains the body or the key; exactly one HTTP call is made per `Ask`; and the call hook reports model, usage and status without content
+
+### AC: typesafe-refuses-unsafe-requests-and-redirects
+**Requirements:** ai-layer#req:typesafe-client
+
+**Given** a client built with no model, with `http://api.example.com`, with credentials in the URL, and a default client calling a loopback server that answers 307 to a second server; and requests with 256 options, 256 questions and a state of about 40k tokens
+**When** `New` and `Ask` run
+**Then** the first three `New` calls fail without echoing the URL, the redirect is not followed (the second server sees nothing; the error is `ErrUnexpectedStatus`), and each oversized request fails with `ErrTooManyOptions`, `ErrTooManyQuestions` or `ErrStateTooLarge` (all matching `ErrInvalidRequest` and `decision.ErrInvalidRequest`) before any HTTP call, while a request just under the budget goes through and `MaxStateTokens` below 0 disables the check
+
+### AC: errors-carry-no-caller-content
+**Requirements:** ai-layer#req:typesafe-client, ai-layer#req:decision-trace-engine, ai-layer#req:engine-combinators
+
+**Given** a response that answers with an option the request never had, a request with a duplicate candidate id, and a decision that fails validation, all using a distinctive id
+**When** `Score`, `Decide`, a `compose` engine's `Score` and a `Chain` run
+**Then** no returned error and no `Attempt.Detail` contains the id, the question id or the model's own words; they carry only counts and positions, and the request error from a combinator still matches `decision.ErrInvalidRequest`
+
+### AC: typesafe-retry-after-and-model
+**Requirements:** ai-layer#req:typesafe-client
+
+**Given** 429 responses carrying `Retry-After` as `7`, as an HTTP date 30 seconds ahead, as a date in the past and as 864000, and a decide response from model `jev-1.13.0`
+**When** `Ask` and `Decide` run
+**Then** `decision.RetryDelay` reads 7s, 30s, 0 and 10 minutes, and the `Decision`, its `Trace` and the `ScoreResult` all carry `jev-1.13.0`
+
+### AC: typesafe-score-maps-relevance-to-nouls
+**Requirements:** ai-layer#req:typesafe-score-mapping
+
+**Given** a `ScoreRequest` with one relevance question over 4 tables and one choice question
+**When** `Score` runs against a recorded response
+**Then** exactly one call carries 5 questions (4 Nouls, 1 Choice), the state holds the question text and the table catalogue, and the answers are `Calibrated` with the Noul probabilities per table and the Choice's confidence and `NoneID`; malformed or mismatched answers are `ErrBadResponse`
+
+### AC: typesafe-decide-folds-into-a-validating-decision
+**Requirements:** ai-layer#req:typesafe-decide-mapping
+
+**Given** a taxonomy with two modules, scopes, a data kind, entity types and presentations, and a recorded response
+**When** `Decide` runs, and again with `other` as the top intent
+**Then** one call carries every question, the decision carries module, intent, scores, required scopes and data, reference and presentation, validates, is `Calibrated`, and the request body contains neither the interaction id, the client context, the time zone nor `now`; `other` abstains; a `choose:<role>` request sends exactly one Choice
+
+### AC: typesafe-decide-always-asks-the-interaction
+**Requirements:** ai-layer#req:typesafe-decide-mapping
+
+**Given** a request with an empty state and no recent turns, and recorded responses whose interaction Choice has `chat` on top at confidence 0.9, `chat` on top at confidence 0.1 or with a 0.05 lead over the runner-up, `confirmation` on top at p=0.19 with confidence 0.04 beside a confident intent (0.97), a `confirmation`, `rejection`, `correction`, `cancellation` or `undo` on top at confidence 0.80 and at 0.97, and one whose top is outside the enum (by the `choice` field and, separately, by the probabilities)
+**When** `Decide` runs, alone and inside a `Chain` with the durable policy
+**Then** the interaction question is sent; `chat` at 0.9 is the `Interaction` with `InteractionConfidence` 0.9; every doubtful case, including the probed `confirmation`, makes the provider abstain (`ok=false`, no error, the chain's attempt is `abstained`) instead of carrying a guessed interaction; a side-effectful interaction at 0.80 abstains even under the narrowing policy and is used at 0.97, while a harmless one at 0.80 is used under narrowing and not under the durable policy; the out-of-enum answers are `ErrBadResponse` quoting nothing; and no interaction is assumed when the question is not answered
+
+### AC: typesafe-live-test-skips-without-opt-in
+**Requirements:** ai-layer#req:typesafe-live-test-opt-in
+
+**Given** `JEV_API_KEY` is unset or `AICHAT_LIVE_JEV` is not `1`
+**When** `go test ./ai/decision/typesafe` runs
+**Then** the live tests are skipped and no network call is made
+
+### AC: llmdecider-scores-in-one-inference
+**Requirements:** ai-layer#req:llmdecider-scores
+
+**Given** a fake LLM that answers a two-question `ScoreRequest` (one relevance, one choice) with one structured result
+**When** `Score` runs, and again with unnormalised and out-of-range numbers, with an invented id, with a question left unanswered, and with a choice that has no probability anywhere
+**Then** one inference carries both questions and the strict schema; the result validates with `Calibrated` and `HasConfidence` false; choices are normalised, numbers clamped, invented ids dropped and missing candidates scored 0; the unanswered and no-probability cases are `ErrBadScores` without any id in the text; the narrowing policy turns the answer into `unscored` with a proposal
+
+### AC: scored-questions-have-an-llm-backup
+**Requirements:** ai-layer#req:llmdecider-scores, ai-layer#req:engine-combinators, ai-layer#req:circuit-breaker
+
+**Given** `Fallback`, `Hedged` and `Race` over `Breaker(typesafe)` and `Breaker(llmdecider)`, the TypeSafe client over a fake transport, and a scored table-narrowing request
+**When** `Score` runs with Jev answering HTTP 500, with Jev hanging until its timeout (or hedge delay), and with Jev's breaker open
+**Then** the LLM decider answers every time with the attempts `jev:error|timeout|cancelled|unavailable, <llm>:decided`, an open breaker never calls Jev, and the narrowing policy yields a proposal (relevance: ids at or above the floor; choice: the top id) that is not actionable
+
 ### AC: ctxmgr-select-vs-selectall
 **Requirements:** ai-layer#req:ctxmgr-retain-then-required
 
@@ -396,6 +660,20 @@ A BYOK adapter (`ai/openaicompat` or `ai/anthropic`, selected by `BYOK.Protocol`
 **Given** a test server implementing `ai/chat`, `ai/decision` (once with `decided:false`), and `ai/usage`, and separately a server returning a non-2xx `ErrorResponse` and one returning 503 twice then 200
 **When** `cloud.Client`'s methods (`Stream`, `Decider().Decide`, `Usage`) are called against each
 **Then** chat streams events normally, decision reports `ok=false` for the abstain case, usage decodes the allowance, the error case surfaces as an `*ai.Error` with the response's `Code`/`Message`, and the 503-then-200 case retries before the first byte
+
+### AC: cloud-score-route-and-old-servers
+**Requirements:** ai-layer#req:cloud-score-route, ai-layer#req:cloud-client-endpoints
+
+**Given** a test server implementing `ai/score` (with an unsorted, partly uncalibrated response carrying per-attempt usage and `latencyMs`), servers that predate the route (ai/usage answering, ai/score answering 404 with a proxy HTML page or plain text, 405, or 501), a server where every route answers 404 HTML (a mistyped base URL), one answering a JSON `ErrorResponse` 404 (an unknown product), probes of `GET ai/usage` that answer a 401 `ErrorResponse`, an HTML 200, JSON `null` or a 502, one answering a JSON `ErrorResponse` with 502, and one answering malformed or invalid results
+**When** the cloud decider's `Score` and `ScoreTraced` run, also inside a `Fallback` over a `Breaker`, five times in a row against each old server, and again after `ResetCapabilities`
+**Then** the request carries the product, text, questions, interaction id, client context and the `X-AI-Protocol` header; the answers come back sorted, validated and `Calibrated` only when both flags say so, with the server's engine, model, strategy, attempts, per-attempt usage and latency in the `Report`; the 501 server gives `decision.ErrUnsupported` after one call and the 404/405 servers after one `ai/score` call and one `ai/usage` probe, the finding is remembered (no request on the next four calls) until `ResetCapabilities`, the `Fallback` moves to its backup and the breaker stays closed; the mistyped base URL and the JSON 404 are `decision.ErrMisconfigured` (never `ErrUnsupported`), recorded `misconfigured`, not hidden by the `Fallback`, not remembered, never opening the breaker, and quoting none of the body; a probe that answers a 401 `ErrorResponse` counts as the protocol speaking, an HTML 200 or JSON `null` does not, and a 502 is an inconclusive engine fault that remembers nothing; the 502 is an `*ai.Error` retried before the first byte; malformed or invalid responses are errors that quote none of the body or ids; an invalid request is refused locally with no call
+
+### AC: cloud-errors-map-to-engine-outcomes
+**Requirements:** ai-layer#req:cloud-client-endpoints, ai-layer#req:cloud-score-route, ai-layer#req:circuit-breaker
+
+**Given** a server answering `ai/score` and `ai/decision` with 400, 422, 401, 403, a 429 with code `quota`, a 429 with code `rate_limited`, a 503 with `Retry-After` as `90`, as an HTTP date, as junk, as a past date and as 100000000, a body-only `retryAfterMs`, and a token source that fails
+**When** the cloud decider runs behind `Breaker(threshold 1)` and inside `Fallback` with a paid backup, six times each
+**Then** 400/422 match `decision.ErrInvalidRequest` (outcome `rejected`) and 401/403 and the failing token source match `decision.ErrAuth` (outcome `auth`), none opens the breaker and none is retried (one request per call); the quota refusal matches `decision.ErrQuota` (outcome `quota`), is not retried, does not open the breaker, is returned to the caller and does not start the paid backup unless `WithFallbackOn(OnQuota)` opts in; the plain 429 is retried before the first byte and opens the breaker; `*ai.Error` stays reachable through `errors.As` in every case; `Retry-After` is carried as `ai.Error.RetryAfterMs` (`decision.RetryDelay` reads 90 seconds, 0 for junk or a past date, and at most 10 minutes), the response is not retried by the client, and the breaker stays open past its 30 second cooldown until the delay has passed
 
 ### AC: byok-never-touches-cloud-base-url
 **Requirements:** ai-layer#req:byok-direct-connection
@@ -525,6 +803,9 @@ A BYOK adapter (`ai/openaicompat` or `ai/anthropic`, selected by `BYOK.Protocol`
 
 ## Open Questions
 
+- `typesafe`'s relevance questions depend on wording: the live API separated a catalogue of 11 tables with the catalogue in the state and a bare question, and not with a description repeated in each question (REQ: typesafe-score-mapping). The wording, and every number of `NarrowingPolicy` and `DurablePolicy` (provisional, from a single small sample), should be re-measured on a product's own corpus whenever a model version is pinned or moved; until then they are starting values, overridable through `decision.policyValues`.
+- Per-product and per-decision-type engine overrides (a different strategy for anonymous traffic, for one decision type) are not part of `aiconfig` yet; a host that needs them selects the configured `decision.Provider` per request itself.
+- The `ai/score` route is specified here (REQ: cloud-score-route) but its server side lives in other repositories and is not implemented by this module; until a server implements it, a client sees `decision.ErrUnsupported` and its combinator falls over to a local engine.
 - `ai/ctxmgr`'s token estimate is `len/4`; if a product finds this consistently over/under-shoots its real tokenizer badly enough to mis-budget, a provider-supplied estimator hook may be worth adding.
 - `ai/decision/llmdecider`'s `MaxRecent` trims `Request.Recent` client-side; whether that trimming should instead be the product's responsibility (so it can prioritise which turns matter) is open.
 - Whether `ai/anthropic` should adopt native structured-output support instead of the system-prompt-instruction approach is open pending live-API verification of current support/stability for the target models; the instruction approach is kept for now since it is already tested and working.

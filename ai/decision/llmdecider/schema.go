@@ -73,3 +73,39 @@ const decisionSchema = `{
   },
   "required": ["module", "intent", "interaction", "reference", "requiredScopes", "requiredData", "slots", "canHandleDeterministically", "needsLLM", "presentation"]
 }`
+
+// scoreSchema is the WIRE JSON Schema of a Decider.Score answer: one entry per
+// question, one {id, probability} per candidate. Strict-mode authoring rules
+// apply as for decisionSchema (every property required, additionalProperties
+// false throughout); the open map of ids to numbers is an array of pairs for the
+// same reason Slots is. TestScoreSchema_IsStrictValid checks it.
+const scoreSchema = `{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "answers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "questionId": {"type": "string"},
+          "scores": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "id": {"type": "string"},
+                "probability": {"type": "number", "minimum": 0, "maximum": 1}
+              },
+              "required": ["id", "probability"]
+            }
+          }
+        },
+        "required": ["questionId", "scores"]
+      }
+    }
+  },
+  "required": ["answers"]
+}`

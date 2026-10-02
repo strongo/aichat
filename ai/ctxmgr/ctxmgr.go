@@ -89,7 +89,7 @@ func (m *Manager) Select(required []string, available []ai.ContextBlock, pinnedS
 	return m.selectImpl(required, false, available, pinnedScopes)
 }
 
-// SelectAll picks context for a turn with NO decision.Decision at all (Jev
+// SelectAll picks context for a turn with NO decision.Decision at all (decision
 // off, or every decision.Provider abstained/errored): every available
 // static scope is included, plus every available dynamic scope for
 // required-equivalent purposes, since the main LLM must classify and answer

@@ -21,6 +21,7 @@ import (
 	"github.com/strongo/aichat/ai/anthropic"
 	"github.com/strongo/aichat/ai/cloud"
 	"github.com/strongo/aichat/ai/decision"
+	"github.com/strongo/aichat/ai/decision/compose"
 	"github.com/strongo/aichat/ai/openaicompat"
 )
 
@@ -38,6 +39,68 @@ type Decision struct {
 	// decision on -- Build errors if no token source is available), or
 	// "disabled". Any other value is a Build error.
 	Provider string `yaml:"provider" json:"provider"`
+
+	// Engines names the decision engines to run, resolved against Deps.Engines
+	// (for example ["jev", "llm-decider"]). Which engines run, and how they are
+	// combined, is configuration, so the engine behind a decision can be swapped
+	// without touching code. Empty: no configured engines (only the product's
+	// ExtraDecision providers and the cloud decider). Engines run after the
+	// product's own rules and before the cloud decider.
+	Engines []string `yaml:"engines" json:"engines"`
+	// Strategy combines the engines: "single" (exactly one engine; the default
+	// for one), "fallback" (exactly two; the backup runs only if the primary
+	// fails; the default for two), "hedged" (exactly two; the backup starts after
+	// HedgeAfter or as soon as the primary fails, and the first valid answer
+	// wins) or "race" (two or more; the first valid answer wins). More than two
+	// engines need "race".
+	Strategy string `yaml:"strategy" json:"strategy"`
+	// HedgeAfter is the latency budget of the "hedged" strategy as a Go duration
+	// such as "600ms" (default compose.DefaultHedgeAfter). Set it above the
+	// primary's p99: a primary slower than the budget is paid for twice on every
+	// slow call.
+	HedgeAfter string `yaml:"hedgeAfter" json:"hedgeAfter"`
+	// Breaker wraps every engine in a circuit breaker so an engine that is down
+	// is not called on every request. Default true.
+	Breaker *bool `yaml:"breaker" json:"breaker"`
+	// BreakerSlowThreshold, when above 0, makes that many consecutive calls in
+	// which a "hedged" primary was cancelled by its backup open the primary's
+	// breaker (compose.WithBreakerSlowThreshold). Default 0: slowness never opens
+	// a breaker, only failures (including the primary's own timeout) do. Set it
+	// for an engine that can hang without ever failing.
+	BreakerSlowThreshold int `yaml:"breakerSlowThreshold" json:"breakerSlowThreshold"`
+	// FallbackOn lists extra conditions that start the backup beyond failure:
+	// "abstain", "uncertain" and "quota" (the primary refused because the caller's
+	// allowance is exhausted; the backup is usually a paid engine, so this is a
+	// spending decision). Empty by default: an abstention or an uncertain answer
+	// is an answer, not a failure, and an exhausted allowance is surfaced to the
+	// caller. A misconfigured endpoint never starts a backup.
+	FallbackOn []string `yaml:"fallbackOn" json:"fallbackOn"`
+	// Policy names the selection policy applied to calibrated scored answers:
+	// "narrowing" or "durable" (see decision.NarrowingPolicy, DurablePolicy).
+	// Empty: no policy; the chain keeps its MinConfidence behaviour. The named
+	// values are PROVISIONAL defaults from a single sample: re-measure them for
+	// your corpus and the exact model id, and set the result in PolicyValues.
+	Policy string `yaml:"policy" json:"policy"`
+	// PolicyValues overrides individual numbers of the named policy (custom
+	// values; any left unset keep the named policy's). The result is validated
+	// (decision.SelectionPolicy.Validate): an invalid combination is a Build
+	// error. It needs Policy to name the base.
+	PolicyValues *PolicyValues `yaml:"policyValues" json:"policyValues"`
+}
+
+// PolicyValues are optional numeric overrides of a named selection policy; see
+// decision.SelectionPolicy for what each one means.
+type PolicyValues struct {
+	MinConfidence        *float64 `yaml:"minConfidence" json:"minConfidence"`
+	MinGap               *float64 `yaml:"minGap" json:"minGap"`
+	MinProbability       *float64 `yaml:"minProbability" json:"minProbability"`
+	StrongProbability    *float64 `yaml:"strongProbability" json:"strongProbability"`
+	PotentialProbability *float64 `yaml:"potentialProbability" json:"potentialProbability"`
+	MaxPicks             *int     `yaml:"maxPicks" json:"maxPicks"`
+	// AcceptUncalibratedAt is the explicit opt-in to acting on an uncalibrated
+	// decision (decision.SelectionPolicy.AcceptUncalibratedAt): 0 never, as the
+	// durable policy defaults to; the narrowing policy defaults to 0.70.
+	AcceptUncalibratedAt *float64 `yaml:"acceptUncalibratedAt" json:"acceptUncalibratedAt"`
 }
 
 // BYOK configures a direct, product-owned connection to an LLM provider.
@@ -104,6 +167,12 @@ const (
 	EnvBYOKModel     = "AI_BYOK_MODEL"
 	EnvBYOKAPIKeyEnv = "AI_BYOK_API_KEY_ENV"
 	EnvCloudBaseURL  = "AI_CLOUD_BASE_URL"
+
+	// EnvDecisionEngines is a comma-separated list of engine names.
+	EnvDecisionEngines    = "AI_DECISION_ENGINES"
+	EnvDecisionStrategy   = "AI_DECISION_STRATEGY"
+	EnvDecisionHedgeAfter = "AI_DECISION_HEDGE_AFTER"
+	EnvDecisionPolicy     = "AI_DECISION_POLICY"
 )
 
 func defaults() Config {
@@ -156,6 +225,18 @@ func (c *Config) ApplyEnv(getenv func(string) string, prefix string) {
 	if v := get(EnvDecision); v != "" {
 		c.Decision.Provider = v
 	}
+	if v := get(EnvDecisionEngines); v != "" {
+		c.Decision.Engines = splitList(v)
+	}
+	if v := get(EnvDecisionStrategy); v != "" {
+		c.Decision.Strategy = v
+	}
+	if v := get(EnvDecisionHedgeAfter); v != "" {
+		c.Decision.HedgeAfter = v
+	}
+	if v := get(EnvDecisionPolicy); v != "" {
+		c.Decision.Policy = v
+	}
 	if v := get(EnvBYOKProtocol); v != "" {
 		c.BYOK.Protocol = v
 	}
@@ -177,8 +258,8 @@ func (c *Config) ApplyEnv(getenv func(string) string, prefix string) {
 // only APIKeyEnv (the variable NAME) is shown, never read.
 func (c Config) String() string {
 	return fmt.Sprintf(
-		"Config{LLM.Provider:%s Decision.Provider:%s BYOK.Protocol:%s BYOK.Endpoint:%s BYOK.Model:%s BYOK.APIKeyEnv:%s Cloud.BaseURL:%s}",
-		c.LLM.Provider, c.Decision.Provider, c.BYOK.Protocol, c.BYOK.Endpoint, c.BYOK.Model, c.BYOK.APIKeyEnv, c.Cloud.BaseURL,
+		"Config{LLM.Provider:%s Decision.Provider:%s Decision.Engines:%v Decision.Strategy:%s BYOK.Protocol:%s BYOK.Endpoint:%s BYOK.Model:%s BYOK.APIKeyEnv:%s Cloud.BaseURL:%s}",
+		c.LLM.Provider, c.Decision.Provider, c.Decision.Engines, c.Decision.Strategy, c.BYOK.Protocol, c.BYOK.Endpoint, c.BYOK.Model, c.BYOK.APIKeyEnv, c.Cloud.BaseURL,
 	)
 }
 
@@ -213,6 +294,17 @@ type Deps struct {
 	// DisableCloudDecision forces the cloud decision provider off (e.g. a
 	// product's --no-jev flag) regardless of Config.Decision.Provider.
 	DisableCloudDecision bool
+	// Engines is the registry Config.Decision.Engines resolves names against:
+	// each value is a decision.Provider (and, for scored questions, a
+	// decision.ScoredProvider), for example a real decision model and an LLM
+	// decider.
+	Engines map[string]decision.Provider
+	// Clock drives the engines' timeouts, hedge delay and breakers (tests);
+	// nil means the real clock.
+	Clock compose.Clock
+	// OnBreakerChange is called when an engine's circuit breaker changes
+	// state, so a host can log and count it.
+	OnBreakerChange func(engine string, from, to compose.BreakerState)
 }
 
 // Providers is what Build assembles: the single LLM provider to answer chat,
@@ -221,6 +313,9 @@ type Deps struct {
 type Providers struct {
 	LLM      ai.LLMProvider
 	Decision []decision.Provider
+	// Policy is the selection policy named by Config.Decision.Policy, nil when
+	// none: feed it to decision.Chain{Policy: providers.Policy}.
+	Policy *decision.SelectionPolicy
 }
 
 // Build wires up Providers from cfg and deps. LLM and Decision are
@@ -244,7 +339,10 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 		return Providers{}, fmt.Errorf("aiconfig: unknown decision.provider %q", cfg.Decision.Provider)
 	}
 
-	var out Providers
+	var (
+		out Providers
+		err error
+	)
 	var cloudClient *cloud.Client
 	haveCloudToken := deps.CloudToken != nil
 	cloudBaseURL := cfg.Cloud.BaseURL
@@ -301,6 +399,19 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 	}
 
 	out.Decision = append(out.Decision, deps.ExtraDecision...)
+
+	if out.Policy, err = policyFromConfig(cfg.Decision); err != nil {
+		return Providers{}, err
+	}
+	if cfg.Decision.Provider != "disabled" {
+		engine, err := buildEngine(cfg.Decision, deps, out.Policy)
+		if err != nil {
+			return Providers{}, err
+		}
+		if engine != nil {
+			out.Decision = append(out.Decision, engine)
+		}
+	}
 
 	switch {
 	case deps.DisableCloudDecision || cfg.Decision.Provider == "disabled":

@@ -1,13 +1,26 @@
 // Package llmdecider is a decision.Provider that makes ONE structured
 // inference against an ai.LLMProvider to produce a decision.Decision. It is
-// the product-neutral implementation the cloud hosts as "Jev": nothing here
-// is Sneat- or DataTug-specific, only the taxonomy passed in on each Request
-// gives it product shape.
+// an LLM decider: nothing here is Sneat- or DataTug-specific, only the
+// taxonomy passed in on each Request gives it product shape. Its confidences
+// are the model's self-report, not calibrated probabilities (Decision.Calibrated
+// and Answer.Calibrated stay false), so it is a fallback or an emulator behind a
+// real decision model such as ai/decision/typesafe, not a replacement for one.
+//
+// It is also a decision.ScoredProvider (see Decider.Score): one structured
+// inference answers every question of a ScoreRequest with a probability per
+// candidate, so a Fallback from a real decision model to this one still answers
+// scored questions such as table narrowing. Its scores are uncalibrated, so a
+// SelectionPolicy turns them into a proposal (decision.Selection.Proposals),
+// never a selection.
+//
+// Everything in a Request or ScoreRequest is sent verbatim to the LLM
+// provider's operator: send metadata, never row data.
 package llmdecider
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -31,7 +44,8 @@ type Options struct {
 	MaxRecent int
 }
 
-// Decider implements decision.Provider with one structured LLM inference.
+// Decider implements decision.Provider and decision.ScoredProvider with one
+// structured LLM inference per call.
 type Decider struct {
 	llm  ai.LLMProvider
 	opts Options
@@ -59,6 +73,29 @@ func (d *Decider) Name() string { return d.opts.Name }
 // DecisionTimeout implements the optional interface decision.Chain honours.
 func (d *Decider) DecisionTimeout() time.Duration { return decisionTimeout }
 
+// ErrNoLLM is returned by a Decider built without an ai.LLMProvider.
+var ErrNoLLM = errors.New("llmdecider: no LLM provider")
+
+// infer runs one structured inference and returns the structured JSON (from the
+// structured event, else extracted from the text) and the usage reported.
+func (d *Decider) infer(ctx context.Context, chatReq ai.ChatRequest) (json.RawMessage, *ai.Usage, error) {
+	if d.llm == nil {
+		return nil, nil, ErrNoLLM
+	}
+	text, structured, usage, err := ai.Collect(d.llm.Stream(ctx, chatReq))
+	if err != nil {
+		return nil, nil, fmt.Errorf("llmdecider: inference: %w", err)
+	}
+	raw := structured
+	if len(raw) == 0 {
+		raw = json.RawMessage(extractJSON(text))
+	}
+	if len(raw) == 0 {
+		return nil, nil, fmt.Errorf("llmdecider: no structured output and no parseable text")
+	}
+	return raw, usage, nil
+}
+
 // Decide implements decision.Provider.
 func (d *Decider) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
 	chatReq := ai.ChatRequest{
@@ -69,22 +106,17 @@ func (d *Decider) Decide(ctx context.Context, req decision.Request) (decision.De
 		ResponseSchema: json.RawMessage(decisionSchema),
 		Metadata:       map[string]string{"path": "decision"},
 	}
-	text, structured, _, err := ai.Collect(d.llm.Stream(ctx, chatReq))
+	raw, _, err := d.infer(ctx, chatReq)
 	if err != nil {
-		return decision.Decision{}, false, fmt.Errorf("llmdecider: inference: %w", err)
-	}
-	raw := structured
-	if len(raw) == 0 {
-		raw = json.RawMessage(extractJSON(text))
-	}
-	if len(raw) == 0 {
-		return decision.Decision{}, false, fmt.Errorf("llmdecider: no structured output and no parseable text")
+		return decision.Decision{}, false, err
 	}
 	var w wireDecision
 	if err := json.Unmarshal(raw, &w); err != nil {
 		return decision.Decision{}, false, fmt.Errorf("llmdecider: malformed decision JSON: %w", err)
 	}
-	return w.toDecision(), true, nil
+	dec := w.toDecision()
+	dec.Model = d.opts.Model
+	return dec, true, nil
 }
 
 // wireDecision mirrors decisionSchema's wire shape exactly (see schema.go's

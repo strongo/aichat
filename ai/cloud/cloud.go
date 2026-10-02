@@ -1,6 +1,7 @@
 // Package cloud is the client for the cloudproto protocol (see
 // ai/cloudproto): it implements ai.LLMProvider (chat) and exposes a separate
-// decision.Provider via Decider(), plus a Usage lookup.
+// decision.Provider via Decider() that is also a decision.ScoredProvider (POST
+// ai/score), plus a Usage lookup.
 package cloud
 
 import (
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/strongo/aichat/ai"
@@ -55,7 +57,16 @@ type Config struct {
 // that split is actually satisfied.
 type Client struct {
 	cfg Config
+	// scoreAbsent is set once the server is confirmed to have no ai/score route
+	// (see ResetCapabilities).
+	scoreAbsent atomic.Bool
 }
+
+// ResetCapabilities forgets what the client learned about the server: today, that
+// it has no ai/score route. Scoring against an old server is remembered for the
+// client's lifetime so the route is not probed on every call; call this after the
+// server was upgraded (or after fixing a base URL) to probe again.
+func (c *Client) ResetCapabilities() { c.scoreAbsent.Store(false) }
 
 type interactionIDKey struct{}
 
@@ -87,12 +98,21 @@ func New(cfg Config) *Client {
 func (c *Client) Name() string { return "cloud" }
 
 // Decider returns c's decision.Provider role (Name "cloud-decision"),
-// backed by POST ai/decision. It also implements the optional
+// backed by POST ai/decision. The value is also a decision.ScoredProvider and a
+// decision.TracedScorer backed by POST ai/score: a hosted decision endpoint can
+// answer scored questions (table narrowing) too. Against a server that has no
+// ai/score route, Score returns an error wrapping decision.ErrUnsupported, so a
+// combinator moves on to its next engine. It also implements the optional
 // `DecisionTimeout() time.Duration` interface decision.Chain honours, so a
 // remote decision call gets more time than Chain's local-call default.
 func (c *Client) Decider() decision.Provider { return decider{c} }
 
 type decider struct{ c *Client }
+
+var (
+	_ decision.ScoredProvider = decider{}
+	_ decision.TracedScorer   = decider{}
+)
 
 func (d decider) Name() string { return "cloud-decision" }
 
@@ -100,6 +120,18 @@ func (d decider) DecisionTimeout() time.Duration { return decisionTimeout }
 
 func (d decider) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
 	return d.c.decide(ctx, req)
+}
+
+// Score implements decision.ScoredProvider by POSTing ai/score.
+func (d decider) Score(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, error) {
+	res, _, err := d.c.score(ctx, req)
+	return res, err
+}
+
+// ScoreTraced implements decision.TracedScorer: the report carries the
+// strategy, answering engine and per-engine attempts the server reported.
+func (d decider) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, decision.Report, error) {
+	return d.c.score(ctx, req)
 }
 
 // Stream implements ai.LLMProvider by POSTing ai/chat and parsing the SSE
@@ -216,30 +248,9 @@ func (c *Client) decide(ctx context.Context, req decision.Request) (decision.Dec
 		return decision.Decision{}, false, err
 	}
 
-	var resp *http.Response
-	doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
-		httpReq, e := c.newRequest(ctx, cloudproto.PathDecision, payload)
-		if e != nil {
-			return e
-		}
-		httpReq.Header.Set("Accept", "application/json")
-		r, e := c.cfg.HTTPClient.Do(httpReq)
-		if e != nil {
-			resp = nil
-			if ctx.Err() != nil {
-				return &ai.Error{Code: ai.ErrCodeCanceled, Message: e.Error()}
-			}
-			return &ai.Error{Code: ai.ErrCodeUpstream, Message: e.Error(), Retryable: true}
-		}
-		if r.StatusCode >= 200 && r.StatusCode < 300 {
-			resp = r
-			return nil
-		}
-		defer func() { _ = r.Body.Close() }()
-		return decodeHTTPError(r)
-	})
-	if doErr != nil {
-		return decision.Decision{}, false, toAIError(ctx, doErr)
+	resp, err := c.postJSON(ctx, cloudproto.PathDecision, payload, nil)
+	if err != nil {
+		return decision.Decision{}, false, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -251,6 +262,257 @@ func (c *Client) decide(ctx context.Context, req decision.Request) (decision.Dec
 		return decision.Decision{}, false, nil
 	}
 	return dr.Decision, true, nil
+}
+
+// engineError is an error from a decision route (ai/decision, ai/score): the
+// *ai.Error the server's answer decoded to, plus the engine-neutral sentinel it
+// stands for (decision.ErrAuth, ErrInvalidRequest, ErrQuota, ErrMisconfigured; nil
+// for a transient fault), so a circuit breaker and the combinators classify it the
+// way they classify a typesafe error. errors.As still finds the *ai.Error.
+type engineError struct {
+	err  *ai.Error
+	kind error
+}
+
+func (e *engineError) Error() string { return e.err.Error() }
+
+func (e *engineError) Unwrap() []error {
+	if e.kind == nil {
+		return []error{e.err}
+	}
+	return []error{e.err, e.kind}
+}
+
+// RetryDelay implements decision.RetryDelayer.
+func (e *engineError) RetryDelay() time.Duration { return e.err.RetryDelay() }
+
+// IsRetryable: a response that asked callers to wait is not retried here after
+// a few hundred milliseconds; the breaker and the combinators decide what to do
+// with the delay.
+func (e *engineError) IsRetryable() bool { return e.err.IsRetryable() && e.err.RetryAfterMs <= 0 }
+
+// engineKind is the sentinel a decision-route error stands for, nil for a
+// transient fault (rate limit, 5xx, transport).
+func engineKind(status int, e *ai.Error) error {
+	switch {
+	case e.Code == ai.ErrCodeAuth || status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return decision.ErrAuth
+	case e.Code == ai.ErrCodeQuota:
+		return decision.ErrQuota
+	case status == http.StatusNotFound || status == http.StatusMethodNotAllowed:
+		// Not "route not implemented" (score handles that before this): an unknown
+		// product, or a base URL that does not speak the protocol.
+		return decision.ErrMisconfigured
+	case e.Code == ai.ErrCodeInvalid || status == http.StatusBadRequest || status == http.StatusUnprocessableEntity:
+		return decision.ErrInvalidRequest
+	}
+	return nil
+}
+
+// maxErrorBodyBytes bounds how much of an error body is read.
+const maxErrorBodyBytes = 64 << 10
+
+// postJSON POSTs payload to path and returns the 2xx response, retrying 429 and
+// 5xx before the first byte like every other call (but not a response that asked
+// callers to wait: see engineError). A non-2xx response is an engineError; first
+// onStatus, when set, may claim it by returning a non-nil error (ai/score uses it
+// for "route not implemented"). The body it receives is the (bounded) error body.
+func (c *Client) postJSON(ctx context.Context, path string, payload []byte, onStatus func(ctx context.Context, status int, body []byte) error) (*http.Response, error) {
+	var resp *http.Response
+	doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
+		httpReq, e := c.newRequest(ctx, path, payload)
+		if e != nil {
+			var aiErr *ai.Error
+			if errors.As(e, &aiErr) {
+				return &engineError{err: aiErr, kind: engineKind(0, aiErr)} // a token-source failure is auth
+			}
+			return e
+		}
+		httpReq.Header.Set("Accept", "application/json")
+		r, e := c.cfg.HTTPClient.Do(httpReq)
+		if e != nil {
+			resp = nil
+			if ctx.Err() != nil {
+				return &ai.Error{Code: ai.ErrCodeCanceled, Message: e.Error()}
+			}
+			return &engineError{err: &ai.Error{Code: ai.ErrCodeUpstream, Message: e.Error(), Retryable: true}}
+		}
+		if r.StatusCode >= 200 && r.StatusCode < 300 {
+			resp = r
+			return nil
+		}
+		defer func() { _ = r.Body.Close() }()
+		body, _ := io.ReadAll(io.LimitReader(r.Body, maxErrorBodyBytes))
+		if onStatus != nil {
+			if err := onStatus(ctx, r.StatusCode, body); err != nil {
+				return err
+			}
+		}
+		aiErr := decodeHTTPErrorBody(r, body)
+		return &engineError{err: aiErr, kind: engineKind(r.StatusCode, aiErr)}
+	})
+	if doErr != nil {
+		var ee *engineError
+		if errors.Is(doErr, decision.ErrUnsupported) || errors.As(doErr, &ee) && ctx.Err() == nil {
+			return nil, doErr
+		}
+		return nil, toAIError(ctx, doErr)
+	}
+	return resp, nil
+}
+
+// maxScoreResponseBytes bounds how much of an ai/score response is read.
+const maxScoreResponseBytes = 4 << 20
+
+// score implements POST ai/score. A request that fails decision.ValidateScoreRequest
+// is refused locally (decision.ErrInvalidRequest, no call). A server that has no
+// ai/score route gives decision.ErrUnsupported, remembered for the client's
+// lifetime (see ResetCapabilities): a 501, or a 404/405 with a non-protocol body
+// from a base URL that does answer GET ai/usage in the protocol. Any other
+// 404/405 (a protocol ErrorResponse, or a base URL that does not speak the
+// protocol at all) is decision.ErrMisconfigured. 401/403 and code "auth" are
+// decision.ErrAuth, 400/422 and code "invalid" decision.ErrInvalidRequest, 429
+// with code "quota" decision.ErrQuota; Retry-After is carried (ai.Error). The
+// answers are validated against the request (decision.ValidateScoreResult) and an
+// answer is Calibrated only when both the answer and the response say so.
+func (c *Client) score(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, decision.Report, error) {
+	if err := decision.ValidateScoreRequest(req); err != nil {
+		// Not %w of err: only its sentinel, the ids are the caller's.
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("cloud: %w: the score request failed validation", decision.ErrInvalidRequest)
+	}
+	if c.scoreAbsent.Load() {
+		return decision.ScoreResult{}, decision.Report{}, errScoreAbsent()
+	}
+	if req.Product == "" {
+		req.Product = c.cfg.Product
+	}
+	interactionID, _ := ctx.Value(interactionIDKey{}).(string)
+	payload, err := json.Marshal(cloudproto.ScoreRequest{ScoreRequest: req, InteractionID: interactionID, ClientContext: c.cfg.ClientContext})
+	if err != nil {
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("cloud: %w: the score request cannot be encoded", decision.ErrInvalidRequest)
+	}
+	resp, err := c.postJSON(ctx, cloudproto.PathScore, payload, c.scoreRouteAbsent)
+	if err != nil {
+		return decision.ScoreResult{}, decision.Report{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var sr cloudproto.ScoreResponse
+	// The decode error is not wrapped: it can quote a fragment of the body.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxScoreResponseBytes)).Decode(&sr); err != nil {
+		return decision.ScoreResult{}, decision.Report{}, errors.New("cloud: ai/score returned a malformed response")
+	}
+	res := decision.ScoreResult{Engine: sr.Engine, Model: sr.Model, Answers: map[string]decision.Answer{}}
+	if res.Engine == "" {
+		res.Engine = "cloud-decision"
+	}
+	if sr.Usage != nil {
+		res.Usage = decision.Usage{InputTokens: int(sr.Usage.InputTokens), OutputTokens: int(sr.Usage.OutputTokens)}
+	}
+	for _, q := range req.Questions {
+		a, ok := sr.Answers[q.ID]
+		if !ok {
+			continue // ValidateScoreResult reports the missing answer
+		}
+		// Sorted, and named by what the client asked, whatever the server sent.
+		sorted := decision.NewAnswer(q.ID, q.Kind, a.Scores)
+		sorted.Confidence, sorted.HasConfidence, sorted.NoneID = a.Confidence, a.HasConfidence, a.NoneID
+		sorted.Calibrated = a.Calibrated && sr.Calibrated
+		res.Answers[q.ID] = sorted
+	}
+	if err := decision.ValidateScoreResult(req, res); err != nil {
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("cloud: ai/score returned an invalid result: %s", decision.InvalidDetail(err))
+	}
+	rep := decision.Report{Strategy: sr.Strategy, Engine: res.Engine, Attempts: sr.Attempts, Model: sr.Model}
+	return res, rep, nil
+}
+
+// errScoreAbsent is the error for a server confirmed to have no ai/score route.
+func errScoreAbsent() error {
+	return fmt.Errorf("cloud: %s: the server has no such route: %w", cloudproto.PathScore, decision.ErrUnsupported)
+}
+
+// scoreRouteAbsent decides what a non-2xx answer from ai/score means before it
+// is treated as an ordinary error. It returns nil for an ordinary error.
+//
+//   - 501: the route is not implemented, unambiguously.
+//   - 404/405 whose body is a protocol ErrorResponse: an application error (an
+//     unknown product), left to the ordinary mapping (a configuration error).
+//   - any other 404/405: ambiguous, since an old server and a mistyped base URL
+//     look the same. GET ai/usage settles it: a base URL that answers it in the
+//     protocol lacks only ai/score (unsupported, remembered); one that does not is
+//     misconfigured.
+func (c *Client) scoreRouteAbsent(ctx context.Context, status int, body []byte) error {
+	switch status {
+	case http.StatusNotImplemented:
+		c.scoreAbsent.Store(true)
+		return errScoreAbsent()
+	case http.StatusNotFound, http.StatusMethodNotAllowed:
+		if isProtocolError(body) {
+			return nil
+		}
+		speaks, err := c.speaksProtocol(ctx)
+		if err != nil {
+			return err
+		}
+		if speaks {
+			c.scoreAbsent.Store(true)
+			return errScoreAbsent()
+		}
+		return &engineError{
+			err:  &ai.Error{Code: ai.ErrCodeInvalid, Message: fmt.Sprintf("cloud: %s answered HTTP %d and %s does not answer in the protocol either: the base URL is wrong", cloudproto.PathScore, status, cloudproto.PathUsage)},
+			kind: decision.ErrMisconfigured,
+		}
+	}
+	return nil
+}
+
+// isProtocolError reports whether body is a protocol ErrorResponse.
+func isProtocolError(body []byte) bool {
+	var er cloudproto.ErrorResponse
+	return json.Unmarshal(body, &er) == nil && er.Error.Code != ""
+}
+
+// speaksProtocol asks GET ai/usage whether the base URL speaks the protocol: a 2xx
+// JSON object, or any status with a protocol ErrorResponse (a 401 included),
+// says yes; a 404 or other non-protocol answer says no. A transport failure, a
+// 429 or a 5xx without a protocol body is inconclusive and returned as an error
+// (an engine fault, nothing remembered).
+func (c *Client) speaksProtocol(ctx context.Context) (bool, error) {
+	httpReq, err := c.newRequestMethod(ctx, http.MethodGet, cloudproto.PathUsage, nil)
+	if err != nil {
+		return false, c.engineErr(err)
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	r, err := c.cfg.HTTPClient.Do(httpReq)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
+		}
+		return false, &engineError{err: &ai.Error{Code: ai.ErrCodeUpstream, Message: err.Error(), Retryable: true}}
+	}
+	defer func() { _ = r.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(r.Body, maxErrorBodyBytes))
+	switch {
+	case r.StatusCode >= 200 && r.StatusCode < 300:
+		var obj map[string]json.RawMessage
+		return json.Unmarshal(body, &obj) == nil && obj != nil, nil
+	case isProtocolError(body):
+		return true, nil
+	case r.StatusCode == http.StatusTooManyRequests || r.StatusCode >= 500:
+		aiErr := decodeHTTPErrorBody(r, body)
+		return false, &engineError{err: aiErr, kind: engineKind(r.StatusCode, aiErr)}
+	}
+	return false, nil
+}
+
+// engineErr wraps a token-source failure (an auth *ai.Error) as an engineError.
+func (c *Client) engineErr(err error) error {
+	var aiErr *ai.Error
+	if errors.As(err, &aiErr) {
+		return &engineError{err: aiErr, kind: engineKind(0, aiErr)}
+	}
+	return err
 }
 
 // Usage calls GET ai/usage.
@@ -336,6 +598,7 @@ func (c *Client) newRequestMethod(ctx context.Context, method, path string, payl
 		httpReq.Header.Set("Content-Type", "application/json")
 	}
 	httpReq.Header.Set(cloudproto.HeaderProduct, c.cfg.Product)
+	httpReq.Header.Set(cloudproto.HeaderProtocol, strconv.Itoa(cloudproto.ProtocolVersion))
 	token, err := c.cfg.Token(ctx)
 	if err != nil {
 		// A token-source failure is an auth problem, not a transport one --
@@ -351,6 +614,21 @@ func (c *Client) newRequestMethod(ctx context.Context, method, path string, payl
 
 func decodeHTTPError(resp *http.Response) error {
 	b, _ := io.ReadAll(resp.Body)
+	return decodeHTTPErrorBody(resp, b)
+}
+
+// decodeHTTPErrorBody builds the *ai.Error for a non-2xx response whose body was
+// already read, carrying the Retry-After it asked for (RetryAfterMs).
+func decodeHTTPErrorBody(resp *http.Response, b []byte) *ai.Error {
+	e := decodeErrorBody(resp, b)
+	if d := decision.ParseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); d > 0 {
+		e.RetryAfterMs = max(e.RetryAfterMs, d.Milliseconds())
+	}
+	e.RetryAfterMs = min(e.RetryAfterMs, decision.MaxRetryDelay.Milliseconds())
+	return e
+}
+
+func decodeErrorBody(resp *http.Response, b []byte) *ai.Error {
 	var er cloudproto.ErrorResponse
 	if err := json.Unmarshal(b, &er); err == nil && er.Error.Code != "" {
 		e := er.Error
