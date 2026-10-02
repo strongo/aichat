@@ -71,6 +71,20 @@ type Decision struct {
 	CanHandleDeterministically bool              `json:"canHandleDeterministically"`
 	NeedsLLM                   bool              `json:"needsLLM"`
 	Presentation               string            `json:"presentation,omitempty"` // e.g. "day_calendar"
+
+	// Scores are the engine's probabilities for the options of the Choice that
+	// picked Intent, keyed by option id (for a taxonomy of several modules the
+	// option id is "module/intent"). Empty when the engine provides none.
+	Scores map[string]float64 `json:"scores,omitempty"`
+	// Calibrated is true only when Scores and the confidences are calibrated
+	// probabilities (a real decision model), false for an LLM emulator's
+	// self-reported confidence. A SelectionPolicy is applied only to
+	// calibrated scores.
+	Calibrated bool `json:"calibrated,omitempty"`
+	// Outcome is set by Chain when it has a SelectionPolicy: the policy's
+	// verdict. Callers of a policy chain MUST act on Outcome (use the decision
+	// only when it is OutcomeSelected; OutcomeUnscored decisions are proposals).
+	Outcome Outcome `json:"outcome,omitempty"`
 }
 
 // ModuleSpec declares a product module and its intents.
@@ -88,6 +102,11 @@ type Taxonomy struct {
 	Presentations []string     `json:"presentations,omitempty"`
 	DataKinds     []string     `json:"dataKinds,omitempty"`
 	EntityTypes   []string     `json:"entityTypes,omitempty"`
+	// Descriptions optionally explain taxonomy entries to the engine, keyed by
+	// entry name: a module name, "module/intent", a presentation, a data kind
+	// or an entity type. A bare name often scores poorly; one line of public
+	// description helps. Additive and optional.
+	Descriptions map[string]string `json:"descriptions,omitempty"`
 }
 
 // Request is the input to Decide.
@@ -99,9 +118,13 @@ type Request struct {
 	Taxonomy      Taxonomy          `json:"taxonomy"`
 	State         session.State     `json:"state"` // entity refs only, no rendered data
 	// Recent is a short tail of the transcript for continuations.
-	Recent []string  `json:"recent,omitempty"`
-	Now    time.Time `json:"now"`
-	TZ     string    `json:"tz,omitempty"`
+	Recent []string `json:"recent,omitempty"`
+	// Context is optional JSON-able context for the engine: names and public
+	// metadata only, never row data, credentials or user identifiers. It is
+	// additive and optional.
+	Context map[string]any `json:"context,omitempty"`
+	Now     time.Time      `json:"now"`
+	TZ      string         `json:"tz,omitempty"`
 }
 
 // Provider decides or abstains. It returns (d, true, nil) when it decided,
@@ -197,15 +220,29 @@ func Validate(d Decision, t Taxonomy) error {
 // Attempt records one provider's outcome for diagnostics.
 type Attempt struct {
 	Provider string        `json:"provider"`
-	Outcome  string        `json:"outcome"` // decided | abstained | low_confidence | invalid | error | timeout
+	Outcome  string        `json:"outcome"` // see the Attempt* constants
 	Detail   string        `json:"detail,omitempty"`
 	Latency  time.Duration `json:"latency"`
+	// Role is the engine's part in a combinator: "primary", "backup" or
+	// "racer"; empty for a plain chain provider.
+	Role string `json:"role,omitempty"`
 }
 
 // Trace is the chain's diagnostic record.
 type Trace struct {
 	DecidedBy string    `json:"decidedBy,omitempty"` // "" when every provider abstained
 	Attempts  []Attempt `json:"attempts"`
+	// Engine is the leaf engine that produced the decision (differs from
+	// DecidedBy when a combinator wrapped it).
+	Engine string `json:"engine,omitempty"`
+	// Strategy, FallbackFired and HedgeFired describe the combinator that
+	// answered, if any (see Report).
+	Strategy      string `json:"strategy,omitempty"`
+	FallbackFired bool   `json:"fallbackFired,omitempty"`
+	HedgeFired    bool   `json:"hedgeFired,omitempty"`
+	// Calibrated and Outcome echo the decision's flag and the policy's verdict.
+	Calibrated bool    `json:"calibrated,omitempty"`
+	Outcome    Outcome `json:"outcome,omitempty"`
 }
 
 // Chain runs providers in order; the first valid, confident decision wins.
@@ -230,6 +267,12 @@ type Chain struct {
 	// in which case that provider's own value is used instead -- a remote
 	// decision call reasonably wants more time than a local one.
 	Timeout time.Duration
+	// Policy, when non-nil, replaces MinConfidence for answers that carry
+	// calibrated Scores: the policy alone decides selected / several /
+	// uncertain / none, and Chain returns the decision with Decision.Outcome
+	// set instead of discarding a non-clear answer. A nil Policy keeps the
+	// legacy MinConfidence behaviour exactly.
+	Policy *SelectionPolicy
 }
 
 // decisionTimeouter is the optional per-provider timeout override.
@@ -257,7 +300,19 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 		}
 		pctx, cancel := context.WithTimeout(ctx, timeout)
 		start := time.Now()
-		d, ok, err := p.Decide(pctx, req)
+		var (
+			d   Decision
+			ok  bool
+			err error
+			rep *Report
+		)
+		if tp, traced := p.(TracedProvider); traced {
+			var r Report
+			d, ok, r, err = tp.DecideTraced(pctx, req)
+			rep = &r
+		} else {
+			d, ok, err = p.Decide(pctx, req)
+		}
 		a := Attempt{Provider: p.Name(), Latency: time.Since(start)}
 		// errors.Is (not ==) so a provider that wraps ctx.Err() (e.g.
 		// fmt.Errorf("...: %w", ctx.Err())) still classifies as a timeout
@@ -265,25 +320,31 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 		timedOut := err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(pctx.Err(), context.DeadlineExceeded))
 		cancel()
 		switch {
+		case err != nil && errors.Is(err, ErrUnavailable):
+			a.Outcome, a.Detail = AttemptUnavailable, err.Error()
 		case err != nil && timedOut:
-			a.Outcome, a.Detail = "timeout", err.Error()
+			a.Outcome, a.Detail = AttemptTimeout, err.Error()
 		case err != nil:
-			a.Outcome, a.Detail = "error", err.Error()
+			a.Outcome, a.Detail = AttemptError, err.Error()
 		case !ok:
-			a.Outcome = "abstained"
+			a.Outcome = AttemptAbstained
 		default:
-			if verr := Validate(d, req.Taxonomy); verr != nil {
-				a.Outcome, a.Detail = "invalid", verr.Error()
-			} else if lowConfidence(d, minConf) {
-				a.Outcome = "low_confidence"
-				a.Detail = fmt.Sprintf("module=%.2f intent=%.2f", d.Module.Confidence, d.Intent.Confidence)
-			} else {
-				a.Outcome = "decided"
-			}
+			d, a = c.judge(d, a, req, minConf)
 		}
-		tr.Attempts = append(tr.Attempts, a)
-		if a.Outcome == "decided" {
+		decided := a.Outcome == AttemptDecided
+		if rep == nil {
+			tr.Attempts = append(tr.Attempts, a)
+		} else {
+			tr.Attempts = append(tr.Attempts, MergeReport(*rep, a, ok && err == nil)...)
+		}
+		if decided {
 			tr.DecidedBy = a.Provider
+			tr.Engine = a.Provider
+			if rep != nil {
+				tr.Engine = rep.Engine
+				tr.Strategy, tr.FallbackFired, tr.HedgeFired = rep.Strategy, rep.FallbackFired, rep.HedgeFired
+			}
+			tr.Calibrated, tr.Outcome = d.Calibrated, d.Outcome
 			return d, true, tr
 		}
 		if ctx.Err() != nil {
@@ -291,6 +352,59 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 		}
 	}
 	return Decision{}, false, tr
+}
+
+// judge classifies a provider's answer: invalid, rejected by the confidence
+// floor, or decided. With a SelectionPolicy set and calibrated scores present,
+// the policy alone owns the floor and every outcome (selected, several,
+// uncertain, none) is "decided": the caller reads Decision.Outcome. Without
+// scores the legacy MinConfidence floor still applies and, under a policy,
+// the outcome is OutcomeUnscored.
+func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decision, Attempt) {
+	if verr := Validate(d, req.Taxonomy); verr != nil {
+		a.Outcome, a.Detail = AttemptInvalid, verr.Error()
+		return d, a
+	}
+	if c.Policy != nil && d.Calibrated && len(d.Scores) > 0 {
+		sel := c.Policy.EvaluateDecision(d)
+		d.Outcome = sel.Outcome
+		a.Outcome, a.Detail = AttemptDecided, string(sel.Outcome)
+		if sel.Reason != "" {
+			a.Detail += ": " + sel.Reason
+		}
+		return d, a
+	}
+	if lowConfidence(d, minConf) {
+		a.Outcome = AttemptLowConfidence
+		a.Detail = fmt.Sprintf("module=%.2f intent=%.2f", d.Module.Confidence, d.Intent.Confidence)
+		return d, a
+	}
+	a.Outcome = AttemptDecided
+	if c.Policy != nil {
+		d.Outcome = OutcomeUnscored
+	}
+	return d, a
+}
+
+// MergeReport returns the attempts to record for a TracedProvider: the engines
+// it ran, with the answering engine's outcome overridden by the caller's own
+// judgement (invalid, low_confidence, a policy verdict, carried by judged) when
+// the provider returned an answer. When the provider reported no attempts,
+// judged itself is recorded instead.
+func MergeReport(rep Report, judged Attempt, answered bool) []Attempt {
+	if len(rep.Attempts) == 0 {
+		return []Attempt{judged}
+	}
+	out := slices.Clone(rep.Attempts)
+	if answered {
+		for i := len(out) - 1; i >= 0; i-- {
+			if out[i].Provider == rep.Engine && out[i].Outcome == AttemptDecided {
+				out[i].Outcome, out[i].Detail = judged.Outcome, judged.Detail
+				break
+			}
+		}
+	}
+	return out
 }
 
 // lowConfidence reports whether d fails the minConf floor. A module-optional
