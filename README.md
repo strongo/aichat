@@ -72,6 +72,23 @@ Four things a product must know before it acts on `ai/decision` answers:
   (`OnQuota` does not apply) and always beats an abstention or an uncertain
   answer, so the chain stops; a spent budget in a race halts the race.
 
+## Upgrade notes
+
+- **Usage is reported on every attempt.** `Trace.Attempts[i].Usage` (and
+  `Report.Attempts`) now carries what the engine billed for EVERY upstream call,
+  not only an abstained or scored one: a decided answer, an answer the policy
+  judged uncertain, and a call that failed after a response that carried a usage
+  object. `typesafe.Client` reports one attempt per call from `DecideTraced` and
+  the new `ScoreTraced` (outcome `decided`, `abstained` or `error`, with latency),
+  and `compose` (`Single`, `Fallback`, `Hedged`, `Race`, `Breaker`, `Budget`) and
+  `decision.Chain` keep it. A call whose response reported no usage, a network
+  error or a leg still running when it was cancelled, has `Usage == nil` (cost
+  unknown), never zero. A host that meters or caps spend can sum `Attempts[].Usage`
+  from the trace; `typesafe.CallEvent.Usage` is likewise set on a failed call whose
+  body carried usage. A report that used to carry no attempts for a decided answer
+  or an error now carries one, so code that counted `len(Attempts)` as "abstentions"
+  should filter on `Outcome`.
+
 Products own scopes, intents, prompts, actions and controls. This module owns
 only what every product needs to talk to models and render chat the same way
 — **including how it looks**: `github.com/tuigoff/tuigoff/pkg/theme` is the single place colour,

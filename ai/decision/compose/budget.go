@@ -83,6 +83,7 @@ var (
 	_ decision.Provider              = (*Budget)(nil)
 	_ decision.TracedProvider        = (*Budget)(nil)
 	_ decision.ScoredProvider        = (*Budget)(nil)
+	_ decision.TracedScorer          = (*Budget)(nil)
 	_ decision.DeterministicProvider = (*Budget)(nil)
 )
 
@@ -175,15 +176,26 @@ func (b *Budget) DecideTraced(ctx context.Context, req decision.Request) (decisi
 // ErrNoEngine, and one around an engine that does not score returns
 // decision.ErrUnsupported, neither counted.
 func (b *Budget) Score(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, error) {
+	res, _, err := b.ScoreTraced(ctx, req)
+	return res, err
+}
+
+// ScoreTraced implements decision.TracedScorer, transparently: the wrapped
+// engine's report is passed on.
+func (b *Budget) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, decision.Report, error) {
 	if b.inner == nil {
-		return decision.ScoreResult{}, fmt.Errorf("%s: %w", b.Name(), ErrNoEngine)
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("%s: %w", b.Name(), ErrNoEngine)
 	}
 	sp, ok := b.inner.(decision.ScoredProvider)
 	if !ok {
-		return decision.ScoreResult{}, fmt.Errorf("%s: %w", b.Name(), decision.ErrUnsupported)
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("%s: %w", b.Name(), decision.ErrUnsupported)
 	}
 	if err := b.admit(); err != nil {
-		return decision.ScoreResult{}, err
+		return decision.ScoreResult{}, decision.Report{}, err
 	}
-	return sp.Score(ctx, req)
+	if ts, ok := sp.(decision.TracedScorer); ok {
+		return ts.ScoreTraced(ctx, req)
+	}
+	res, err := sp.Score(ctx, req)
+	return res, decision.Report{Engine: b.Name()}, err
 }

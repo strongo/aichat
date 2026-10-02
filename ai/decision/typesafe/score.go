@@ -3,6 +3,7 @@ package typesafe
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/strongo/aichat/ai/decision"
 )
@@ -10,6 +11,7 @@ import (
 var (
 	_ decision.Provider       = (*Client)(nil)
 	_ decision.ScoredProvider = (*Client)(nil)
+	_ decision.TracedScorer   = (*Client)(nil)
 )
 
 // scoreState is the state of a ScoreRequest: an object holding the question
@@ -60,9 +62,25 @@ type candidateRef struct {
 // asked as a Choice without relevant tables splitting the probability between
 // them. A Noul has no confidence, so a relevance Answer has none either.
 func (c *Client) Score(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, error) {
+	res, _, err := c.ScoreTraced(ctx, req)
+	return res, err
+}
+
+// ScoreTraced implements decision.TracedScorer: Score plus a report of the
+// upstream call, ONE attempt whatever came of it, with the same shape as
+// DecideTraced's (outcome decided or error, Latency, and Usage that is what the
+// call billed, also when it failed after a response that carried a usage object,
+// and nil when it reported none).
+func (c *Client) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, decision.Report, error) {
+	start := time.Now()
+	rep := decision.Report{Engine: c.Name()}
+	fail := func(err error, u Usage) (decision.ScoreResult, decision.Report, error) {
+		rep.Attempts = []decision.Attempt{c.attempt(start, decision.AttemptError, err.Error(), u)}
+		return decision.ScoreResult{}, rep, err
+	}
 	if err := decision.ValidateScoreRequest(req); err != nil {
 		// Not %w of err: its text quotes the caller's question and candidate ids.
-		return decision.ScoreResult{}, fmt.Errorf("%w: the score request failed validation", ErrInvalidRequest)
+		return fail(fmt.Errorf("%w: the score request failed validation", ErrInvalidRequest), Usage{})
 	}
 	questions := map[string]Question{}
 	refs := map[string]candidateRef{} // wire key -> candidate (relevance only)
@@ -88,10 +106,11 @@ func (c *Client) Score(ctx context.Context, req decision.ScoreRequest) (decision
 		}
 	}
 
-	resp, err := c.Ask(ctx, AskRequest{State: scoreState(req), Questions: questions})
+	resp, usage, err := c.ask(ctx, AskRequest{State: scoreState(req), Questions: questions})
 	if err != nil {
-		return decision.ScoreResult{}, err
+		return fail(err, usage)
 	}
+	rep.Model = resp.Model
 	res := decision.ScoreResult{Engine: c.cfg.Name, Model: resp.Model, Usage: decision.Usage(resp.Usage), Answers: map[string]decision.Answer{}}
 	for qi, q := range req.Questions {
 		var ans decision.Answer
@@ -102,14 +121,15 @@ func (c *Client) Score(ctx context.Context, req decision.ScoreRequest) (decision
 			ans, err = foldRelevance(qi, q, resp.Answers)
 		}
 		if err != nil {
-			return decision.ScoreResult{}, err
+			return fail(err, usage)
 		}
 		res.Answers[q.ID] = ans
 	}
 	if err := decision.ValidateScoreResult(req, res); err != nil {
-		return decision.ScoreResult{}, fmt.Errorf("%w: %s", ErrBadResponse, decision.InvalidDetail(err))
+		return fail(fmt.Errorf("%w: %s", ErrBadResponse, decision.InvalidDetail(err)), usage)
 	}
-	return res, nil
+	rep.Attempts = []decision.Attempt{c.attempt(start, decision.AttemptDecided, "", usage)}
+	return res, rep, nil
 }
 
 func choiceKey(qi int) string        { return fmt.Sprintf("q%d", qi) }

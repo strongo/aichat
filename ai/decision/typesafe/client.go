@@ -106,8 +106,11 @@ type HTTPDoer interface {
 // CallEvent describes one finished API call for metering and telemetry. It
 // holds no state, question or answer text.
 type CallEvent struct {
-	Engine    string
-	Model     string // the versioned model id that answered ("" on failure)
+	Engine string
+	Model  string // the versioned model id that answered ("" on failure)
+	// Usage is what the call billed, as the response body reports it: set on a
+	// success, and also on a failure whose response carried a usage object (a
+	// non-2xx answer, a malformed 2xx). Zero when the call reported none.
 	Usage     Usage
 	Questions int
 	Latency   time.Duration
@@ -348,27 +351,48 @@ func (c *Client) encode(req AskRequest) ([]byte, error) {
 
 // Ask makes one call. It does not retry.
 func (c *Client) Ask(ctx context.Context, req AskRequest) (*AskResponse, error) {
-	start := c.cfg.Clock()
-	resp, status, err := c.do(ctx, req)
-	if c.cfg.OnCall != nil {
-		ev := CallEvent{Engine: c.cfg.Name, Questions: len(req.Questions), Latency: c.cfg.Clock().Sub(start), Status: status, Err: err}
-		if resp != nil {
-			ev.Model, ev.Usage = resp.Model, resp.Usage
-		}
-		c.cfg.OnCall(ev)
-	}
+	resp, _, err := c.ask(ctx, req)
 	return resp, err
 }
 
-func (c *Client) do(ctx context.Context, req AskRequest) (*AskResponse, int, error) {
+// ask is Ask plus the usage the call billed: resp.Usage on a success, and on a
+// failure whatever usage object the response body carried (zero when it carried
+// none, or when no response arrived), so a caller that meters can see the tokens
+// of a call that failed after the upstream spent them.
+func (c *Client) ask(ctx context.Context, req AskRequest) (*AskResponse, Usage, error) {
+	start := c.cfg.Clock()
+	resp, usage, status, err := c.do(ctx, req)
+	if c.cfg.OnCall != nil {
+		ev := CallEvent{Engine: c.cfg.Name, Questions: len(req.Questions), Latency: c.cfg.Clock().Sub(start), Status: status, Err: err, Usage: usage}
+		if resp != nil {
+			ev.Model = resp.Model
+		}
+		c.cfg.OnCall(ev)
+	}
+	return resp, usage, err
+}
+
+// bodyUsage reads the usage object of a response body that is not (or not
+// entirely) the documented shape. It never fails: a body without one is zero.
+func bodyUsage(raw []byte) Usage {
+	var shape struct {
+		Usage Usage `json:"usage"`
+	}
+	// A body that is not JSON, or has a usage of another type, is the "no usage"
+	// case; a partly decoded value is still what the body carried.
+	_ = json.Unmarshal(raw, &shape)
+	return shape.Usage
+}
+
+func (c *Client) do(ctx context.Context, req AskRequest) (*AskResponse, Usage, int, error) {
 	body, err := c.encode(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, Usage{}, 0, err
 	}
 	url := strings.TrimRight(c.cfg.BaseURL, "/") + systemOnePath
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, fmt.Errorf("typesafe: build request: %w", err)
+		return nil, Usage{}, 0, fmt.Errorf("typesafe: build request: %w", err)
 	}
 	hreq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 	hreq.Header.Set("Content-Type", "application/json")
@@ -378,29 +402,29 @@ func (c *Client) do(ctx context.Context, req AskRequest) (*AskResponse, int, err
 	hresp, err := c.cfg.HTTPClient.Do(hreq)
 	if err != nil {
 		// A *url.Error carries the URL (no key: the key is only in a header).
-		return nil, 0, fmt.Errorf("typesafe: request failed: %w", err)
+		return nil, Usage{}, 0, fmt.Errorf("typesafe: request failed: %w", err)
 	}
 	defer func() { _ = hresp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(hresp.Body, c.cfg.MaxResponseBytes+1))
 	if err != nil {
-		return nil, hresp.StatusCode, fmt.Errorf("typesafe: read response: %w", err)
+		return nil, Usage{}, hresp.StatusCode, fmt.Errorf("typesafe: read response: %w", err)
 	}
 
 	if hresp.StatusCode < 200 || hresp.StatusCode > 299 {
-		return nil, hresp.StatusCode, newAPIError(hresp, raw, c.cfg.Clock())
+		return nil, bodyUsage(raw), hresp.StatusCode, newAPIError(hresp, raw, c.cfg.Clock())
 	}
 	if int64(len(raw)) > c.cfg.MaxResponseBytes {
-		return nil, hresp.StatusCode, fmt.Errorf("%w: response larger than %d bytes", ErrBadResponse, c.cfg.MaxResponseBytes)
+		return nil, Usage{}, hresp.StatusCode, fmt.Errorf("%w: response larger than %d bytes", ErrBadResponse, c.cfg.MaxResponseBytes)
 	}
 	var out AskResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
 		// Do not wrap err: a JSON syntax error can quote a fragment of the body.
-		return nil, hresp.StatusCode, fmt.Errorf("%w: not JSON of the documented shape", ErrBadResponse)
+		return nil, out.Usage, hresp.StatusCode, fmt.Errorf("%w: not JSON of the documented shape", ErrBadResponse)
 	}
 	if out.Answers == nil {
-		return nil, hresp.StatusCode, fmt.Errorf("%w: no answers", ErrBadResponse)
+		return nil, out.Usage, hresp.StatusCode, fmt.Errorf("%w: no answers", ErrBadResponse)
 	}
-	return &out, hresp.StatusCode, nil
+	return &out, out.Usage, hresp.StatusCode, nil
 }
 
 // newAPIError builds an APIError from a non-2xx response, keeping only the

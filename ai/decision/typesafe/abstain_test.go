@@ -73,12 +73,12 @@ func TestDecide_AbstentionCarriesANonSensitiveReasonCode(t *testing.T) {
 	}
 }
 
-// A decided answer and a failure leave the report without attempts: the caller
-// records them.
-func TestDecideTraced_DecidedAndFailedReportNoAttempts(t *testing.T) {
+// A decided answer and a failure each report one attempt: every upstream call
+// is metered, not only the abstained ones (see usage_test.go for the usage).
+func TestDecideTraced_DecidedAndFailedReportOneAttempt(t *testing.T) {
 	d := &fakeDoer{body: response(fullAnswers()...)}
 	dec, ok, rep, err := newClient(t, d).DecideTraced(context.Background(), decideRequest())
-	if !ok || err != nil || len(rep.Attempts) != 0 || rep.Engine != DefaultName || rep.Model != testModel || dec.Model != testModel {
+	if !ok || err != nil || len(rep.Attempts) != 1 || rep.Attempts[0].Outcome != decision.AttemptDecided || rep.Engine != DefaultName || rep.Model != testModel || dec.Model != testModel {
 		t.Fatalf("dec=%+v ok=%v rep=%+v err=%v", dec, ok, rep, err)
 	}
 	// Direct use is unjudged: a decision from the provider is not actionable.
@@ -86,7 +86,7 @@ func TestDecideTraced_DecidedAndFailedReportNoAttempts(t *testing.T) {
 		t.Fatalf("%+v", dec)
 	}
 	_, ok, rep, err = newClient(t, &fakeDoer{err: errNetwork}).DecideTraced(context.Background(), decideRequest())
-	if ok || err == nil || len(rep.Attempts) != 0 {
+	if ok || err == nil || len(rep.Attempts) != 1 || rep.Attempts[0].Outcome != decision.AttemptError || rep.Attempts[0].Usage != nil {
 		t.Fatalf("ok=%v rep=%+v err=%v", ok, rep, err)
 	}
 }
