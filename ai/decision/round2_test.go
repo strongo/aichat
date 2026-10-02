@@ -40,8 +40,11 @@ func TestPolicy_EvaluateDecisionUncalibrated(t *testing.T) {
 	if sel := nar.EvaluateDecision(m); sel.Picks[0] != "calendar" {
 		t.Fatalf("module only: %+v", sel)
 	}
-	yes := Decision{Interaction: InteractionConfirmation, Module: Scored{}, Intent: Scored{}}
-	if sel := nar.EvaluateDecision(yes); sel.Outcome != OutcomeAccepted {
+	// A module-optional, non-side-effectful interaction (chat) is exempt from the
+	// module confidence; a side-effectful one is not accepted at all (see
+	// TestPolicy_UncalibratedSideEffectsNeedTheirOwnOptIn).
+	chat := Decision{Interaction: InteractionChat, Module: Scored{}, Intent: Scored{}}
+	if sel := nar.EvaluateDecision(chat); sel.Outcome != OutcomeAccepted {
 		t.Fatalf("module-optional: %+v", sel)
 	}
 	// Durable: unscored, not actionable, whatever the confidence.

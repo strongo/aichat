@@ -54,14 +54,27 @@
 //     does NOT start the backup unless WithFallbackOn(OnQuota) says so, and the
 //     error is returned to the caller. A misconfigured endpoint
 //     (decision.ErrMisconfigured, outcome "misconfigured") never starts a backup
-//     and never opens a breaker: it is loud on purpose.
+//     and never opens a breaker: it is loud on purpose. The same holds for the
+//     strategies that run engines at once: a Hedged primary's refusal, even after
+//     the hedge fired and the backup is already running, and any Race engine's
+//     refusal, ends the call with that error, cancels the others and returns no
+//     answer (WithFallbackOn(OnQuota) opts out of the quota case only). A Hedged
+//     backup's own refusal is just a failed backup.
 //   - With WithPolicy, every decision an engine returns carries the policy's
 //     Outcome, and only an actionable one counts as decided: an answer the policy
 //     judged uncertain, none or unscored is recorded "uncertain" (and returned, as
 //     an answer, when nothing better exists) and Decision.Actionable is false for
-//     it. Without WithPolicy an engine has no bar to judge by and returns the
-//     decision unjudged (empty Outcome): wrap it in a decision.Chain, which owns
-//     the bar.
+//     it. A deterministic decision (decision.Deterministic, what
+//     ai/decision/rules returns) is accepted under any policy as
+//     OutcomeDeterministic, and a calibrated decision that contradicts its own
+//     Scores is recorded "invalid". Without WithPolicy an engine has no bar to
+//     judge by and returns the decision unjudged (empty Outcome), which is NOT
+//     actionable (Decision.Actionable is false): wrap it in a decision.Chain, which
+//     owns the bar and stamps the verdict.
+//   - A Breaker is transparent for tracing: it passes on the Report of an engine
+//     that reports one (a combinator, or an engine that explains its abstentions,
+//     as ai/decision/typesafe does), so a breaker never hides attempts from a
+//     decision.Chain's trace.
 //   - Each answered scored attempt carries its own decision.Usage, so a hedged or
 //     fallen-back call can be metered per engine.
 //   - A Breaker honours a failure's retry delay (a Retry-After, see

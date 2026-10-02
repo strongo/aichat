@@ -29,7 +29,11 @@
 //     ScoreResult.
 //   - Decide never hands a caller a guessed turn kind: the interaction Choice is
 //     run through the selection policy and the provider abstains when it is not
-//     selected (see Client.Decide).
+//     selected (see Client.Decide), recording a non-sensitive reason code
+//     (Abstain*) in the attempt so the abstention rate can be measured.
+//   - Every 429 is a transient rate limit: TypeSafe documents no error that
+//     tells an exhausted allowance from rate limiting (see ErrRateLimited), so
+//     this package never reports decision.ErrQuota.
 //   - Requests are checked locally before any call (state size, number of
 //     questions, number of options); a refused request is an error that matches
 //     decision.ErrInvalidRequest, which a circuit breaker does not count against

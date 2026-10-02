@@ -70,19 +70,21 @@ func TestChain_KeepNonSelectedReturnsTheAnswerButItIsNotActionable(t *testing.T)
 }
 
 func TestDecision_Actionable(t *testing.T) {
-	want := map[Outcome]bool{"": true, OutcomeSelected: true, OutcomeSeveral: true, OutcomeAccepted: true,
-		OutcomeUnscored: false, OutcomeUncertain: false, OutcomeNone: false}
+	want := map[Outcome]bool{OutcomeSelected: true, OutcomeSeveral: true, OutcomeAccepted: true, OutcomeDeterministic: true, OutcomeFloor: true,
+		"": false, OutcomeUnscored: false, OutcomeUncertain: false, OutcomeNone: false, OutcomeInvalid: false, "Selected": false}
 	for outcome, w := range want {
 		if got := (Decision{Outcome: outcome}).Actionable(); got != w {
 			t.Errorf("Decision %q: %v", outcome, got)
 		}
-		// One rule: a Selection with the same verdict agrees (the empty outcome
-		// is "no policy ran", which a Selection never is).
-		if outcome != "" {
-			if got := (Selection{Outcome: outcome}).Actionable(); got != w {
-				t.Errorf("Selection %q: %v", outcome, got)
-			}
+		// One rule: a Selection with the same verdict agrees.
+		if got := (Selection{Outcome: outcome}).Actionable(); got != w {
+			t.Errorf("Selection %q: %v", outcome, got)
 		}
+	}
+	// Nothing is actionable by omission: not the zero value, not a decision a
+	// provider returned with no verdict.
+	if (Decision{}).Actionable() || decided("calendar", "show", 1).Actionable() {
+		t.Fatal("an unjudged decision must not be actionable")
 	}
 }
 

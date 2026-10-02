@@ -3,7 +3,11 @@
 // an LLM decider: nothing here is Sneat- or DataTug-specific, only the
 // taxonomy passed in on each Request gives it product shape. Its confidences
 // are the model's self-report, not calibrated probabilities (Decision.Calibrated
-// and Answer.Calibrated stay false), so it is a fallback or an emulator behind a
+// and Answer.Calibrated stay false; its provenance is self-reported), and so is
+// its InteractionConfidence. A selection policy never accepts a side-effectful
+// interaction (confirmation, rejection, correction, cancellation, undo) from it
+// without an explicit opt-in, and never at an interaction confidence of 0 (what a
+// model that reports none leaves). It is a fallback or an emulator behind a
 // real decision model such as ai/decision/typesafe, not a replacement for one.
 //
 // It is also a decision.ScoredProvider (see Decider.Score): one structured
@@ -126,6 +130,7 @@ type wireDecision struct {
 	Module                     decision.Scored      `json:"module"`
 	Intent                     decision.Scored      `json:"intent"`
 	Interaction                decision.Interaction `json:"interaction"`
+	InteractionConfidence      float64              `json:"interactionConfidence"`
 	Reference                  *wireReference       `json:"reference"`
 	RequiredScopes             []string             `json:"requiredScopes"`
 	RequiredData               []string             `json:"requiredData"`
@@ -154,6 +159,7 @@ func (w wireDecision) toDecision() decision.Decision {
 		Module:                     w.Module,
 		Intent:                     w.Intent,
 		Interaction:                w.Interaction,
+		InteractionConfidence:      w.InteractionConfidence,
 		RequiredScopes:             w.RequiredScopes,
 		RequiredData:               w.RequiredData,
 		CanHandleDeterministically: w.CanHandleDeterministically,
@@ -198,7 +204,8 @@ func systemPrompt(t decision.Taxonomy) string {
 	b.WriteString("- requiredScopes must be the MINIMUM scopes needed, not every scope that might help.\n")
 	b.WriteString("- Set canHandleDeterministically=true and needsLLM=false ONLY when the product can fully answer from data alone with no further model reasoning (e.g. \"show my calendar\" -> just render data).\n")
 	b.WriteString("- module and intent must come from the taxonomy below; do not invent new ones.\n")
-	b.WriteString("- confidence is your calibrated probability in [0,1] that module/intent are correct.\n\n")
+	b.WriteString("- confidence is your calibrated probability in [0,1] that module/intent are correct.\n")
+	b.WriteString("- interactionConfidence is your probability in [0,1] that `interaction` is the right kind of turn. Be conservative for confirmation, rejection, correction, cancellation and undo: a wrong one acts on something the user never meant, so give 0 when the message does not clearly answer a pending action.\n\n")
 
 	b.WriteString("Taxonomy:\n")
 	for _, m := range t.Modules {

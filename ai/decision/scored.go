@@ -24,23 +24,40 @@ const (
 	// OutcomeNone: the engine says none of the candidates fits.
 	OutcomeNone Outcome = "none"
 	// OutcomeUnscored: the engine produced no calibrated probabilities (an LLM
-	// emulator, a deterministic rule), so no threshold can be applied. The
-	// answer is a proposal, never a "clear winner by margin", and it is NOT
-	// actionable.
+	// emulator), so no threshold can be applied. The answer is a proposal, never a
+	// "clear winner by margin", and it is NOT actionable.
 	OutcomeUnscored Outcome = "unscored"
 	// OutcomeAccepted: an UNCALIBRATED decision accepted because the caller's
 	// policy explicitly opted in (SelectionPolicy.AcceptUncalibratedAt) and its
 	// self-reported confidence reached that bar. It is actionable, and it is
 	// never a calibrated selection: Decision.Calibrated stays false.
 	OutcomeAccepted Outcome = "accepted"
+	// OutcomeDeterministic: the decision came from exact logic (a rule table; see
+	// Deterministic), so there is no estimate to threshold. It is actionable under
+	// every policy, and no AcceptUncalibratedAt bar applies to it.
+	OutcomeDeterministic Outcome = "deterministic"
+	// OutcomeFloor: a Chain WITHOUT a SelectionPolicy accepted the decision at its
+	// MinConfidence floor, the caller's own explicit bar. It is the explicit
+	// verdict that replaces "actionable because nothing judged it".
+	OutcomeFloor Outcome = "floor"
+	// OutcomeInvalid: the decision contradicts itself (its own intent is not the
+	// top of its own Scores, or is missing from them). It is NOT actionable, and a
+	// chain records it as an invalid answer and falls through.
+	OutcomeInvalid Outcome = "invalid"
 )
 
 // Actionable reports whether an outcome lets a caller act: a calibrated
-// selection (OutcomeSelected, OutcomeSeveral) or an explicitly accepted
-// uncalibrated decision (OutcomeAccepted). Uncertain, none and unscored are not.
-// The empty outcome (no policy ran) is not an Outcome; see Decision.Actionable.
+// selection (OutcomeSelected, OutcomeSeveral), an explicitly accepted
+// uncalibrated decision (OutcomeAccepted), a deterministic decision
+// (OutcomeDeterministic) or one a policy-less chain accepted at its floor
+// (OutcomeFloor). Uncertain, none, unscored, invalid and the empty outcome
+// (nothing judged it) are not.
 func (o Outcome) Actionable() bool {
-	return o == OutcomeSelected || o == OutcomeSeveral || o == OutcomeAccepted
+	switch o {
+	case OutcomeSelected, OutcomeSeveral, OutcomeAccepted, OutcomeDeterministic, OutcomeFloor:
+		return true
+	}
+	return false
 }
 
 // QuestionKind says how the probabilities of one Question relate to each other.

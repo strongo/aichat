@@ -65,11 +65,22 @@ func policyFromConfig(cfg Decision) (*decision.SelectionPolicy, error) {
 	if v.MaxPicks != nil {
 		p.MaxPicks = *v.MaxPicks
 	}
+	if v.AcceptUncalibratedSideEffects != nil {
+		p.AcceptUncalibratedSideEffects = *v.AcceptUncalibratedSideEffects
+	}
 	p.Name += "+custom"
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("aiconfig: decision.policyValues: %w", err)
 	}
 	return p, nil
+}
+
+// stopFromConfig maps an optional bool (nil: the default, ON) to a decision.Stop.
+func stopFromConfig(v *bool) decision.Stop {
+	if v != nil && !*v {
+		return decision.StopOff
+	}
+	return decision.StopOn
 }
 
 // buildEngine assembles the configured decision engines into one

@@ -54,6 +54,13 @@ func (p *Provider) DecisionTimeout() time.Duration { return decisionTimeout }
 // write "Confidence: 1" is exactly the kind of boilerplate this package
 // exists to avoid. A rule that deliberately wants a lower confidence still
 // can -- this only fills the zero value.
+//
+// Every matched decision is declared deterministic (decision.Deterministic):
+// its provenance is "deterministic", its outcome OutcomeDeterministic (always
+// actionable, under any SelectionPolicy, with no AcceptUncalibratedAt bar), and
+// whatever a Rule put in Calibrated, Scores or Model is cleared, since no model
+// produced the answer. A chain that sets a Policy therefore accepts a rule match
+// without calling, or paying for, the engines behind it.
 func (p *Provider) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
 	text := Normalize(req.Text)
 	for _, r := range p.rules {
@@ -67,7 +74,7 @@ func (p *Provider) Decide(ctx context.Context, req decision.Request) (decision.D
 			if d.Intent.Value != "" && d.Intent.Confidence == 0 {
 				d.Intent.Confidence = 1.0
 			}
-			return d, true, nil
+			return decision.Deterministic(d), true, nil
 		}
 	}
 	return decision.Decision{}, false, nil

@@ -86,6 +86,19 @@ type Decision struct {
 	// (decision.SelectionPolicy.Validate): an invalid combination is a Build
 	// error. It needs Policy to name the base.
 	PolicyValues *PolicyValues `yaml:"policyValues" json:"policyValues"`
+	// StopOnQuota (default true) makes the decision chain (Providers.Chain) stop,
+	// instead of calling the next provider, when a provider reports an exhausted
+	// allowance (decision.ErrQuota): allowance exhaustion must be loud and must not
+	// silently bill a paid provider behind it, which matters for any anonymous or
+	// metered demo. Set false to opt out, naming the decision; an engine
+	// strategy's fallbackOn "quota" is the narrower opt-in that fails over inside
+	// one engine. The decision.Trace says it stopped (StoppedBy, Err).
+	StopOnQuota *bool `yaml:"stopOnQuota" json:"stopOnQuota"`
+	// StopOnMisconfigured (default true) is the same for a misconfigured engine
+	// (decision.ErrMisconfigured: an unknown product, a base URL that does not speak
+	// the protocol): a person has to fix it, so it is never absorbed by the next
+	// provider.
+	StopOnMisconfigured *bool `yaml:"stopOnMisconfigured" json:"stopOnMisconfigured"`
 }
 
 // PolicyValues are optional numeric overrides of a named selection policy; see
@@ -101,6 +114,11 @@ type PolicyValues struct {
 	// decision (decision.SelectionPolicy.AcceptUncalibratedAt): 0 never, as the
 	// durable policy defaults to; the narrowing policy defaults to 0.70.
 	AcceptUncalibratedAt *float64 `yaml:"acceptUncalibratedAt" json:"acceptUncalibratedAt"`
+	// AcceptUncalibratedSideEffects is the separate opt-in to accepting an
+	// uncalibrated side-effectful interaction (confirmation, rejection,
+	// correction, cancellation, undo; decision.SelectionPolicy.AcceptUncalibratedSideEffects).
+	// False by default for both named policies.
+	AcceptUncalibratedSideEffects *bool `yaml:"acceptUncalibratedSideEffects" json:"acceptUncalibratedSideEffects"`
 }
 
 // BYOK configures a direct, product-owned connection to an LLM provider.
@@ -314,8 +332,21 @@ type Providers struct {
 	LLM      ai.LLMProvider
 	Decision []decision.Provider
 	// Policy is the selection policy named by Config.Decision.Policy, nil when
-	// none: feed it to decision.Chain{Policy: providers.Policy}.
+	// none: feed it to decision.Chain{Policy: providers.Policy}, or use Chain.
 	Policy *decision.SelectionPolicy
+	// StopOnQuota and StopOnMisconfigured are Config.Decision.StopOnQuota and
+	// StopOnMisconfigured as the decision.Chain settings (zero: stop).
+	StopOnQuota, StopOnMisconfigured decision.Stop
+}
+
+// Chain is the decision chain Build configured: Decision in order, the Policy,
+// and the stop settings. The product's own rules (Deps.ExtraDecision) come first
+// and are deterministic: under any Policy, including "durable", a rule match is
+// accepted (decision.OutcomeDeterministic) and the engines behind it are not
+// called. MinConfidence, Timeout and KeepNonSelected keep their defaults; set
+// them on the returned value.
+func (p Providers) Chain() decision.Chain {
+	return decision.Chain{Providers: p.Decision, Policy: p.Policy, StopOnQuota: p.StopOnQuota, StopOnMisconfigured: p.StopOnMisconfigured}
 }
 
 // Build wires up Providers from cfg and deps. LLM and Decision are
@@ -403,6 +434,7 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 	if out.Policy, err = policyFromConfig(cfg.Decision); err != nil {
 		return Providers{}, err
 	}
+	out.StopOnQuota, out.StopOnMisconfigured = stopFromConfig(cfg.Decision.StopOnQuota), stopFromConfig(cfg.Decision.StopOnMisconfigured)
 	if cfg.Decision.Provider != "disabled" {
 		engine, err := buildEngine(cfg.Decision, deps, out.Policy)
 		if err != nil {

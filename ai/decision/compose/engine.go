@@ -24,7 +24,9 @@ const (
 // (Fallback, Hedged) starts its backup. Failures (error, timeout, an open
 // breaker, an unsupported operation, an invalid answer, a request or credentials
 // the engine refused) always start it. An exhausted allowance (OnQuota) and a
-// misconfigured endpoint never do, unless OnQuota asks for the former.
+// misconfigured endpoint never do, unless OnQuota asks for the former. In Hedged
+// and Race the same two conditions also end the call when they come from a leg
+// that is already running (see Engine.halts).
 type Trigger uint
 
 const (
@@ -250,6 +252,21 @@ func (e *Engine) triggers(outcome string) bool {
 	}
 }
 
+// halts reports whether a leg that ended with outcome ends the whole call, in the
+// strategies that run legs concurrently (Hedged, Race): an exhausted allowance
+// (unless OnQuota chose to fail over) and a misconfigured endpoint. Without it a
+// backup that was already started, by the hedge timer or because a race starts
+// everyone, would answer and quietly take over the metered caller's traffic.
+func (e *Engine) halts(outcome string) bool {
+	switch outcome {
+	case decision.AttemptQuota:
+		return e.cfg.also&OnQuota == 0
+	case decision.AttemptMisconfigured:
+		return true
+	}
+	return false
+}
+
 // ---- Provider (decisions) ----
 
 // Decide implements decision.Provider.
@@ -284,7 +301,9 @@ func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decisi
 			return decision.AttemptInvalid, decision.InvalidDetail(err)
 		}
 		if e.cfg.policy != nil {
-			if sel := e.cfg.policy.EvaluateDecision(v.d); !sel.Actionable() {
+			if sel := e.cfg.policy.EvaluateDecision(v.d); sel.Outcome == decision.OutcomeInvalid {
+				return decision.AttemptInvalid, sel.Detail()
+			} else if !sel.Actionable() {
 				return decision.AttemptUncertain, sel.Detail()
 			}
 		}
@@ -302,7 +321,7 @@ func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decisi
 		}
 		return v.d, true, rep, nil
 	}
-	if out.abstained() {
+	if out.abstained() && !out.halted {
 		return decision.Decision{}, false, rep, nil
 	}
 	return decision.Decision{}, false, rep, out.failure(e)
@@ -454,7 +473,9 @@ func runLeg[T any](ctx context.Context, e *Engine, l leg[T], judge func(T) (stri
 		a.Usage = l.usage(res.val)
 	}
 	if rep != nil {
-		res.engine = rep.Engine
+		if rep.Engine != "" {
+			res.engine = rep.Engine
+		}
 		res.attempts = decision.MergeReport(*rep, a, res.err == nil && res.answered)
 	} else {
 		res.attempts = []decision.Attempt{a}
@@ -499,6 +520,10 @@ type runOut[T any] struct {
 	// an uncertain answer that does not trigger the backup: that answer is the
 	// result, whatever the backup was doing.
 	primaryStands bool
+	// halted is true when a started leg reported an exhausted allowance or a
+	// misconfigured endpoint that the engine does not fail over (see halts): the
+	// other legs were cancelled and no answer is returned, only the failure.
+	halted bool
 }
 
 // pickAnswer chooses the answer an engine returns: the accepted one, else the
@@ -506,6 +531,9 @@ type runOut[T any] struct {
 func (o runOut[T]) pickAnswer() int {
 	if o.winner >= 0 {
 		return o.winner
+	}
+	if o.halted {
+		return -1
 	}
 	if o.primaryStands {
 		if o.results[0].outcome == decision.AttemptUncertain {
@@ -630,7 +658,7 @@ func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge f
 	}
 
 	winnerLeg := -1
-	for running > 0 && winnerLeg < 0 && !out.primaryStands {
+	for running > 0 && winnerLeg < 0 && !out.primaryStands && !out.halted {
 		select {
 		case <-hedgeC:
 			hedgeC = nil // a nil channel never fires again
@@ -645,6 +673,12 @@ func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge f
 			switch {
 			case rr.accepted():
 				winnerLeg = r.idx
+			case e.halts(rr.outcome) && (e.strategy == StrategyRace || r.idx == 0):
+				// A race pays every engine on every call, so one engine's refusal
+				// of the allowance ends the call. A hedge's backup is only the
+				// primary's stand-in: the primary's refusal ends it, the backup's
+				// own is just a failed backup.
+				out.halted = true
 			case e.strategy == StrategyHedged && r.idx == 0 && e.triggers(rr.outcome):
 				if !started[1] {
 					out.fallback = true

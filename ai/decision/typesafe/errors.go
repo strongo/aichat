@@ -37,6 +37,18 @@ var (
 	// ErrRateLimited: the rate limit was exceeded (HTTP 429). The caller (a
 	// combinator or breaker) decides whether to try another engine; this package
 	// never retries.
+	//
+	// It is deliberately NOT decision.ErrQuota. TypeSafe's documentation (the
+	// error classes of its SDKs and the llms.txt index, checked 2026-10) defines
+	// one 429 error, "the rate limit was exceeded", with a Retry-After delay, and
+	// no error type, status or body field that tells a billing or credit
+	// exhaustion from a per-second rate limit; the API documents no quota error at
+	// all. So every 429 is treated as a transient rate limit: a breaker counts it
+	// and opens for the Retry-After, a combinator may fail over. A product that
+	// needs a hard allowance stop (the anonymous demo) must enforce it on its own
+	// side, for example behind the cloud boundary, whose protocol does carry code
+	// "quota" (ai/cloud maps it to decision.ErrQuota); if TypeSafe documents a
+	// distinguishing error type, kindForStatus is the one place to map it.
 	ErrRateLimited = errors.New("typesafe: rate limited")
 	// ErrOverloaded: the service is temporarily overloaded (HTTP 529).
 	ErrOverloaded = errors.New("typesafe: overloaded")

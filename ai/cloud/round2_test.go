@@ -96,8 +96,13 @@ func (p *protoServer) set(path string, r route) {
 	p.routes[path] = r
 }
 
-func (p *protoServer) client() *Client {
-	return New(Config{BaseURL: p.URL + "/v0/", Product: "sneat", Token: tokenFunc("t")})
+func (p *protoServer) client() *Client { return p.clientWith(func(*Config) {}) }
+
+// clientWith builds a client against the server, after mutate adjusted its Config.
+func (p *protoServer) clientWith(mutate func(*Config)) *Client {
+	cfg := Config{BaseURL: p.URL + "/v0/", Product: "sneat", Token: tokenFunc("t")}
+	mutate(&cfg)
+	return New(cfg)
 }
 
 func apiError(code, msg string) string {
@@ -114,6 +119,14 @@ func jsonRoute(status int, body string, headers ...string) route {
 }
 
 var usageOK = jsonRoute(200, `{"product":"sneat"}`)
+
+// scoreAbsent reports whether c currently remembers that the server has no
+// ai/score route.
+func scoreAbsent(c *Client) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.absent
+}
 
 func decideReq() decision.Request {
 	return decision.Request{Text: "hi", Taxonomy: decision.Taxonomy{Modules: []decision.ModuleSpec{{Name: "m", Intents: []string{"i"}}}}}
@@ -377,7 +390,9 @@ func TestCloud_MistypedBaseURLIsALoudConfigurationError(t *testing.T) {
 	for name, miss := range map[string]route{"html": htmlNotFound, "plain": plainMissing} {
 		t.Run(name, func(t *testing.T) {
 			srv := newProtoServer(t, map[string]route{}) // everything 404s
-			b := compose.NewBreaker(srv.client().Decider(), compose.WithBreakerThreshold(1))
+			// MisconfiguredTTL < 0: not remembered at all (the default remembers it briefly:
+			// see TestCloud_MisconfiguredVerdictIsRemembered).
+			b := compose.NewBreaker(srv.clientWith(func(c *Config) { c.MisconfiguredTTL = -1 }).Decider(), compose.WithBreakerThreshold(1))
 			backup := &countingScorer{stubScorer: stubScorer{name: "local"}}
 			e := compose.Fallback(b, backup)
 			srv.set(cloudproto.PathScore, miss)
@@ -444,17 +459,17 @@ func TestCloud_ProbeVerdicts(t *testing.T) {
 			_, err := c.Decider().(decision.ScoredProvider).Score(context.Background(), libraryScoreRequest())
 			switch {
 			case tc.wantUnsup:
-				if !errors.Is(err, decision.ErrUnsupported) || !c.scoreAbsent.Load() {
+				if !errors.Is(err, decision.ErrUnsupported) || !scoreAbsent(c) {
 					t.Fatalf("err=%v", err)
 				}
 			case tc.wantMisconf:
-				if !errors.Is(err, decision.ErrMisconfigured) || c.scoreAbsent.Load() {
+				if !errors.Is(err, decision.ErrMisconfigured) || scoreAbsent(c) {
 					t.Fatalf("err=%v", err)
 				}
 			case tc.wantFault:
 				// Inconclusive: an engine fault, nothing remembered, nothing unsupported.
 				var aiErr *ai.Error
-				if err == nil || errors.Is(err, decision.ErrUnsupported) || errors.Is(err, decision.ErrMisconfigured) || !errors.As(err, &aiErr) || c.scoreAbsent.Load() {
+				if err == nil || errors.Is(err, decision.ErrUnsupported) || errors.Is(err, decision.ErrMisconfigured) || !errors.As(err, &aiErr) || scoreAbsent(c) {
 					t.Fatalf("err=%v", err)
 				}
 			}
@@ -475,7 +490,7 @@ func TestCloud_ProbeTransportFailureAndCancellationAndTokenFailure(t *testing.T)
 		})}})
 	var aiErr *ai.Error
 	_, err := c.Decider().(decision.ScoredProvider).Score(context.Background(), libraryScoreRequest())
-	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeUpstream || errors.Is(err, decision.ErrUnsupported) || c.scoreAbsent.Load() {
+	if !errors.As(err, &aiErr) || aiErr.Code != ai.ErrCodeUpstream || errors.Is(err, decision.ErrUnsupported) || scoreAbsent(c) {
 		t.Fatalf("transport: %v", err)
 	}
 	// Cancelled while probing.

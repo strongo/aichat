@@ -89,7 +89,7 @@ func TestDecisionSchema_MatchesFields(t *testing.T) {
 	if err := json.Unmarshal([]byte(decisionSchema), &parsed); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"module", "intent", "interaction", "reference", "requiredScopes", "requiredData", "slots", "canHandleDeterministically", "needsLLM", "presentation"}
+	want := []string{"module", "intent", "interaction", "interactionConfidence", "reference", "requiredScopes", "requiredData", "slots", "canHandleDeterministically", "needsLLM", "presentation"}
 	for _, f := range want {
 		if _, ok := parsed.Properties[f]; !ok {
 			t.Errorf("schema missing property %q", f)
@@ -101,6 +101,7 @@ func TestDecisionSchema_MatchesFields(t *testing.T) {
 		Module:                     decision.Scored{Value: "calendar", Confidence: 0.9},
 		Intent:                     decision.Scored{Value: "show", Confidence: 0.9},
 		Interaction:                decision.InteractionCommand,
+		InteractionConfidence:      0.9,
 		Reference:                  &decision.Reference{Kind: "happening", Expression: "it", Pronoun: true},
 		RequiredScopes:             []string{"calendar"},
 		RequiredData:               []string{"relevant_happenings"},
@@ -416,5 +417,51 @@ func TestExtractJSON_FencedBlockAtStart(t *testing.T) {
 func TestExtractJSON_NoBraces(t *testing.T) {
 	if got := extractJSON("no json here"); got != "" {
 		t.Errorf("extractJSON = %q, want empty", got)
+	}
+}
+
+// M3: the decider reports its interaction confidence (self-reported, as every
+// number it reports), and a model that leaves it out gives 0 = "not reported".
+func TestDecide_InteractionConfidenceIsSelfReportedAndZeroWhenAbsent(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want float64
+	}{
+		"reported": {`{"module":{"value":"calendar","confidence":0.9},"intent":{"value":"show","confidence":0.9},"interaction":"command","interactionConfidence":0.85}`, 0.85},
+		"absent":   {`{"module":{"value":"calendar","confidence":0.9},"intent":{"value":"show","confidence":0.9},"interaction":"command"}`, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			llm := &fakeLLM{events: []ai.Event{{Type: ai.EventStructured, Structured: json.RawMessage(tc.body)}, {Type: ai.EventCompleted}}}
+			d, ok, err := New(llm, Options{}).Decide(context.Background(), decision.Request{Text: "x", Taxonomy: taxonomy()})
+			if err != nil || !ok || d.InteractionConfidence != tc.want || d.Calibrated || d.Provenance() != decision.ProvenanceSelfReported || d.Actionable() {
+				t.Fatalf("d=%+v ok=%v err=%v", d, ok, err)
+			}
+			if !strings.Contains(llm.lastReq.System, "interactionConfidence") {
+				t.Errorf("the prompt must explain interactionConfidence")
+			}
+		})
+	}
+}
+
+// The end-to-end finding: a module-less "yes" from the LLM at no interaction
+// confidence is not accepted under the narrowing policy; with a stated, high
+// confidence AND the explicit opt-in it is.
+func TestDecide_ConfirmationFromTheLLMIsGatedByThePolicy(t *testing.T) {
+	yes := func(conf string) *Decider {
+		body := `{"module":{"value":"","confidence":0},"intent":{"value":"","confidence":0},"interaction":"confirmation"` + conf + `}`
+		return New(&fakeLLM{events: []ai.Event{{Type: ai.EventStructured, Structured: json.RawMessage(body)}, {Type: ai.EventCompleted}}}, Options{})
+	}
+	nar := decision.NarrowingPolicy()
+	if d, ok, tr := (decision.Chain{Providers: []decision.Provider{yes("")}, Policy: &nar}).Decide(context.Background(), decision.Request{Text: "yes", Taxonomy: taxonomy()}); ok {
+		t.Fatalf("accepted: %+v %+v", d, tr)
+	}
+	optIn := nar
+	optIn.AcceptUncalibratedSideEffects = true
+	if _, ok, _ := (decision.Chain{Providers: []decision.Provider{yes("")}, Policy: &optIn}).Decide(context.Background(), decision.Request{Text: "yes", Taxonomy: taxonomy()}); ok {
+		t.Fatal("the opt-in does not accept an engine that reports no interaction confidence")
+	}
+	d, ok, _ := decision.Chain{Providers: []decision.Provider{yes(`,"interactionConfidence":0.95`)}, Policy: &optIn}.Decide(context.Background(), decision.Request{Text: "yes", Taxonomy: taxonomy()})
+	if !ok || d.Outcome != decision.OutcomeAccepted {
+		t.Fatalf("ok=%v d=%+v", ok, d)
 	}
 }

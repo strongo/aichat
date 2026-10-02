@@ -35,6 +35,19 @@
 // the client does not retry such a response itself, and a circuit breaker keeps
 // the engine out of service at least that long (capped at 10 minutes).
 //
+// A decision from ai/decision is a claim, not a verdict. The client trusts a
+// server's calibrated flag and scores, but never lets a response make a decision
+// actionable or deterministic: any actionable "outcome" in the body is dropped
+// (only a refusal such as "uncertain" is kept), and protocol version 1 has no wire
+// form for "deterministic" (that class is declared in-process by a rule table,
+// decision.Deterministic, through a field no JSON can set), so a server answer is
+// at most calibrated and otherwise self-reported. Unknown fields are ignored.
+//
+// GET ai/usage answers with a UsageResponse: a client takes a 2xx JSON object as
+// "this base URL speaks the protocol" only when it has that shape (a non-empty
+// "product" string, and "allowance" an object or null when present), so a catch-all
+// 200 from a web host in front of the API does not count.
+//
 // Every request carries HeaderProtocol (the protocol version this client speaks,
 // ProtocolVersion), in addition to the version prefix of {base}; a server may use
 // it to answer a newer or older client in the version it asked for, and ScoreResponse

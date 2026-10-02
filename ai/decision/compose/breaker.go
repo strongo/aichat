@@ -157,6 +157,7 @@ type Breaker struct {
 
 var (
 	_ decision.Provider       = (*Breaker)(nil)
+	_ decision.TracedProvider = (*Breaker)(nil)
 	_ decision.ScoredProvider = (*Breaker)(nil)
 )
 
@@ -358,20 +359,35 @@ func callBreaker[T any](b *Breaker, ctx context.Context, fn func(context.Context
 }
 
 type decideResult struct {
-	d  decision.Decision
-	ok bool
+	d   decision.Decision
+	ok  bool
+	rep decision.Report
 }
 
 // Decide implements decision.Provider.
 func (b *Breaker) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
+	d, ok, _, err := b.DecideTraced(ctx, req)
+	return d, ok, err
+}
+
+// DecideTraced implements decision.TracedProvider, transparently: when the wrapped
+// engine reports how it answered (a combinator, or an engine that explains an
+// abstention, as typesafe.Client does), the breaker passes that report on, so a
+// circuit breaker around an engine never hides its attempts from a Chain's trace.
+// For an engine that reports nothing the report is empty.
+func (b *Breaker) DecideTraced(ctx context.Context, req decision.Request) (decision.Decision, bool, decision.Report, error) {
 	if b.inner == nil {
-		return decision.Decision{}, false, fmt.Errorf("%s: %w", b.Name(), ErrNoEngine)
+		return decision.Decision{}, false, decision.Report{}, fmt.Errorf("%s: %w", b.Name(), ErrNoEngine)
 	}
 	r, err := callBreaker(b, ctx, func(ctx context.Context) (decideResult, error) {
+		if tp, ok := b.inner.(decision.TracedProvider); ok {
+			d, ok, rep, err := tp.DecideTraced(ctx, req)
+			return decideResult{d, ok, rep}, err
+		}
 		d, ok, err := b.inner.Decide(ctx, req)
-		return decideResult{d, ok}, err
+		return decideResult{d: d, ok: ok, rep: decision.Report{Engine: b.Name()}}, err
 	})
-	return r.d, r.ok, err
+	return r.d, r.ok, r.rep, err
 }
 
 // Score implements decision.ScoredProvider. A breaker with no engine returns

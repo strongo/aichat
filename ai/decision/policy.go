@@ -12,17 +12,22 @@ import (
 // runner-up, and an independent relevance list may legitimately select several
 // candidates or none.
 //
-// A policy is applied only to CALIBRATED answers. An uncalibrated answer gets
+// A decision has one of three provenances (Decision.Provenance). A policy is
+// applied by probability only to CALIBRATED answers. An uncalibrated answer gets
 // OutcomeUnscored whatever its numbers say, with a PROPOSAL in
-// Selection.Proposals (see Evaluate) that is never a selection. The one
-// exception is a Decision (EvaluateDecision) under a policy whose
-// AcceptUncalibratedAt is set: that opt-in names the self-reported confidence
-// at which an uncalibrated decision is accepted (OutcomeAccepted).
+// Selection.Proposals (see Evaluate) that is never a selection. The exceptions
+// are a Decision (EvaluateDecision) under a policy whose AcceptUncalibratedAt is
+// set (that opt-in names the self-reported confidence at which an LLM's decision
+// is accepted: OutcomeAccepted; a side-effectful interaction needs a further,
+// separate opt-in), and a DETERMINISTIC decision (see Deterministic), which every
+// policy accepts as OutcomeDeterministic: exact logic has no estimate to
+// threshold, and AcceptUncalibratedAt never governs it.
 //
 // There is ONE rule for "may a caller act on this": Selection.Actionable and
-// Decision.Actionable are true for a calibrated selection (selected, several)
-// and for an explicitly accepted uncalibrated decision (accepted), and for
-// nothing else.
+// Decision.Actionable are true for a calibrated selection (selected, several),
+// an explicitly accepted uncalibrated decision (accepted), a deterministic
+// decision (deterministic) and a policy-less chain's floor acceptance (floor),
+// and for nothing else.
 //
 // Use NarrowingPolicy or DurablePolicy, or build a value and Validate it. The
 // zero value is invalid (it would select everything): Validate rejects it, and
@@ -62,8 +67,24 @@ type SelectionPolicy struct {
 	// DurablePolicy leaves it off; NarrowingPolicy sets it to
 	// NarrowingAcceptUncalibratedAt. Without this opt-in, a calibrated engine
 	// that goes down would silently lower the bar from the calibrated threshold
-	// to an LLM's self-reported number.
+	// to an LLM's self-reported number. It never governs a deterministic decision,
+	// which every policy accepts (OutcomeDeterministic) without comparing any
+	// confidence: use rules (Deterministic) for what must be certain, not a
+	// threshold of 1.0 an LLM can also report.
 	AcceptUncalibratedAt float64 `json:"acceptUncalibratedAt,omitempty"`
+
+	// AcceptUncalibratedSideEffects is the separate, explicit opt-in to accepting
+	// an uncalibrated decision whose Interaction is side-effectful (confirmation,
+	// rejection, correction, cancellation, undo: see SideEffectful), because a
+	// wrong "yes" confirms something the user never meant and an LLM's
+	// self-reported number is a poor guard for that. Without it such a decision
+	// is unscored (reason side_effect_uncalibrated) however confident it sounds,
+	// including under AcceptUncalibratedAt. With it, the decision's own
+	// InteractionConfidence must be above 0 and reach the larger of
+	// AcceptUncalibratedAt and DurableMinConfidence (an engine that reports no
+	// interaction confidence is never accepted for these kinds), on top of the
+	// module and intent bar. False by default for both named policies.
+	AcceptUncalibratedSideEffects bool `json:"acceptUncalibratedSideEffects,omitempty"`
 }
 
 // Documented defaults of the two named policies. They are PROVISIONAL: they come
@@ -128,8 +149,8 @@ func DurablePolicy() SelectionPolicy {
 
 // AtLeast returns a policy at least as strict as both p and o: each threshold
 // is the larger of the two, MaxPicks the smaller non-zero cap, and an
-// uncalibrated decision is accepted only when BOTH accept it (the larger bar,
-// and never when either never does). Its name is p's with "+strict" appended.
+// uncalibrated decision (and an uncalibrated side-effectful one) is accepted only
+// when BOTH accept it (the larger bar, and never when either never does). Its name is p's with "+strict" appended.
 func (p SelectionPolicy) AtLeast(o SelectionPolicy) SelectionPolicy {
 	r := p
 	r.Name += "+strict"
@@ -149,6 +170,7 @@ func (p SelectionPolicy) AtLeast(o SelectionPolicy) SelectionPolicy {
 	} else {
 		r.AcceptUncalibratedAt = max(p.AcceptUncalibratedAt, o.AcceptUncalibratedAt)
 	}
+	r.AcceptUncalibratedSideEffects = p.AcceptUncalibratedSideEffects && o.AcceptUncalibratedSideEffects
 	return r
 }
 
@@ -206,7 +228,9 @@ type Selection struct {
 	// Reason is a short machine-readable explanation of a non-selected
 	// outcome, or of a truncation: not_calibrated, no_scores, none_of_these,
 	// low_confidence, narrow_gap, nothing_above_floor, only_potential,
-	// truncated_to_max_picks, invalid_policy, accepted_uncalibrated.
+	// truncated_to_max_picks, invalid_policy, accepted_uncalibrated, deterministic_rule,
+	// side_effect_uncalibrated, interaction_low_confidence, decision_not_scored,
+	// decision_not_top, bad_scores.
 	Reason string `json:"reason,omitempty"`
 }
 
@@ -239,6 +263,23 @@ const (
 	// ReasonAcceptedUncalibrated marks OutcomeAccepted: the policy's
 	// AcceptUncalibratedAt opt-in, not a calibrated selection.
 	ReasonAcceptedUncalibrated = "accepted_uncalibrated"
+	// ReasonDeterministic marks OutcomeDeterministic: exact logic, no threshold.
+	ReasonDeterministic = "deterministic_rule"
+	// ReasonSideEffectUncalibrated: an uncalibrated side-effectful interaction
+	// without the AcceptUncalibratedSideEffects opt-in.
+	ReasonSideEffectUncalibrated = "side_effect_uncalibrated"
+	// ReasonInteractionLowConfidence: an opted-in uncalibrated side-effectful
+	// interaction whose InteractionConfidence is 0 (not reported) or below the bar.
+	ReasonInteractionLowConfidence = "interaction_low_confidence"
+	// ReasonDecisionNotScored: a calibrated decision whose own module/intent is not
+	// among its Scores (OutcomeInvalid).
+	ReasonDecisionNotScored = "decision_not_scored"
+	// ReasonDecisionNotTop: a calibrated decision whose own module/intent scores
+	// below another option of its own Scores (OutcomeInvalid).
+	ReasonDecisionNotTop = "decision_not_top"
+	// ReasonBadScores: a calibrated decision with a non-finite or out-of-range
+	// probability in Scores (OutcomeInvalid).
+	ReasonBadScores = "bad_scores"
 )
 
 // Evaluate applies the policy to one answer.
@@ -362,33 +403,110 @@ func answerOf(d Decision) Answer {
 	return a
 }
 
-// EvaluateDecision applies the policy to a Decision. A calibrated decision with
-// Scores is judged like a Choice (the policy's confidence and gap thresholds). A
-// decision the policy cannot judge by probabilities (uncalibrated, or calibrated
-// but without Scores) is OutcomeAccepted when AcceptUncalibratedAt is set and
-// both its Module and Intent confidences reach it (the module confidence is
-// exempt for a module-optional interaction, as in Chain), and OutcomeUnscored,
-// which is not actionable, otherwise. An invalid policy selects nothing.
+// EvaluateDecision applies the policy to a Decision.
+//
+//   - A deterministic decision (Deterministic) is OutcomeDeterministic, whatever
+//     the policy's numbers: exact logic has nothing to threshold.
+//   - A calibrated decision with Scores is judged like a Choice (the policy's
+//     confidence and gap thresholds) on the decision's OWN module/intent, never on
+//     whichever option tops the scores: a decision whose own option is missing from
+//     its Scores, or scores below another option, contradicts itself and is
+//     OutcomeInvalid (not actionable; reasons decision_not_scored,
+//     decision_not_top, bad_scores).
+//   - Any other decision (uncalibrated, or calibrated but without Scores) is
+//     OutcomeAccepted when AcceptUncalibratedAt is set and both its Module and
+//     Intent confidences reach it (the module confidence is exempt for a
+//     module-optional interaction, as in Chain), and OutcomeUnscored, which is not
+//     actionable, otherwise. A side-effectful interaction (SideEffectful) is further
+//     refused unless AcceptUncalibratedSideEffects opts in and its
+//     InteractionConfidence is above 0 and reaches the larger of
+//     AcceptUncalibratedAt and DurableMinConfidence.
+//
+// An invalid policy selects nothing.
 func (p SelectionPolicy) EvaluateDecision(d Decision) Selection {
 	if p.Validate() != nil {
 		return Selection{Outcome: OutcomeUncertain, Reason: ReasonInvalidPolicy}
 	}
+	if d.deterministic {
+		return Selection{Outcome: OutcomeDeterministic, Reason: ReasonDeterministic, Picks: []string{decisionKey(d)}}
+	}
 	if d.Calibrated && len(d.Scores) > 0 {
-		return p.Evaluate(answerOf(d))
+		return p.evaluateOwn(d)
 	}
 	sel := Selection{Outcome: OutcomeUnscored, Reason: ReasonNotCalibrated}
 	if d.Calibrated {
 		sel.Reason = ReasonNoScores
 	}
-	switch {
-	case p.AcceptUncalibratedAt <= 0:
-	case lowConfidence(d, p.AcceptUncalibratedAt):
-		sel.Reason = ReasonLowConfidence
-	default:
-		sel.Outcome, sel.Reason = OutcomeAccepted, ReasonAcceptedUncalibrated
-		sel.Picks = []string{decisionKey(d)}
+	if p.AcceptUncalibratedAt <= 0 {
+		return sel
 	}
+	if reason := p.uncalibratedRefusal(d); reason != "" {
+		sel.Reason = reason
+		return sel
+	}
+	sel.Outcome, sel.Reason = OutcomeAccepted, ReasonAcceptedUncalibrated
+	sel.Picks = []string{decisionKey(d)}
 	return sel
+}
+
+// uncalibratedRefusal is why an uncalibrated decision is not accepted ("" when it
+// is). AcceptUncalibratedAt is set.
+func (p SelectionPolicy) uncalibratedRefusal(d Decision) string {
+	if SideEffectful(d.Interaction) {
+		switch {
+		case !p.AcceptUncalibratedSideEffects:
+			return ReasonSideEffectUncalibrated
+		case d.InteractionConfidence <= 0 || d.InteractionConfidence < max(p.AcceptUncalibratedAt, DurableMinConfidence):
+			return ReasonInteractionLowConfidence
+		}
+	}
+	if lowConfidence(d, p.AcceptUncalibratedAt) {
+		return ReasonLowConfidence
+	}
+	return ""
+}
+
+// evaluateOwn judges a calibrated decision by the probability of ITS OWN
+// module/intent among its Scores.
+func (p SelectionPolicy) evaluateOwn(d Decision) Selection {
+	for _, pr := range d.Scores {
+		if math.IsNaN(pr) || pr < 0 || pr > 1 {
+			return Selection{Outcome: OutcomeInvalid, Reason: ReasonBadScores}
+		}
+	}
+	key, ok := scoreKey(d)
+	if !ok {
+		return Selection{Outcome: OutcomeInvalid, Reason: ReasonDecisionNotScored}
+	}
+	a := answerOf(d)
+	own := d.Scores[key]
+	if own < a.Scores[0].Probability {
+		return Selection{Outcome: OutcomeInvalid, Reason: ReasonDecisionNotTop}
+	}
+	// Rank the decision's own option first among equals, so a tie reads as a
+	// zero gap rather than depending on id order.
+	ranked := []Score{{ID: key, Probability: own}}
+	for _, s := range a.Scores {
+		if s.ID != key {
+			ranked = append(ranked, s)
+		}
+	}
+	return p.evaluateChoice(a, ranked)
+}
+
+// scoreKey finds the key of d's own option in d.Scores: "module/intent" (the
+// option id of a multi-module taxonomy), else the bare intent (a choose:<role>
+// request), else the bare module (a module with no intents).
+func scoreKey(d Decision) (string, bool) {
+	for _, k := range []string{decisionKey(d), d.Intent.Value, d.Module.Value} {
+		if k == "" {
+			continue
+		}
+		if _, ok := d.Scores[k]; ok {
+			return k, true
+		}
+	}
+	return "", false
 }
 
 // decisionKey names a decision's pick as Decision.Scores does.
