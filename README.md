@@ -13,10 +13,10 @@ products. Apache-2.0.
 | `ai/openaicompat` | `LLMProvider` over the OpenAI Chat Completions streaming API (plain net/http) |
 | `ai/openairesponses` | `LLMProvider` over OpenAI's Responses API (plain net/http, item-based input/output, same `Config` shape as `ai/openaicompat`) |
 | `ai/anthropic` | `LLMProvider` over the Anthropic Messages streaming API (plain net/http, prompt caching) |
-| `ai/cloud` | `LLMProvider` client for the `ai/cloudproto` cloud boundary; `Decider()` returns its separate `decision.Provider` role, plus `Usage` |
+| `ai/cloud` | `LLMProvider` client for the `ai/cloudproto` cloud boundary; `Decider()` returns its separate `decision.Provider` role (also a `ScoredProvider`, over `POST ai/score`), plus `Usage` |
 | `ai/decision/rules` | Deterministic, table-driven `decision.Provider` — no regex/NLP engine |
-| `ai/decision/llmdecider` | `decision.Provider` backed by one structured LLM inference: an LLM decider with uncalibrated confidences, a fallback or emulator behind a real decision model |
-| `ai/decision/typesafe` | Client for TypeSafe AI's System One API (the Jev decision model): `decision.Provider` and `decision.ScoredProvider` with calibrated probabilities |
+| `ai/decision/llmdecider` | `decision.Provider` backed by one structured LLM inference: an LLM decider with uncalibrated confidences (decisions and scored candidates), a fallback or emulator behind a real decision model |
+| `ai/decision/typesafe` | Client for TypeSafe AI's System One API (the Jev decision model): `decision.Provider` and `decision.ScoredProvider` with calibrated probabilities; the model id is required (pin a version) |
 | `ai/decision/compose` | Engine combinators over `decision.Provider`: `Single`, `Fallback`, `Hedged`, `Race`, and a circuit `Breaker` |
 | `ai/ctxmgr` | Context Manager: token-budgeted, cache-stable `ai.ContextBlock` selection |
 | `ai/aiconfig` | Product config (`cloud`/`byok`, decision chain) and `Build` wiring |
