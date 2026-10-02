@@ -231,8 +231,9 @@ const (
 	EnvDecisionStrategy   = "AI_DECISION_STRATEGY"
 	EnvDecisionHedgeAfter = "AI_DECISION_HEDGE_AFTER"
 	EnvDecisionPolicy     = "AI_DECISION_POLICY"
-	// EnvDecisionStopOnQuota and EnvDecisionStopOnMisconfigured are booleans
-	// ("true"/"false"); anything else is a Build error.
+	// EnvDecisionStopOnQuota and EnvDecisionStopOnMisconfigured are booleans as
+	// strconv.ParseBool reads them (1, t, T, TRUE, true, True, 0, f, F, FALSE, false,
+	// False); anything else, a padded value included, is a Build error.
 	EnvDecisionStopOnQuota         = "AI_DECISION_STOP_ON_QUOTA"
 	EnvDecisionStopOnMisconfigured = "AI_DECISION_STOP_ON_MISCONFIGURED"
 	// EnvDecisionBackupBudgetMaxCalls (an integer) and EnvDecisionBackupBudgetPer (a
@@ -331,7 +332,7 @@ func (c *Config) applyStopAndBudgetEnv(get func(string) string) {
 		}
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			c.envErrs = append(c.envErrs, fmt.Errorf("aiconfig: %s=%q is not a boolean", name, v))
+			c.envError(fmt.Errorf("aiconfig: %s=%q is not a boolean", name, v))
 			return
 		}
 		*dst = &b
@@ -347,7 +348,7 @@ func (c *Config) applyStopAndBudgetEnv(get func(string) string) {
 	if v := get(EnvDecisionBackupBudgetMaxCalls); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			c.envErrs = append(c.envErrs, fmt.Errorf("aiconfig: %s=%q is not an integer", EnvDecisionBackupBudgetMaxCalls, v))
+			c.envError(fmt.Errorf("aiconfig: %s=%q is not an integer", EnvDecisionBackupBudgetMaxCalls, v))
 		} else {
 			budget().MaxCalls = n
 		}
@@ -355,6 +356,17 @@ func (c *Config) applyStopAndBudgetEnv(get func(string) string) {
 	if v := get(EnvDecisionBackupBudgetPer); v != "" {
 		budget().Per = v
 	}
+}
+
+// envError records an unreadable environment value once (applying the same
+// environment twice, by the caller and by Build, must not repeat it).
+func (c *Config) envError(err error) {
+	for _, e := range c.envErrs {
+		if e.Error() == err.Error() {
+			return
+		}
+	}
+	c.envErrs = append(c.envErrs, err)
 }
 
 // String renders Config for logs/diagnostics. It never prints key values --
@@ -449,7 +461,8 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 	if deps.HTTPClient == nil {
 		deps.HTTPClient = http.DefaultClient
 	}
-	cfg.envErrs = nil
+	// Errors an earlier ApplyEnv on this Config recorded are kept: Build reports
+	// them too, so a caller that applied the environment itself cannot lose one.
 	cfg.ApplyEnv(deps.Getenv, deps.EnvPrefix)
 	fillDefaults(&cfg)
 	if err := errors.Join(cfg.envErrs...); err != nil {

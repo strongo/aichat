@@ -52,6 +52,13 @@ Four things a product must know before it acts on `ai/decision` answers:
   backup is never billed silently. Check `Trace.StoppedBy` BEFORE escalating to
   your paid main LLM. Put rules (deterministic providers) before the engines: a
   stop skips everything after it.
+- **A verdict belongs to the content it judged.** Editing a judged decision's
+  module, intent, interaction, confidences or `Calibrated` makes it not
+  actionable again, `json.Unmarshal` into a judged value discards its verdict, and
+  `Chain.Rejudge` never upgrades a refusal recorded in `Outcome` (a policy-less
+  chain knows only its floor: rejudge with the chain that carries your policy).
+  Fields outside that list (`Scores`, `Slots`, `Reference`, ...) are not bound:
+  re-judge after changing them.
 - **A paid backup needs a cap.** TypeSafe documents one 429 (a rate limit) and no
   way to tell a spent Jev account from it, so every 429 stays transient and a
   `Fallback(Breaker(jev), Breaker(llm))` sends all traffic to the LLM once the
@@ -59,7 +66,11 @@ Four things a product must know before it acts on `ai/decision` answers:
   the backup in `compose.NewBudget` (inside its `Breaker`), or set
   `decision.backupBudget: {maxCalls, per}` in `aiconfig`. For anonymous or public
   traffic run the calibrated engine alone (no paid backup) or with a budgeted
-  backup.
+  backup. The cap counts admissions, not billed requests (a hedge-started
+  backup that loses still consumed one), its window is fixed (a burst across a
+  boundary can admit twice the cap), a spent budget is never failed over from
+  (`OnQuota` does not apply) and always beats an abstention or an uncertain
+  answer, so the chain stops; a spent budget in a race halts the race.
 
 Products own scopes, intents, prompts, actions and controls. This module owns
 only what every product needs to talk to models and render chat the same way

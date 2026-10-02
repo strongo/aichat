@@ -230,10 +230,10 @@ func TestBudget_IsQuotaClassForTheStrategies(t *testing.T) {
 	if ok || !errors.Is(err, decision.ErrBudget) || backup.calls.Load() != 0 || rep.Attempts[0].Outcome != decision.AttemptBudget {
 		t.Fatalf("ok=%v err=%v backupCalls=%d rep=%+v", ok, err, backup.calls.Load(), rep)
 	}
-	// ...unless OnQuota chose to fail over.
+	// ...and OnQuota, which is about an exhausted allowance, does not change that.
 	_, ok, _, err = Fallback(spent(), backup, WithFallbackOn(OnQuota)).DecideTraced(context.Background(), request())
-	if !ok || err != nil || backup.calls.Load() != 1 {
-		t.Fatalf("ok=%v err=%v", ok, err)
+	if ok || !errors.Is(err, decision.ErrBudget) || backup.calls.Load() != 0 {
+		t.Fatalf("OnQuota must not fail over from a spent budget: ok=%v err=%v backupCalls=%d", ok, err, backup.calls.Load())
 	}
 	// A spent BACKUP behind a primary that failed: the call fails loudly.
 	_, ok, _, err = Fallback(failing("jev", errTransient), spent()).DecideTraced(context.Background(), request())

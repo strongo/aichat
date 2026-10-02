@@ -231,7 +231,8 @@ type Selection struct {
 	// low_confidence, narrow_gap, nothing_above_floor, only_potential,
 	// truncated_to_max_picks, invalid_policy, accepted_uncalibrated, deterministic_rule,
 	// side_effect_uncalibrated, interaction_low_confidence, interaction_narrow_gap,
-	// interaction_not_top, decision_not_scored, decision_not_top, bad_scores.
+	// interaction_not_top, bad_confidence, decision_not_scored, decision_not_top,
+	// bad_scores.
 	Reason string `json:"reason,omitempty"`
 }
 
@@ -278,6 +279,10 @@ const (
 	// ReasonInteractionNotTop: a calibrated side-effectful interaction whose own
 	// InteractionScores contradict it (OutcomeInvalid under a policy).
 	ReasonInteractionNotTop = "interaction_not_top"
+	// ReasonBadConfidence: a non-finite or out-of-range confidence or interaction
+	// probability on a decision (OutcomeInvalid); JudgeDecision does not trust a
+	// number Validate would have refused.
+	ReasonBadConfidence = "bad_confidence"
 	// ReasonDecisionNotScored: a calibrated decision whose own module/intent is not
 	// among its Scores (OutcomeInvalid).
 	ReasonDecisionNotScored = "decision_not_scored"
@@ -412,6 +417,9 @@ func answerOf(d Decision) Answer {
 
 // EvaluateDecision applies the policy to a Decision.
 //
+//   - A decision with a non-finite or out-of-range confidence or interaction
+//     probability is OutcomeInvalid (bad_confidence): JudgeDecision cannot take a
+//     taxonomy, but it never trusts a number Validate would refuse.
 //   - A deterministic decision (Deterministic) is OutcomeDeterministic, whatever
 //     the policy's numbers: exact logic has nothing to threshold.
 //   - A calibrated decision with Scores is judged like a Choice (the policy's
@@ -423,8 +431,9 @@ func answerOf(d Decision) Answer {
 //   - A side-effectful interaction (SideEffectful) on a calibrated decision is
 //     further gated, because the calibrated flag of a remote engine is only a
 //     claim: InteractionScores must back it (the interaction is their top option,
-//     clear of the runner-up) AND InteractionConfidence must be above 0 and reach
-//     the larger of the policy's MinConfidence and DurableMinConfidence. A
+//     clear of the runner-up), the interaction's OWN probability must reach the
+//     bar, AND InteractionConfidence must be above 0 and reach the larger of the
+//     policy's MinConfidence and DurableMinConfidence. A
 //     decision whose InteractionScores contradict its Interaction is OutcomeInvalid
 //     (interaction_not_top); one that falls short of the bar is OutcomeUncertain
 //     (interaction_low_confidence, interaction_narrow_gap). A calibrated claim with
@@ -442,6 +451,9 @@ func answerOf(d Decision) Answer {
 func (p SelectionPolicy) EvaluateDecision(d Decision) Selection {
 	if p.Validate() != nil {
 		return Selection{Outcome: OutcomeUncertain, Reason: ReasonInvalidPolicy}
+	}
+	if !d.confidencesValid() {
+		return Selection{Outcome: OutcomeInvalid, Reason: ReasonBadConfidence}
 	}
 	if d.deterministic {
 		return Selection{Outcome: OutcomeDeterministic, Reason: ReasonDeterministic, Picks: []string{decisionKey(d)}}
@@ -523,13 +535,17 @@ func (d Decision) interactionBacking() interactionBacking {
 // interactionRefusal is why a side-effectful decision's interaction is not
 // accepted at the policy's bar ("" when it is): InteractionConfidence above 0 and
 // at least the larger of MinConfidence and DurableMinConfidence; contradicting
-// InteractionScores; and, when InteractionScores back the claim, an interaction
-// that leads its runner-up by less than the larger of MinGap and DurableMinGap. A
-// policy-less Chain calls it with the durable policy raised to its floor. The
-// caller has already decided the interaction is side-effectful and the decision
-// is not deterministic.
+// InteractionScores; and, when InteractionScores back the claim, the interaction's
+// OWN probability at that same bar (a lone {"undo": 0.01} backs nothing) and a lead
+// over its runner-up of at least the larger of MinGap and DurableMinGap. Both
+// numbers being at least the bar (0.90 or more) already bounds how far the stated
+// confidence can sit from the interaction's probability (at most 1 minus the bar),
+// so no separate tolerance is applied. A policy-less Chain calls it with the
+// durable policy raised to its floor. The caller has already decided the
+// interaction is side-effectful and the decision is not deterministic.
 func (p SelectionPolicy) interactionRefusal(d Decision) string {
-	if bar := max(p.MinConfidence, DurableMinConfidence); d.InteractionConfidence <= 0 || d.InteractionConfidence < bar {
+	bar := max(p.MinConfidence, DurableMinConfidence)
+	if d.InteractionConfidence <= 0 || d.InteractionConfidence < bar {
 		return ReasonInteractionLowConfidence
 	}
 	switch d.interactionBacking() {
@@ -537,6 +553,9 @@ func (p SelectionPolicy) interactionRefusal(d Decision) string {
 		return ReasonInteractionNotTop
 	case backingScores:
 		gap, own := max(p.MinGap, DurableMinGap), d.InteractionScores[string(d.Interaction)]
+		if own < bar {
+			return ReasonInteractionLowConfidence
+		}
 		for id, pr := range d.InteractionScores {
 			if id != string(d.Interaction) && own-pr < gap {
 				return ReasonInteractionNarrowGap

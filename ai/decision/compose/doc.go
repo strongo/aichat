@@ -62,10 +62,13 @@
 //     answer (WithFallbackOn(OnQuota) opts out of the quota case only). A Hedged
 //     backup's own refusal is just a failed backup.
 //   - A spent budget (decision.ErrBudget, outcome "budget"; see Budget) is a
-//     quota-class refusal: it is not the engine's fault (a Breaker ignores it), and
-//     Fallback, Hedged and Race treat it exactly like an exhausted allowance (no
-//     backup unless WithFallbackOn(OnQuota); it ends a concurrent call). An
-//     abstention elsewhere in a call never swallows such a refusal.
+//     quota-class refusal that OnQuota does NOT govern: it is not the engine's fault
+//     (a Breaker ignores it), no Fallback, Hedged or Race ever starts another engine
+//     in its place, and it ends a concurrent call. Like every refusal an engine does
+//     not absorb (an exhausted allowance, a misconfigured endpoint), it wins over an
+//     abstention or an uncertain answer from another leg: the call fails with the
+//     error, so a Chain stops instead of treating it as "nobody decided". (A Hedged
+//     backup's budget refusal still lets its primary answer.)
 //   - With WithPolicy, every decision an engine returns carries the policy's
 //     stamped verdict (decision.Decision.Outcome, and the judged state Actionable
 //     reads), and only an actionable one counts as decided: an answer the policy

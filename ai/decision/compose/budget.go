@@ -49,17 +49,25 @@ type BudgetStats struct {
 //
 // Once the cap is used up the engine is not called: the call fails with an error
 // matching decision.ErrBudget (outcome "budget"). That is a quota-class refusal,
-// loud on purpose: a Breaker ignores it (it is not the engine's fault), a
-// Fallback or Hedged does not start its backup for it unless OnQuota says so, and
+// loud on purpose: a Breaker ignores it (it is not the engine's fault), no
+// Fallback, Hedged or Race ever starts another engine in its place (OnQuota is about
+// an exhausted allowance, not about this cap), and
 // a decision.Chain stops at it by default (Chain.StopOnQuota, Trace.StoppedBy ==
 // "budget") instead of handing the turn to the next, possibly paid, provider. A
 // product that sees a stopped chain MUST NOT then call its paid main LLM as if
 // nobody had decided.
 //
-// A call is counted when it is admitted, whatever it then does (answers, fails or
-// abstains), because the engine is billed for it either way; one the engine does
-// not support (a Budget around an engine that cannot score) is not counted.
-// State is per instance and in memory: a cap per process, not per fleet.
+// What the cap counts, so nothing is over-read: ADMISSIONS, not billed requests. A
+// call is counted when it is admitted, whatever it then does (answers, fails,
+// abstains or is cancelled), so a backup that a Hedged engine started and that then
+// lost to its primary still consumed one; one the engine does not support (a Budget
+// around an engine that cannot score) is not counted. The window is fixed, not
+// sliding: a burst at the end of one window and another at the start of the next
+// can admit up to twice MaxCalls within any Per. A spent Budget in a Race ends the
+// call with ErrBudget; on a Hedged backup the primary may still answer, but if it
+// does not (it abstains, answers uncertain or fails) the call fails with ErrBudget.
+// Like every refusal it wins over an abstention or an uncertain answer from
+// another leg. State is per instance and in // memory: a cap per process, not per fleet.
 type Budget struct {
 	inner decision.Provider
 	opts  BudgetOptions
@@ -72,9 +80,10 @@ type Budget struct {
 }
 
 var (
-	_ decision.Provider       = (*Budget)(nil)
-	_ decision.TracedProvider = (*Budget)(nil)
-	_ decision.ScoredProvider = (*Budget)(nil)
+	_ decision.Provider              = (*Budget)(nil)
+	_ decision.TracedProvider        = (*Budget)(nil)
+	_ decision.ScoredProvider        = (*Budget)(nil)
+	_ decision.DeterministicProvider = (*Budget)(nil)
 )
 
 // NewBudget wraps p with the cap opts. A nil p gives a Budget whose calls fail
@@ -90,6 +99,10 @@ func NewBudget(p decision.Provider, opts BudgetOptions) *Budget {
 
 // Name is the wrapped engine's name: the Budget is transparent in traces.
 func (b *Budget) Name() string { return providerName(b.inner) }
+
+// IsDeterministic forwards decision.DeterministicProvider: a budget around rules is
+// still deterministic.
+func (b *Budget) IsDeterministic() bool { return allDeterministic(b.inner) }
 
 // DecisionTimeout passes through the wrapped engine's timeout, if it has one.
 func (b *Budget) DecisionTimeout() time.Duration {

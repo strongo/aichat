@@ -66,7 +66,12 @@
 // the deterministic class live in unexported fields no data can set, so a rule
 // decision replayed from storage reads self_reported. A product that replays must
 // re-judge it through a chain or policy (Chain.Rejudge, SelectionPolicy.JudgeDecision),
-// which treats it as the ordinary decision it now is, or re-run its rules.
+// which treats it as the ordinary decision it now is, or re-run its rules. Rejudge
+// keeps a refusal recorded in Outcome (a policy-less chain knows only its floor), so
+// rejudge with the chain that carries the policy that applied. The verdict is also
+// bound to the decision's module, intent, interaction, confidences and Calibrated:
+// editing any of them after judging makes the decision not actionable until it is
+// judged again, and decoding JSON into a judged value discards its verdict.
 //
 // # Stopped chains
 //
@@ -185,12 +190,54 @@ type Decision struct {
 	// nothing else. Unexported for the same reason as deterministic: no JSON and no
 	// provider can set it, so no decision becomes actionable by claiming an Outcome.
 	verdict Outcome
+	// sealed is the content the verdict was stamped on (see sealOf): Actionable is
+	// true only while the decision still reads the same, so a judged decision that is
+	// then edited (a different interaction, a different confidence) is no longer
+	// actionable.
+	sealed seal
 }
 
-// stamped returns d judged as o: the unexported verdict and the exported record.
+// seal is the part of a decision that decides whether to act: what the user asked
+// (module, intent, interaction), how sure the engine was, and which class of
+// evidence stood behind it. Scalars only, so seals compare with ==.
+type seal struct {
+	module, intent         string
+	moduleConf, intentConf float64
+	interaction            Interaction
+	interactionConf        float64
+	calibrated             bool
+	deterministic          bool
+}
+
+func sealOf(d Decision) seal {
+	return seal{
+		module: d.Module.Value, intent: d.Intent.Value, moduleConf: d.Module.Confidence, intentConf: d.Intent.Confidence,
+		interaction: d.Interaction, interactionConf: d.InteractionConfidence,
+		calibrated: d.Calibrated, deterministic: d.deterministic,
+	}
+}
+
+// stamped returns d judged as o: the unexported verdict, bound to d's content, and
+// the exported record.
 func (d Decision) stamped(o Outcome) Decision {
-	d.verdict, d.Outcome = o, o
+	d.verdict, d.Outcome, d.sealed = o, o, sealOf(d)
 	return d
+}
+
+// UnmarshalJSON decodes d like encoding/json does and then discards the judged
+// state: whatever verdict d held before (decoding INTO a judged value) is cleared,
+// and so is the deterministic class, because the decoded content is new and nothing
+// judged it. The wire form is unchanged; Outcome is read as the informational
+// record it is.
+func (d *Decision) UnmarshalJSON(b []byte) error {
+	type plain Decision // no methods: avoids recursing into this one
+	p := plain(*d)
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*d = Decision(p)
+	d.verdict, d.sealed, d.deterministic = "", seal{}, false
+	return nil
 }
 
 // Actionable reports whether a caller may act on d. The rule is one and
@@ -203,8 +250,15 @@ func (d Decision) stamped(o Outcome) Decision {
 // remote decision has lost its verdict and its provenance class; re-judge it with
 // Chain.Rejudge). Chain (with or without a Policy) and every engine built with a
 // policy stamp the verdict.
+//
+// The verdict is bound to the fields that decide whether to act: module, intent,
+// their confidences, Interaction, InteractionConfidence, Calibrated and the
+// deterministic class. Editing any of them after judging makes the decision not
+// actionable until it is judged again. Other fields (Scores, InteractionScores,
+// Slots, Reference, RequiredScopes, RequiredData, Presentation) are not bound: a
+// product that edits a judged decision's evidence or arguments must re-judge it.
 func (d Decision) Actionable() bool {
-	return d.verdict.Actionable()
+	return d.verdict.Actionable() && d.sealed == sealOf(d)
 }
 
 // ModuleSpec declares a product module and its intents.
@@ -315,15 +369,8 @@ func Validate(d Decision, t Taxonomy) error {
 	} else if !knownInteractions[d.Interaction] {
 		errs = append(errs, fmt.Errorf("unknown interaction %q", d.Interaction))
 	}
-	confidences := []float64{d.Module.Confidence, d.Intent.Confidence, d.InteractionConfidence}
-	for _, p := range d.InteractionScores {
-		confidences = append(confidences, p)
-	}
-	for _, c := range confidences {
-		if math.IsNaN(c) || c < 0 || c > 1 {
-			errs = append(errs, errors.New("confidence out of range"))
-			break
-		}
+	if !d.confidencesValid() {
+		errs = append(errs, errors.New("confidence out of range"))
 	}
 	moduleOptional := d.Module.Value == "" && moduleOptionalInteractions[d.Interaction]
 	if !moduleOptional {
@@ -360,6 +407,21 @@ func Validate(d Decision, t Taxonomy) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// confidencesValid reports whether every confidence and interaction probability of
+// d is a number in [0,1]. (Scores are checked by the policy that reads them.)
+func (d Decision) confidencesValid() bool {
+	ok := func(c float64) bool { return !math.IsNaN(c) && c >= 0 && c <= 1 }
+	if !ok(d.Module.Confidence) || !ok(d.Intent.Confidence) || !ok(d.InteractionConfidence) {
+		return false
+	}
+	for _, p := range d.InteractionScores {
+		if !ok(p) {
+			return false
+		}
+	}
+	return true
 }
 
 // Attempt records one provider's outcome for diagnostics.
@@ -759,14 +821,31 @@ func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decis
 // received: a decision read back from JSON (a database row, a cloud response)
 // is NOT actionable and has lost its provenance class (deterministic included),
 // because the verdict and the class live in unexported fields no data can set.
-// Rejudge discards whatever Outcome the decision carries and judges it afresh, and
-// can never make it deterministic: a product that must replay a rule decision as
-// deterministic re-runs its rules (ai/decision/rules) instead. The taxonomy
-// validates it, as Request.Taxonomy does for a provider's answer. A decision that
-// is not actionable is returned stamped with its own outcome (OutcomeInvalid for
-// one that fails validation) and ok=false, whatever Chain.KeepNonSelected says.
+//
+// Rejudge can only know what the decision and THIS chain say. It can never make a
+// decision deterministic (a product that must replay a rule decision as
+// deterministic re-runs its rules, ai/decision/rules), and a policy-less chain
+// knows only its floor: a decision that a stricter policy refused in the live chain
+// (an engine built with compose.WithPolicy(DurablePolicy) inside a policy-less
+// chain with KeepNonSelected) would pass that floor. So the safer rule applies: a
+// refusal recorded in Outcome (uncertain, none, unscored, invalid) is kept, never
+// upgraded: Rejudge returns the decision with that outcome, not actionable. To
+// re-judge a stored refusal under another policy, clear its Outcome first. Rejudge
+// with the chain that carries the policy that should apply (its Policy, not the
+// floor) whenever the decision was judged under one. The taxonomy validates the
+// decision, as Request.Taxonomy does for a provider's answer.
+//
+// A decision that is not actionable is returned with the outcome its judge gave it
+// (OutcomeInvalid for one that fails validation or the policy's range checks, the
+// policy's own refusal under a Policy, the stored refusal) and ok=false; one the
+// policy-less floor or the side-effect gate refused has an empty Outcome, because
+// no policy outcome describes it.
 func (c Chain) Rejudge(d Decision, taxonomy Taxonomy) (Decision, bool) {
 	d.deterministic = false // a decision is deterministic only in the process that matched the rule
+	if stored := d.Outcome; stored != "" && !stored.Actionable() {
+		d.verdict, d.sealed = "", seal{}
+		return d.stamped(stored), false
+	}
 	d, _ = c.judge(d, Attempt{}, Request{Taxonomy: taxonomy}, c.minConfidence())
 	return d, d.Actionable()
 }

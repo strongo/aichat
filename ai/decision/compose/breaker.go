@@ -156,9 +156,10 @@ type Breaker struct {
 }
 
 var (
-	_ decision.Provider       = (*Breaker)(nil)
-	_ decision.TracedProvider = (*Breaker)(nil)
-	_ decision.ScoredProvider = (*Breaker)(nil)
+	_ decision.Provider              = (*Breaker)(nil)
+	_ decision.TracedProvider        = (*Breaker)(nil)
+	_ decision.ScoredProvider        = (*Breaker)(nil)
+	_ decision.DeterministicProvider = (*Breaker)(nil)
 )
 
 // BreakerStats is a breaker's running tally.
@@ -192,6 +193,10 @@ func NewBreaker(p decision.Provider, opts ...BreakerOption) *Breaker {
 
 // Name is the wrapped engine's name: the breaker is transparent in traces.
 func (b *Breaker) Name() string { return providerName(b.inner) }
+
+// IsDeterministic forwards decision.DeterministicProvider: a breaker around rules is
+// still deterministic.
+func (b *Breaker) IsDeterministic() bool { return allDeterministic(b.inner) }
 
 // DecisionTimeout passes through the wrapped engine's timeout, if it has one.
 func (b *Breaker) DecisionTimeout() time.Duration {

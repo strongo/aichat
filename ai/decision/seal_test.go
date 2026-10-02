@@ -151,7 +151,7 @@ func TestSideEffectfulCalibratedClaimNeedsItsInteractionScores(t *testing.T) {
 		{"unbacked: a self-report, and narrowing has no side-effect opt-in", moduleDecision(decision.InteractionConfirmation, 0.95, nil), decision.OutcomeUnscored, decision.ReasonSideEffectUncalibrated},
 		{"contradicted", moduleDecision(decision.InteractionConfirmation, 0.95, map[string]float64{"confirmation": 0.2, "command": 0.8}), decision.OutcomeInvalid, decision.ReasonInteractionNotTop},
 		{"missing from its scores", moduleDecision(decision.InteractionConfirmation, 0.95, map[string]float64{"command": 0.9}), decision.OutcomeInvalid, decision.ReasonInteractionNotTop},
-		{"narrow gap", moduleDecision(decision.InteractionConfirmation, 0.95, map[string]float64{"confirmation": 0.55, "command": 0.45}), decision.OutcomeUncertain, decision.ReasonInteractionNarrowGap},
+		{"narrow gap", moduleDecision(decision.InteractionConfirmation, 0.95, map[string]float64{"confirmation": 0.95, "command": 0.9}), decision.OutcomeUncertain, decision.ReasonInteractionNarrowGap},
 		{"low confidence", moduleDecision(decision.InteractionConfirmation, 0.6, backed), decision.OutcomeUncertain, decision.ReasonInteractionLowConfidence},
 		{"zero confidence", moduleDecision(decision.InteractionConfirmation, 0, backed), decision.OutcomeUncertain, decision.ReasonInteractionLowConfidence},
 		{"not side-effectful: no interaction evidence needed", moduleDecision(decision.InteractionCommand, 0, nil), decision.OutcomeSelected, ""},
@@ -173,7 +173,7 @@ func TestSideEffectfulCalibratedClaimNeedsItsInteractionScores(t *testing.T) {
 		"backed":         {moduleDecision(decision.InteractionConfirmation, 0.95, backed), true},
 		"unbacked":       {moduleDecision(decision.InteractionConfirmation, 0.95, nil), true}, // a self-report at the durable bar
 		"contradicted":   {moduleDecision(decision.InteractionConfirmation, 0.95, map[string]float64{"confirmation": 0.2, "command": 0.8}), false},
-		"narrow gap":     {moduleDecision(decision.InteractionConfirmation, 0.95, map[string]float64{"confirmation": 0.55, "command": 0.45}), false},
+		"narrow gap":     {moduleDecision(decision.InteractionConfirmation, 0.95, map[string]float64{"confirmation": 0.95, "command": 0.9}), false},
 		"zero":           {moduleDecision(decision.InteractionConfirmation, 0, backed), false},
 		"out of [0,1]":   {moduleDecision(decision.InteractionConfirmation, 0.95, map[string]float64{"confirmation": 1.5}), false},
 		"unbacked low":   {moduleDecision(decision.InteractionConfirmation, 0.8, nil), false},
