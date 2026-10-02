@@ -130,7 +130,13 @@ func TestLive_Decide(t *testing.T) {
 		t.Fatalf("live call failed: %v", err)
 	}
 	t.Logf("ok=%v model=%s latency=%s tokens in=%d out=%d", ok, d.Model, last.Latency.Round(time.Millisecond), last.Usage.InputTokens, last.Usage.OutputTokens)
-	t.Logf("module=%s intent=%s conf=%.2f interaction=%s presentation=%q data=%v scopes=%v", d.Module.Value, d.Intent.Value, d.Intent.Confidence, d.Interaction, d.Presentation, d.RequiredData, d.RequiredScopes)
+	if !ok {
+		// Abstaining is a legitimate answer: "other", or an interaction the policy
+		// did not select (see Client.Decide). Nothing more to read.
+		t.Log("the provider abstained")
+		return
+	}
+	t.Logf("module=%s intent=%s conf=%.2f interaction=%s (confidence %.2f) presentation=%q data=%v scopes=%v", d.Module.Value, d.Intent.Value, d.Intent.Confidence, d.Interaction, d.InteractionConfidence, d.Presentation, d.RequiredData, d.RequiredScopes)
 	pol := decision.NarrowingPolicy()
 	t.Logf("policy outcome: %s", pol.EvaluateDecision(d).Outcome)
 	for id, p := range d.Scores {

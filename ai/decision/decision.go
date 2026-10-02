@@ -475,9 +475,9 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 // not actionable, otherwise. An actionable verdict is "decided"; any other is
 // recorded as "uncertain" and the chain falls through, unless KeepNonSelected
 // makes it "decided" for the caller to read Decision.Outcome. Without a policy
-// the MinConfidence floor is the bar; a provider that returned an explicit
-// uncertain or none verdict of its own (an engine built with a policy) is still
-// honoured, never acted on by omission.
+// the MinConfidence floor is the bar; a provider that returned a non-actionable
+// verdict of its own (an engine built with a policy: uncertain, none or
+// unscored) is still honoured, never acted on by omission.
 func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decision, Attempt) {
 	if verr := Validate(d, req.Taxonomy); verr != nil {
 		a.Outcome, a.Detail = AttemptInvalid, InvalidDetail(verr)
@@ -493,7 +493,7 @@ func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decis
 		}
 		return d, a
 	}
-	if d.Outcome == OutcomeUncertain || d.Outcome == OutcomeNone {
+	if d.Outcome != "" && !d.Outcome.Actionable() {
 		a.Detail = string(d.Outcome)
 		a.Outcome = AttemptUncertain
 		if c.KeepNonSelected {

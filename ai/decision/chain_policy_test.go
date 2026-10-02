@@ -163,7 +163,7 @@ func TestChain_PolicyDoesNotThresholdUncalibratedScores(t *testing.T) {
 // A provider that carries its own uncertain or none verdict (an engine built
 // with a policy) is honoured even by a chain without a policy.
 func TestChain_NoPolicyHonoursAProvidersExplicitNonActionableVerdict(t *testing.T) {
-	for _, o := range []Outcome{OutcomeUncertain, OutcomeNone} {
+	for _, o := range []Outcome{OutcomeUncertain, OutcomeNone, OutcomeUnscored} {
 		d := decided("calendar", "show", 0.95)
 		d.Outcome = o
 		if got, ok, tr := chainOf(nil, constProvider("e", d)).Decide(context.Background(), req()); ok || tr.Attempts[0].Outcome != AttemptUncertain || tr.Attempts[0].Detail != string(o) {

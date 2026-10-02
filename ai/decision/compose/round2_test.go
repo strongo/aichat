@@ -370,3 +370,16 @@ func TestScore_EveryAnsweredAttemptCarriesItsOwnUsage(t *testing.T) {
 		t.Fatalf("rep=%+v err=%v", rep, err)
 	}
 }
+
+// An unscored verdict (an LLM answer under a durable engine) is no more actionable
+// by omission: a chain without a policy does not hand it back as ok=true.
+func TestEngine_UnscoredAnswerIsNotActedOnByAChainWithoutPolicy(t *testing.T) {
+	noLeak(t)
+	e := Single(&fake{name: "llm", decide: func(context.Context, decision.Request) (decision.Decision, bool, error) {
+		return answer("i", 0.95), true, nil
+	}}, WithClock(newFakeClock()), WithPolicy(decision.DurablePolicy()))
+	d, ok, tr := decision.Chain{Providers: []decision.Provider{e}}.Decide(context.Background(), request())
+	if ok || d.Outcome != "" || tr.Attempts[0].Outcome != decision.AttemptUncertain || tr.Attempts[0].Detail != "unscored: not_calibrated" {
+		t.Fatalf("ok=%v d=%+v tr=%+v", ok, d, tr)
+	}
+}
