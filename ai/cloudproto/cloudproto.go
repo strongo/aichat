@@ -8,7 +8,14 @@
 //
 //	POST {base}ai/chat      body: ai.ChatRequest     → text/event-stream of ai.Event
 //	POST {base}ai/decision  body: decision.Request   → application/json DecisionResponse
+//	POST {base}ai/score     body: ScoreRequest       → application/json ScoreResponse
 //	GET  {base}ai/usage     → application/json UsageResponse
+//
+// ai/score is additive within a version: a server that predates it answers 404,
+// 405 or 501 and clients treat that as "scoring not supported" (the engine is
+// skipped, never retried), and a server must not use those three statuses for an
+// application error on that route. Old clients never call it. Unknown JSON
+// fields are ignored on both sides.
 //
 // {base} is the API base URL including its version prefix, e.g.
 // https://api.example.com/v0/. Requests carry the product's normal bearer
@@ -44,6 +51,7 @@ import (
 const (
 	PathChat        = "ai/chat"
 	PathDecision    = "ai/decision"
+	PathScore       = "ai/score"
 	PathUsage       = "ai/usage"
 	PathInteraction = "ai/interactions"
 
@@ -57,6 +65,41 @@ type DecisionResponse struct {
 	Decision decision.Decision `json:"decision,omitzero"`
 	Model    string            `json:"model,omitempty"`
 	Usage    *ai.Usage         `json:"usage,omitempty"`
+}
+
+// ScoreRequest is the body of POST ai/score: a decision.ScoreRequest (product,
+// text, context, questions) with the same correlation fields a decision request
+// carries. The text, context and candidate descriptions reach the server's
+// decision engines verbatim: callers send metadata, never row data.
+type ScoreRequest struct {
+	decision.ScoreRequest
+	InteractionID string            `json:"interactionId,omitempty"`
+	ClientContext *ai.ClientContext `json:"clientContext,omitempty"`
+}
+
+// ScoreResponse is the body of a 2xx response to POST ai/score: one answer per
+// question (answers keyed by question id, scores per candidate), plus how the
+// server produced them.
+type ScoreResponse struct {
+	// Answers has one entry per requested question id. Each decision.Answer carries
+	// its scores (best first or not: the client sorts), its own Confidence when
+	// HasConfidence, and its own Calibrated flag.
+	Answers map[string]decision.Answer `json:"answers"`
+	// Engine is the leaf engine that answered (for example "jev"), Model the
+	// engine's model id, Strategy the server's combinator ("single", "fallback",
+	// "hedged", "race" or empty).
+	Engine   string `json:"engine,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Strategy string `json:"strategy,omitempty"`
+	// Calibrated is true only when the answering engine produced calibrated
+	// probabilities. A client treats an answer as calibrated only when this and the
+	// answer's own flag are both true; false (an LLM emulator behind a fallback)
+	// makes every answer a proposal under a selection policy.
+	Calibrated bool `json:"calibrated"`
+	// Attempts lists each engine tried, in start order, with its outcome (the
+	// decision.Attempt outcomes), so a client's trace shows a fallback.
+	Attempts []decision.Attempt `json:"attempts,omitempty"`
+	Usage    *ai.Usage          `json:"usage,omitempty"`
 }
 
 // UsageResponse is the body of GET ai/usage.

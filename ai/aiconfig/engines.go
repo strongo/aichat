@@ -1,6 +1,7 @@
 package aiconfig
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -20,7 +21,7 @@ func splitList(v string) []string {
 	return out
 }
 
-// policyByName resolves Config.Decision.Policy.
+// policyByName resolves a named policy.
 func policyByName(name string) (*decision.SelectionPolicy, error) {
 	switch name {
 	case "":
@@ -34,6 +35,40 @@ func policyByName(name string) (*decision.SelectionPolicy, error) {
 	default:
 		return nil, fmt.Errorf("aiconfig: unknown decision.policy %q (want narrowing or durable)", name)
 	}
+}
+
+// policyFromConfig resolves Decision.Policy and applies Decision.PolicyValues
+// on top, then validates the result.
+func policyFromConfig(cfg Decision) (*decision.SelectionPolicy, error) {
+	p, err := policyByName(cfg.Policy)
+	if err != nil {
+		return nil, err
+	}
+	v := cfg.PolicyValues
+	if v == nil {
+		return p, nil
+	}
+	if p == nil {
+		return nil, errors.New("aiconfig: decision.policyValues needs decision.policy to name the policy to override")
+	}
+	set := func(dst *float64, src *float64) {
+		if src != nil {
+			*dst = *src
+		}
+	}
+	set(&p.MinConfidence, v.MinConfidence)
+	set(&p.MinGap, v.MinGap)
+	set(&p.MinProbability, v.MinProbability)
+	set(&p.StrongProbability, v.StrongProbability)
+	set(&p.PotentialProbability, v.PotentialProbability)
+	if v.MaxPicks != nil {
+		p.MaxPicks = *v.MaxPicks
+	}
+	p.Name += "+custom"
+	if err := p.Validate(); err != nil {
+		return nil, fmt.Errorf("aiconfig: decision.policyValues: %w", err)
+	}
+	return p, nil
 }
 
 // buildEngine assembles the configured decision engines into one

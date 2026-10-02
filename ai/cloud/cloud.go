@@ -1,6 +1,7 @@
 // Package cloud is the client for the cloudproto protocol (see
 // ai/cloudproto): it implements ai.LLMProvider (chat) and exposes a separate
-// decision.Provider via Decider(), plus a Usage lookup.
+// decision.Provider via Decider() that is also a decision.ScoredProvider (POST
+// ai/score), plus a Usage lookup.
 package cloud
 
 import (
@@ -12,6 +13,7 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -87,12 +89,21 @@ func New(cfg Config) *Client {
 func (c *Client) Name() string { return "cloud" }
 
 // Decider returns c's decision.Provider role (Name "cloud-decision"),
-// backed by POST ai/decision. It also implements the optional
+// backed by POST ai/decision. The value is also a decision.ScoredProvider and a
+// decision.TracedScorer backed by POST ai/score: a hosted decision endpoint can
+// answer scored questions (table narrowing) too. Against a server that has no
+// ai/score route, Score returns an error wrapping decision.ErrUnsupported, so a
+// combinator moves on to its next engine. It also implements the optional
 // `DecisionTimeout() time.Duration` interface decision.Chain honours, so a
 // remote decision call gets more time than Chain's local-call default.
 func (c *Client) Decider() decision.Provider { return decider{c} }
 
 type decider struct{ c *Client }
+
+var (
+	_ decision.ScoredProvider = decider{}
+	_ decision.TracedScorer   = decider{}
+)
 
 func (d decider) Name() string { return "cloud-decision" }
 
@@ -100,6 +111,18 @@ func (d decider) DecisionTimeout() time.Duration { return decisionTimeout }
 
 func (d decider) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
 	return d.c.decide(ctx, req)
+}
+
+// Score implements decision.ScoredProvider by POSTing ai/score.
+func (d decider) Score(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, error) {
+	res, _, err := d.c.score(ctx, req)
+	return res, err
+}
+
+// ScoreTraced implements decision.TracedScorer: the report carries the
+// strategy, answering engine and per-engine attempts the server reported.
+func (d decider) ScoreTraced(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, decision.Report, error) {
+	return d.c.score(ctx, req)
 }
 
 // Stream implements ai.LLMProvider by POSTing ai/chat and parsing the SSE
@@ -216,9 +239,30 @@ func (c *Client) decide(ctx context.Context, req decision.Request) (decision.Dec
 		return decision.Decision{}, false, err
 	}
 
+	resp, err := c.postJSON(ctx, cloudproto.PathDecision, payload)
+	if err != nil {
+		return decision.Decision{}, false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var dr cloudproto.DecisionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
+		return decision.Decision{}, false, fmt.Errorf("cloud: decode decision response: %w", err)
+	}
+	if !dr.Decided {
+		return decision.Decision{}, false, nil
+	}
+	return dr.Decision, true, nil
+}
+
+// postJSON POSTs payload to path and returns the 2xx response, retrying 429 and
+// 5xx before the first byte like every other call. A status in unsupported means
+// the server has no such route: the error wraps decision.ErrUnsupported and is
+// not retried.
+func (c *Client) postJSON(ctx context.Context, path string, payload []byte, unsupported ...int) (*http.Response, error) {
 	var resp *http.Response
 	doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
-		httpReq, e := c.newRequest(ctx, cloudproto.PathDecision, payload)
+		httpReq, e := c.newRequest(ctx, path, payload)
 		if e != nil {
 			return e
 		}
@@ -236,21 +280,75 @@ func (c *Client) decide(ctx context.Context, req decision.Request) (decision.Dec
 			return nil
 		}
 		defer func() { _ = r.Body.Close() }()
+		if slices.Contains(unsupported, r.StatusCode) {
+			return fmt.Errorf("cloud: %s: HTTP %d: %w", path, r.StatusCode, decision.ErrUnsupported)
+		}
 		return decodeHTTPError(r)
 	})
+	if errors.Is(doErr, decision.ErrUnsupported) {
+		return nil, doErr
+	}
 	if doErr != nil {
-		return decision.Decision{}, false, toAIError(ctx, doErr)
+		return nil, toAIError(ctx, doErr)
+	}
+	return resp, nil
+}
+
+// maxScoreResponseBytes bounds how much of an ai/score response is read.
+const maxScoreResponseBytes = 4 << 20
+
+// score implements POST ai/score. A request that fails decision.ValidateScoreRequest
+// is refused locally (decision.ErrInvalidRequest, no call). HTTP 404, 405 and 501
+// mean the server predates the route and become decision.ErrUnsupported. The
+// answers are validated against the request (decision.ValidateScoreResult) and
+// an answer is Calibrated only when both the answer and the response say so.
+func (c *Client) score(ctx context.Context, req decision.ScoreRequest) (decision.ScoreResult, decision.Report, error) {
+	if err := decision.ValidateScoreRequest(req); err != nil {
+		// Not %w of err: its text quotes the caller's ids.
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("cloud: %w: the score request failed validation", decision.ErrInvalidRequest)
+	}
+	if req.Product == "" {
+		req.Product = c.cfg.Product
+	}
+	interactionID, _ := ctx.Value(interactionIDKey{}).(string)
+	payload, err := json.Marshal(cloudproto.ScoreRequest{ScoreRequest: req, InteractionID: interactionID, ClientContext: c.cfg.ClientContext})
+	if err != nil {
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("cloud: %w: the score request cannot be encoded", decision.ErrInvalidRequest)
+	}
+	resp, err := c.postJSON(ctx, cloudproto.PathScore, payload, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented)
+	if err != nil {
+		return decision.ScoreResult{}, decision.Report{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	var dr cloudproto.DecisionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
-		return decision.Decision{}, false, fmt.Errorf("cloud: decode decision response: %w", err)
+	var sr cloudproto.ScoreResponse
+	// The decode error is not wrapped: it can quote a fragment of the body.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxScoreResponseBytes)).Decode(&sr); err != nil {
+		return decision.ScoreResult{}, decision.Report{}, errors.New("cloud: ai/score returned a malformed response")
 	}
-	if !dr.Decided {
-		return decision.Decision{}, false, nil
+	res := decision.ScoreResult{Engine: sr.Engine, Model: sr.Model, Answers: map[string]decision.Answer{}}
+	if res.Engine == "" {
+		res.Engine = "cloud-decision"
 	}
-	return dr.Decision, true, nil
+	if sr.Usage != nil {
+		res.Usage = decision.Usage{InputTokens: int(sr.Usage.InputTokens), OutputTokens: int(sr.Usage.OutputTokens)}
+	}
+	for _, q := range req.Questions {
+		a, ok := sr.Answers[q.ID]
+		if !ok {
+			continue // ValidateScoreResult reports the missing answer
+		}
+		// Sorted, and named by what the client asked, whatever the server sent.
+		sorted := decision.NewAnswer(q.ID, q.Kind, a.Scores)
+		sorted.Confidence, sorted.HasConfidence, sorted.NoneID = a.Confidence, a.HasConfidence, a.NoneID
+		sorted.Calibrated = a.Calibrated && sr.Calibrated
+		res.Answers[q.ID] = sorted
+	}
+	if err := decision.ValidateScoreResult(req, res); err != nil {
+		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("cloud: ai/score returned an invalid result: %s", decision.InvalidDetail(err))
+	}
+	rep := decision.Report{Strategy: sr.Strategy, Engine: res.Engine, Attempts: sr.Attempts, Model: sr.Model}
+	return res, rep, nil
 }
 
 // Usage calls GET ai/usage.

@@ -66,8 +66,26 @@ type Decision struct {
 	FallbackOn []string `yaml:"fallbackOn" json:"fallbackOn"`
 	// Policy names the selection policy applied to calibrated scored answers:
 	// "narrowing" or "durable" (see decision.NarrowingPolicy, DurablePolicy).
-	// Empty: no policy; the chain keeps its MinConfidence behaviour.
+	// Empty: no policy; the chain keeps its MinConfidence behaviour. The named
+	// values are PROVISIONAL defaults from a single sample: re-measure them for
+	// your corpus and the exact model id, and set the result in PolicyValues.
 	Policy string `yaml:"policy" json:"policy"`
+	// PolicyValues overrides individual numbers of the named policy (custom
+	// values; any left unset keep the named policy's). The result is validated
+	// (decision.SelectionPolicy.Validate): an invalid combination is a Build
+	// error. It needs Policy to name the base.
+	PolicyValues *PolicyValues `yaml:"policyValues" json:"policyValues"`
+}
+
+// PolicyValues are optional numeric overrides of a named selection policy; see
+// decision.SelectionPolicy for what each one means.
+type PolicyValues struct {
+	MinConfidence        *float64 `yaml:"minConfidence" json:"minConfidence"`
+	MinGap               *float64 `yaml:"minGap" json:"minGap"`
+	MinProbability       *float64 `yaml:"minProbability" json:"minProbability"`
+	StrongProbability    *float64 `yaml:"strongProbability" json:"strongProbability"`
+	PotentialProbability *float64 `yaml:"potentialProbability" json:"potentialProbability"`
+	MaxPicks             *int     `yaml:"maxPicks" json:"maxPicks"`
 }
 
 // BYOK configures a direct, product-owned connection to an LLM provider.
@@ -367,7 +385,7 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 
 	out.Decision = append(out.Decision, deps.ExtraDecision...)
 
-	if out.Policy, err = policyByName(cfg.Decision.Policy); err != nil {
+	if out.Policy, err = policyFromConfig(cfg.Decision); err != nil {
 		return Providers{}, err
 	}
 	if cfg.Decision.Provider != "disabled" {

@@ -322,3 +322,65 @@ func TestSplitList(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 }
+
+func f(v float64) *float64 { return &v }
+
+func TestBuild_PolicyValuesOverrideTheNamedPolicyAndAreValidated(t *testing.T) {
+	maxPicks := 3
+	p, err := buildDecision(t, func(c *Config) {
+		c.Decision.Policy = "narrowing"
+		c.Decision.PolicyValues = &PolicyValues{
+			MinConfidence: f(0.6), MinGap: f(0.1), MinProbability: f(0.7), StrongProbability: f(0.9), PotentialProbability: f(0.4), MaxPicks: &maxPicks,
+		}
+	}, Deps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := decision.SelectionPolicy{Name: "narrowing+custom", MinConfidence: 0.6, MinGap: 0.1, MinProbability: 0.7, StrongProbability: 0.9, PotentialProbability: 0.4, MaxPicks: 3}
+	if p.Policy == nil || *p.Policy != want {
+		t.Fatalf("policy = %+v", p.Policy)
+	}
+
+	// Values left unset keep the named policy's.
+	p, err = buildDecision(t, func(c *Config) {
+		c.Decision.Policy, c.Decision.PolicyValues = "durable", &PolicyValues{MinProbability: f(0.92)}
+	}, Deps{})
+	base := decision.DurablePolicy()
+	base.Name, base.MinProbability = "durable+custom", 0.92
+	if err != nil || *p.Policy != base {
+		t.Fatalf("partial override: %+v %v", p.Policy, err)
+	}
+
+	for name, mutate := range map[string]func(*Config){
+		"overrides without a policy": func(c *Config) { c.Decision.PolicyValues = &PolicyValues{MinGap: f(0.1)} },
+		"out of range": func(c *Config) {
+			c.Decision.Policy, c.Decision.PolicyValues = "narrowing", &PolicyValues{MinGap: f(1.5)}
+		},
+		"zero threshold": func(c *Config) {
+			c.Decision.Policy, c.Decision.PolicyValues = "narrowing", &PolicyValues{MinProbability: f(0), PotentialProbability: f(0)}
+		},
+		"unordered": func(c *Config) {
+			c.Decision.Policy, c.Decision.PolicyValues = "narrowing", &PolicyValues{StrongProbability: f(0.5)}
+		},
+	} {
+		if _, err := buildDecision(t, mutate, Deps{}); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestLoad_ParsesPolicyValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ai.yaml")
+	yaml := "decision:\n  policy: narrowing\n  policyValues:\n    minProbability: 0.7\n    maxPicks: 4\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := cfg.Decision.PolicyValues
+	if v == nil || v.MinProbability == nil || *v.MinProbability != 0.7 || v.MaxPicks == nil || *v.MaxPicks != 4 || v.MinGap != nil {
+		t.Fatalf("values = %+v", v)
+	}
+}

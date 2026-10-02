@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/strongo/aichat/ai"
+	"github.com/strongo/aichat/ai/decision"
 )
 
 func TestWriteReadEvents_RoundTrip(t *testing.T) {
@@ -398,5 +400,72 @@ func TestErrorResponse_JSON(t *testing.T) {
 	}
 	if back.Error.Code != ai.ErrCodeAuth || back.Error.Message != "bad key" {
 		t.Errorf("back = %+v", back)
+	}
+}
+
+// The ai/score wire shapes are a contract for server implementers: pin the JSON
+// field names.
+func TestScoreWireShapes(t *testing.T) {
+	req := ScoreRequest{
+		ScoreRequest: decision.ScoreRequest{
+			Product: "p", Text: "which?", Context: map[string]any{"k": "v"},
+			Questions: []decision.Question{{ID: "q", Kind: decision.KindChoice, Instructions: "i", NoneID: "none",
+				Candidates: []decision.Candidate{{ID: "a", Description: "d"}, {ID: "none"}}}},
+		},
+		InteractionID: "turn-1",
+		ClientContext: &ai.ClientContext{},
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"product", "text", "context", "questions", "interactionId", "clientContext"} {
+		if _, ok := m[key]; !ok {
+			t.Errorf("request is missing top-level %q: %s", key, b)
+		}
+	}
+	q := m["questions"].([]any)[0].(map[string]any)
+	for _, key := range []string{"id", "kind", "instructions", "noneId", "candidates"} {
+		if _, ok := q[key]; !ok {
+			t.Errorf("question is missing %q: %s", key, b)
+		}
+	}
+	var back ScoreRequest
+	if err := json.Unmarshal(b, &back); err != nil || !reflect.DeepEqual(back, req) {
+		t.Fatalf("round trip: %+v %v", back, err)
+	}
+
+	resp := ScoreResponse{
+		Answers: map[string]decision.Answer{"q": {QuestionID: "q", Kind: decision.KindChoice,
+			Scores: []decision.Score{{ID: "a", Probability: 0.9}}, Confidence: 0.8, HasConfidence: true, Calibrated: true, NoneID: "none"}},
+		Engine: "jev", Model: "jev-1.13.0", Strategy: "fallback", Calibrated: true,
+		Attempts: []decision.Attempt{{Provider: "jev", Outcome: "decided", Role: "primary"}},
+		Usage:    &ai.Usage{InputTokens: 1, OutputTokens: 2},
+	}
+	b, err = json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = nil
+	_ = json.Unmarshal(b, &m)
+	for _, key := range []string{"answers", "engine", "model", "strategy", "calibrated", "attempts", "usage"} {
+		if _, ok := m[key]; !ok {
+			t.Errorf("response is missing %q: %s", key, b)
+		}
+	}
+	var backResp ScoreResponse
+	if err := json.Unmarshal(b, &backResp); err != nil || !reflect.DeepEqual(backResp, resp) {
+		t.Fatalf("response round trip: %+v %v", backResp, err)
+	}
+	// A response with fields this version does not know still decodes (additive evolution).
+	if err := json.Unmarshal([]byte(`{"answers":{},"calibrated":false,"future":{"x":1}}`), &backResp); err != nil {
+		t.Fatal(err)
+	}
+	if PathScore != "ai/score" {
+		t.Fatalf("PathScore = %q", PathScore)
 	}
 }
