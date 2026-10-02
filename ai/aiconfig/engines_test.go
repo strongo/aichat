@@ -3,6 +3,7 @@ package aiconfig
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -336,7 +337,7 @@ func TestBuild_PolicyValuesOverrideTheNamedPolicyAndAreValidated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := decision.SelectionPolicy{Name: "narrowing+custom", MinConfidence: 0.6, MinGap: 0.1, MinProbability: 0.7, StrongProbability: 0.9, PotentialProbability: 0.4, MaxPicks: 3}
+	want := decision.SelectionPolicy{Name: "narrowing+custom", MinConfidence: 0.6, MinGap: 0.1, MinProbability: 0.7, StrongProbability: 0.9, PotentialProbability: 0.4, MaxPicks: 3, AcceptUncalibratedAt: decision.NarrowingAcceptUncalibratedAt}
 	if p.Policy == nil || *p.Policy != want {
 		t.Fatalf("policy = %+v", p.Policy)
 	}
@@ -382,5 +383,52 @@ func TestLoad_ParsesPolicyValues(t *testing.T) {
 	v := cfg.Decision.PolicyValues
 	if v == nil || v.MinProbability == nil || *v.MinProbability != 0.7 || v.MaxPicks == nil || *v.MaxPicks != 4 || v.MinGap != nil {
 		t.Fatalf("values = %+v", v)
+	}
+}
+
+// fallbackOn quota is the opt-in to a paid backup taking over an exhausted allowance.
+func TestBuild_FallbackOnQuotaIsAnOptIn(t *testing.T) {
+	jev := &stubEngine{name: "jev", err: fmt.Errorf("allowance: %w", decision.ErrQuota)}
+	llm := &stubEngine{name: "llm-decider", d: engineDecision("j"), ok: true}
+	engines := map[string]decision.Provider{"jev": jev, "llm-decider": llm}
+	build := func(on ...string) decision.Provider {
+		p, err := buildDecision(t, func(c *Config) {
+			c.Decision.Engines, c.Decision.FallbackOn = []string{"jev", "llm-decider"}, on
+		}, Deps{Engines: engines})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p.Decision[0]
+	}
+	if _, ok, _, err := decideVia(t, build()); ok || !errors.Is(err, decision.ErrQuota) || llm.calls != 0 {
+		t.Fatalf("by default the quota error is surfaced and the paid backup untouched: ok=%v err=%v calls=%d", ok, err, llm.calls)
+	}
+	if _, ok, _, err := decideVia(t, build("quota")); !ok || err != nil || llm.calls != 1 {
+		t.Fatalf("fallbackOn quota: ok=%v err=%v calls=%d", ok, err, llm.calls)
+	}
+}
+
+func TestBuild_PolicyValuesCanSetTheUncalibratedBar(t *testing.T) {
+	p, err := buildDecision(t, func(c *Config) {
+		c.Decision.Policy, c.Decision.PolicyValues = "durable", &PolicyValues{AcceptUncalibratedAt: f(0.85)}
+	}, Deps{})
+	if err != nil || p.Policy.AcceptUncalibratedAt != 0.85 || p.Policy.Name != "durable+custom" {
+		t.Fatalf("policy=%+v err=%v", p.Policy, err)
+	}
+	if _, err := buildDecision(t, func(c *Config) {
+		c.Decision.Policy, c.Decision.PolicyValues = "durable", &PolicyValues{AcceptUncalibratedAt: f(1.5)}
+	}, Deps{}); err == nil || !strings.Contains(err.Error(), "acceptUncalibratedAt") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLoad_ParsesBreakerSlowThreshold(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ai.yaml")
+	if err := os.WriteFile(path, []byte("decision:\n  breakerSlowThreshold: 4\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil || cfg.Decision.BreakerSlowThreshold != 4 {
+		t.Fatalf("cfg=%+v err=%v", cfg.Decision, err)
 	}
 }

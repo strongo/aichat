@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/strongo/aichat/ai"
 	"github.com/strongo/aichat/ai/decision"
@@ -443,8 +444,9 @@ func TestScoreWireShapes(t *testing.T) {
 		Answers: map[string]decision.Answer{"q": {QuestionID: "q", Kind: decision.KindChoice,
 			Scores: []decision.Score{{ID: "a", Probability: 0.9}}, Confidence: 0.8, HasConfidence: true, Calibrated: true, NoneID: "none"}},
 		Engine: "jev", Model: "jev-1.13.0", Strategy: "fallback", Calibrated: true,
-		Attempts: []decision.Attempt{{Provider: "jev", Outcome: "decided", Role: "primary"}},
+		Attempts: []decision.Attempt{{Provider: "jev", Outcome: "decided", Role: "primary", Latency: 120 * time.Millisecond, Usage: &decision.Usage{InputTokens: 3, OutputTokens: 4}}},
 		Usage:    &ai.Usage{InputTokens: 1, OutputTokens: 2},
+		Protocol: ProtocolVersion,
 	}
 	b, err = json.Marshal(resp)
 	if err != nil {
@@ -452,10 +454,15 @@ func TestScoreWireShapes(t *testing.T) {
 	}
 	m = nil
 	_ = json.Unmarshal(b, &m)
-	for _, key := range []string{"answers", "engine", "model", "strategy", "calibrated", "attempts", "usage"} {
+	for _, key := range []string{"answers", "engine", "model", "strategy", "calibrated", "attempts", "usage", "protocol"} {
 		if _, ok := m[key]; !ok {
 			t.Errorf("response is missing %q: %s", key, b)
 		}
+	}
+	// The attempt's wire form: integer milliseconds and its own usage.
+	at := m["attempts"].([]any)[0].(map[string]any)
+	if at["latencyMs"] != float64(120) || at["usage"] == nil {
+		t.Errorf("attempt = %v", at)
 	}
 	var backResp ScoreResponse
 	if err := json.Unmarshal(b, &backResp); err != nil || !reflect.DeepEqual(backResp, resp) {

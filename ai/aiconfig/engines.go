@@ -61,6 +61,7 @@ func policyFromConfig(cfg Decision) (*decision.SelectionPolicy, error) {
 	set(&p.MinProbability, v.MinProbability)
 	set(&p.StrongProbability, v.StrongProbability)
 	set(&p.PotentialProbability, v.PotentialProbability)
+	set(&p.AcceptUncalibratedAt, v.AcceptUncalibratedAt)
 	if v.MaxPicks != nil {
 		p.MaxPicks = *v.MaxPicks
 	}
@@ -85,7 +86,7 @@ func buildEngine(cfg Decision, deps Deps, policy *decision.SelectionPolicy) (dec
 			return nil, fmt.Errorf("aiconfig: decision.engines names %q but Deps.Engines has no such engine", name)
 		}
 		if breaker {
-			bopts := []compose.BreakerOption{compose.WithBreakerOnChange(deps.OnBreakerChange)}
+			bopts := []compose.BreakerOption{compose.WithBreakerOnChange(deps.OnBreakerChange), compose.WithBreakerSlowThreshold(cfg.BreakerSlowThreshold)}
 			if deps.Clock != nil {
 				bopts = append(bopts, compose.WithBreakerClock(deps.Clock))
 			}
@@ -162,8 +163,10 @@ func fallbackTriggers(names []string) (compose.Trigger, error) {
 			t |= compose.OnAbstain
 		case "uncertain":
 			t |= compose.OnUncertain
+		case "quota":
+			t |= compose.OnQuota
 		default:
-			return 0, fmt.Errorf("aiconfig: unknown decision.fallbackOn %q (want abstain or uncertain)", n)
+			return 0, fmt.Errorf("aiconfig: unknown decision.fallbackOn %q (want abstain, uncertain or quota)", n)
 		}
 	}
 	return t, nil

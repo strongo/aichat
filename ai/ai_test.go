@@ -5,6 +5,7 @@ import (
 	"errors"
 	"iter"
 	"testing"
+	"time"
 )
 
 func seq(events ...struct {
@@ -254,5 +255,15 @@ func TestUsage_BillableTokensZeroCacheFieldsMatchAcrossProviders(t *testing.T) {
 	anthropic := u.BillableTokens("anthropic")
 	if openai != 42 || responses != 42 || anthropic != 42 {
 		t.Errorf("openai-compatible = %d, openai-responses = %d, anthropic = %d, want all 42 with no cache tokens reported", openai, responses, anthropic)
+	}
+}
+
+func TestAIError_RetryDelay(t *testing.T) {
+	var nilErr *Error
+	if nilErr.RetryDelay() != 0 || (&Error{}).RetryDelay() != 0 || (&Error{RetryAfterMs: -5}).RetryDelay() != 0 {
+		t.Fatal("no delay expected")
+	}
+	if got := (&Error{RetryAfterMs: 1500}).RetryDelay(); got != 1500*time.Millisecond {
+		t.Fatal(got)
 	}
 }

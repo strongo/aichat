@@ -55,14 +55,25 @@ type Decision struct {
 	// engines need "race".
 	Strategy string `yaml:"strategy" json:"strategy"`
 	// HedgeAfter is the latency budget of the "hedged" strategy as a Go duration
-	// such as "600ms" (default compose.DefaultHedgeAfter).
+	// such as "600ms" (default compose.DefaultHedgeAfter). Set it above the
+	// primary's p99: a primary slower than the budget is paid for twice on every
+	// slow call.
 	HedgeAfter string `yaml:"hedgeAfter" json:"hedgeAfter"`
 	// Breaker wraps every engine in a circuit breaker so an engine that is down
 	// is not called on every request. Default true.
 	Breaker *bool `yaml:"breaker" json:"breaker"`
+	// BreakerSlowThreshold, when above 0, makes that many consecutive calls in
+	// which a "hedged" primary was cancelled by its backup open the primary's
+	// breaker (compose.WithBreakerSlowThreshold). Default 0: slowness never opens
+	// a breaker, only failures (including the primary's own timeout) do. Set it
+	// for an engine that can hang without ever failing.
+	BreakerSlowThreshold int `yaml:"breakerSlowThreshold" json:"breakerSlowThreshold"`
 	// FallbackOn lists extra conditions that start the backup beyond failure:
-	// "abstain" and "uncertain". Empty by default: an abstention or an uncertain
-	// answer is an answer, not a failure.
+	// "abstain", "uncertain" and "quota" (the primary refused because the caller's
+	// allowance is exhausted; the backup is usually a paid engine, so this is a
+	// spending decision). Empty by default: an abstention or an uncertain answer
+	// is an answer, not a failure, and an exhausted allowance is surfaced to the
+	// caller. A misconfigured endpoint never starts a backup.
 	FallbackOn []string `yaml:"fallbackOn" json:"fallbackOn"`
 	// Policy names the selection policy applied to calibrated scored answers:
 	// "narrowing" or "durable" (see decision.NarrowingPolicy, DurablePolicy).
@@ -86,6 +97,10 @@ type PolicyValues struct {
 	StrongProbability    *float64 `yaml:"strongProbability" json:"strongProbability"`
 	PotentialProbability *float64 `yaml:"potentialProbability" json:"potentialProbability"`
 	MaxPicks             *int     `yaml:"maxPicks" json:"maxPicks"`
+	// AcceptUncalibratedAt is the explicit opt-in to acting on an uncalibrated
+	// decision (decision.SelectionPolicy.AcceptUncalibratedAt): 0 never, as the
+	// durable policy defaults to; the narrowing policy defaults to 0.70.
+	AcceptUncalibratedAt *float64 `yaml:"acceptUncalibratedAt" json:"acceptUncalibratedAt"`
 }
 
 // BYOK configures a direct, product-owned connection to an LLM provider.

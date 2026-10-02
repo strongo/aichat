@@ -11,11 +11,34 @@
 //	POST {base}ai/score     body: ScoreRequest       → application/json ScoreResponse
 //	GET  {base}ai/usage     → application/json UsageResponse
 //
-// ai/score is additive within a version: a server that predates it answers 404,
-// 405 or 501 and clients treat that as "scoring not supported" (the engine is
-// skipped, never retried), and a server must not use those three statuses for an
-// application error on that route. Old clients never call it. Unknown JSON
-// fields are ignored on both sides.
+// ai/score is additive within a version. A server that predates it answers 501
+// (preferred) or 404/405, and a client then treats scoring as "not supported":
+// the engine is skipped, a circuit breaker is left alone, and the finding is
+// remembered for the client's lifetime (cloud.Client.ResetCapabilities forgets
+// it) so the route is not probed on every call. Only an UNAMBIGUOUS signal counts
+// as "route not implemented": a 501, or a 404/405 whose body is not an
+// ErrorResponse AND where GET ai/usage shows the base URL does speak this
+// protocol. Any other 404/405 is a configuration error (an unknown product, a
+// base URL that does not speak the protocol): it is loud, never absorbed by a
+// backup engine. A server MUST therefore use 501 or 404/405 for nothing but "no
+// such route" on ai/score, and MUST put an ErrorResponse body on every
+// application error, including a 404 for an unknown product. Old clients never
+// call ai/score. Unknown JSON fields are ignored on both sides.
+//
+// Errors on the decision routes (ai/decision, ai/score) map to engine-neutral
+// outcomes: 401/403 or code "auth" is an authentication failure; 400/422 or code
+// "invalid" is a request the engine refused; 429 with code "quota" is an
+// exhausted allowance (not transient, never retried, never failed over to a paid
+// backup unless the caller opted in); any other 429 ("rate_limited") and every
+// 5xx is a transient engine fault. A Retry-After header (seconds or an HTTP date;
+// or ErrorResponse.error.retryAfterMs) on any error is honoured as a minimum wait:
+// the client does not retry such a response itself, and a circuit breaker keeps
+// the engine out of service at least that long (capped at 10 minutes).
+//
+// Every request carries HeaderProtocol (the protocol version this client speaks,
+// ProtocolVersion), in addition to the version prefix of {base}; a server may use
+// it to answer a newer or older client in the version it asked for, and ScoreResponse
+// echoes the version it answered in.
 //
 // {base} is the API base URL including its version prefix, e.g.
 // https://api.example.com/v0/. Requests carry the product's normal bearer
@@ -55,8 +78,16 @@ const (
 	PathUsage       = "ai/usage"
 	PathInteraction = "ai/interactions"
 
-	HeaderProduct  = "X-AI-Product"
+	HeaderProduct = "X-AI-Product"
+	// HeaderProtocol carries the protocol version the client speaks (the value is
+	// ProtocolVersion, as a decimal string).
+	HeaderProtocol = "X-AI-Protocol"
 	ContentTypeSSE = "text/event-stream"
+
+	// ProtocolVersion is this client's protocol version. It names the shape of the
+	// routes above; a change that old clients cannot ignore bumps it (and the
+	// version prefix of {base}).
+	ProtocolVersion = 1
 )
 
 // DecisionResponse is the body of POST ai/decision.
@@ -98,8 +129,16 @@ type ScoreResponse struct {
 	Calibrated bool `json:"calibrated"`
 	// Attempts lists each engine tried, in start order, with its outcome (the
 	// decision.Attempt outcomes), so a client's trace shows a fallback.
+	// Each attempt carries its own usage when its engine reported it (so a hedged
+	// or fallen-back call can be metered per engine), and its latency in the
+	// integer "latencyMs" (milliseconds; see decision.Attempt).
 	Attempts []decision.Attempt `json:"attempts,omitempty"`
-	Usage    *ai.Usage          `json:"usage,omitempty"`
+	// Usage is what the answering engine consumed. Per-attempt usage is on the
+	// attempts.
+	Usage *ai.Usage `json:"usage,omitempty"`
+	// Protocol is the protocol version the server answered in (informational; 0
+	// when the server does not say).
+	Protocol int `json:"protocol,omitempty"`
 }
 
 // UsageResponse is the body of GET ai/usage.

@@ -338,9 +338,24 @@ type Error struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`
 	Retryable bool   `json:"retryable,omitempty"`
+	// RetryAfterMs is how long the server asked callers to wait before trying
+	// again, in whole milliseconds (0 = it asked nothing): the HTTP Retry-After
+	// header, read in both its forms and capped by the client, or the same field
+	// in a JSON error body, whichever is longer. A circuit breaker keeps the
+	// engine out of service at least this long (see RetryDelay).
+	RetryAfterMs int64 `json:"retryAfterMs,omitempty"`
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
+
+// RetryDelay returns RetryAfterMs as a duration (0 for none). It satisfies
+// decision.RetryDelayer, so a circuit breaker's open time honours it.
+func (e *Error) RetryDelay() time.Duration {
+	if e == nil || e.RetryAfterMs <= 0 {
+		return 0
+	}
+	return time.Duration(e.RetryAfterMs) * time.Millisecond
+}
 
 // IsRetryable reports whether the caller may retry the request that produced
 // this error. It lets *Error satisfy ai/internal/retry.Retryable.

@@ -136,26 +136,44 @@ func TestScore_CalibratedNeedsBothTheAnswerAndTheResponse(t *testing.T) {
 	}
 }
 
+// oldServer is a server of this protocol that predates ai/score: ai/usage works,
+// ai/score answers scoreStatus with scoreBody. Calls are counted per path.
+func oldServer(t *testing.T, scoreStatus int, scoreBody string, scoreCalls, usageCalls *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/" + cloudproto.PathUsage:
+			usageCalls.Add(1)
+			_, _ = w.Write([]byte(`{"product":"sneat"}`))
+		case "/v0/" + cloudproto.PathScore:
+			scoreCalls.Add(1)
+			w.WriteHeader(scoreStatus)
+			_, _ = w.Write([]byte(scoreBody))
+		default:
+			t.Errorf("unexpected %s", r.URL.Path)
+		}
+	}))
+}
+
 // New client, old server: no ai/score route. The engine is unsupported (and so
-// skipped by a combinator, neutral for a breaker), never an error to retry.
+// skipped by a combinator, neutral for a breaker), never an error to retry. A 501
+// says so by itself; a 404 or 405 is ambiguous and is settled by one GET
+// ai/usage showing that the base URL does speak the protocol.
 func TestScore_ServerWithoutTheRouteIsUnsupported(t *testing.T) {
-	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented} {
-		var calls atomic.Int32
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			calls.Add(1)
-			w.WriteHeader(status)
-			_, _ = w.Write([]byte("<html>no such route</html>"))
-		}))
+	for status, wantUsage := range map[int]int32{http.StatusNotFound: 1, http.StatusMethodNotAllowed: 1, http.StatusNotImplemented: 0} {
+		var score, usage atomic.Int32
+		srv := oldServer(t, status, "<html>no such route</html>", &score, &usage)
 		_, err := scorer(t, srv.URL).Score(context.Background(), libraryScoreRequest())
 		srv.Close()
-		if !errors.Is(err, decision.ErrUnsupported) || calls.Load() != 1 {
-			t.Fatalf("%d: err=%v calls=%d (an unsupported route must not be retried)", status, err, calls.Load())
+		if !errors.Is(err, decision.ErrUnsupported) || score.Load() != 1 || usage.Load() != wantUsage {
+			t.Fatalf("%d: err=%v score calls=%d usage calls=%d (an unsupported route must not be retried)", status, err, score.Load(), usage.Load())
 		}
 	}
 }
 
 func TestScore_UnsupportedServerFailsOverInACombinatorAndLeavesTheBreakerAlone(t *testing.T) {
-	srv := httptest.NewServer(http.NotFoundHandler())
+	var score, usage atomic.Int32
+	srv := oldServer(t, http.StatusNotFound, "404 page not found", &score, &usage)
 	defer srv.Close()
 	hosted := compose.NewBreaker(New(Config{BaseURL: srv.URL + "/v0/", Product: "sneat", Token: tokenFunc("t")}).Decider(), compose.WithBreakerThreshold(1))
 	backup := stubScorer{name: "local"}
