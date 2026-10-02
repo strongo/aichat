@@ -27,6 +27,9 @@
 //     required, pin a versioned id so thresholds measured against it stay valid,
 //     and the model id the API reports is recorded in every Decision and
 //     ScoreResult.
+//   - Decide never hands a caller a guessed turn kind: the interaction Choice is
+//     run through the selection policy and the provider abstains when it is not
+//     selected (see Client.Decide).
 //   - Requests are checked locally before any call (state size, number of
 //     questions, number of options); a refused request is an error that matches
 //     decision.ErrInvalidRequest, which a circuit breaker does not count against

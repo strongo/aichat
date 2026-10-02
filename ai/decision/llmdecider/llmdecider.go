@@ -10,7 +10,7 @@
 // inference answers every question of a ScoreRequest with a probability per
 // candidate, so a Fallback from a real decision model to this one still answers
 // scored questions such as table narrowing. Its scores are uncalibrated, so a
-// SelectionPolicy turns them into a proposal (decision.Selection.Proposal),
+// SelectionPolicy turns them into a proposal (decision.Selection.Proposals),
 // never a selection.
 //
 // Everything in a Request or ScoreRequest is sent verbatim to the LLM

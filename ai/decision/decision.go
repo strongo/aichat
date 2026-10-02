@@ -25,11 +25,20 @@
 //
 // # Acting on a chain's answer
 //
-// A Chain with a Policy only returns ok=true for an answer the policy selected
-// (or an unscored one that passed the confidence floor); an uncertain or "none"
-// answer falls through to the next provider. A chain built with KeepNonSelected
-// can return ok=true for an uncertain or "none" answer: such a caller MUST
-// check Decision.Actionable before acting on the decision.
+// One rule decides whether an answer may be acted on (Decision.Actionable and
+// Selection.Actionable): a SelectionPolicy selected a calibrated answer
+// (selected, several), or the caller's policy explicitly accepted an
+// uncalibrated decision at a stated bar (accepted; SelectionPolicy.
+// AcceptUncalibratedAt, off for DurablePolicy). An uncalibrated LLM emulator's
+// self-reported confidence is otherwise a proposal, never a selection.
+//
+// A Chain with a Policy only returns ok=true for an answer that rule accepts; an
+// uncertain, "none" or unscored answer falls through to the next provider. A
+// chain built with KeepNonSelected can return ok=true for such an answer, and so
+// can an engine called directly (compose.WithPolicy sets its Outcome): such a
+// caller MUST check Decision.Actionable before acting on the decision. A chain
+// without a Policy has only its MinConfidence floor, and an empty Outcome (no
+// policy judged the answer) is then actionable.
 package decision
 
 import (
