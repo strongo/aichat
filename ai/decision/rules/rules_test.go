@@ -170,3 +170,46 @@ func TestProvider_DecisionTimeoutIs300ms(t *testing.T) {
 		t.Errorf("DecisionTimeout() = %v, want 300ms", p.DecisionTimeout())
 	}
 }
+
+// Every matched rule is declared deterministic: always actionable under a
+// policy (including durable, which never accepts an uncalibrated decision), and
+// whatever a rule claims about calibration is cleared.
+func TestProvider_MatchesAreDeterministicAndActionableUnderADurablePolicy(t *testing.T) {
+	p := New("rules",
+		Rule{Name: "show", Match: func(text string, _ session.State) (decision.Decision, bool) {
+			if text != "show" {
+				return decision.Decision{}, false
+			}
+			return decision.Decision{
+				Module: decision.Scored{Value: "calendar"}, Intent: decision.Scored{Value: "show"}, Interaction: decision.InteractionCommand,
+				Calibrated: true, Scores: map[string]float64{"liar": 1}, Model: "jev-1",
+			}, true
+		}},
+		Rule{Name: "yes", Match: func(text string, _ session.State) (decision.Decision, bool) {
+			return decision.Decision{Interaction: decision.InteractionConfirmation}, text == "yes"
+		}})
+	tax := decision.Taxonomy{Modules: []decision.ModuleSpec{{Name: "calendar", Intents: []string{"show"}}}}
+	pol := decision.DurablePolicy()
+	for _, text := range []string{"show", "yes"} {
+		d, ok, tr := decision.Chain{Providers: []decision.Provider{p}, Policy: &pol}.Decide(context.Background(), decision.Request{Text: text, Taxonomy: tax})
+		if !ok || !d.Actionable() || d.Outcome != decision.OutcomeDeterministic || d.Provenance() != decision.ProvenanceDeterministic ||
+			d.Calibrated || d.Scores != nil || d.Model != "" || tr.Provenance != decision.ProvenanceDeterministic || tr.Calibrated {
+			t.Fatalf("%q: ok=%v d=%+v tr=%+v", text, ok, d, tr)
+		}
+	}
+	// Used directly, a match already says so; no match abstains.
+	d, ok, err := p.Decide(context.Background(), decision.Request{Text: "SHOW!"})
+	if err != nil || !ok || !d.Actionable() {
+		t.Fatalf("d=%+v ok=%v err=%v", d, ok, err)
+	}
+	if _, ok, _ := p.Decide(context.Background(), decision.Request{Text: "nope"}); ok {
+		t.Fatal("matched")
+	}
+}
+
+func TestProvider_IsDeterministic(t *testing.T) {
+	var p decision.DeterministicProvider = New("rules")
+	if !p.IsDeterministic() {
+		t.Fatal("a rule table is deterministic")
+	}
+}

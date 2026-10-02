@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +14,8 @@ import (
 
 	"github.com/strongo/aichat/ai/decision"
 	"github.com/strongo/aichat/ai/decision/compose"
+	"github.com/strongo/aichat/ai/decision/rules"
+	"github.com/strongo/aichat/ai/session"
 )
 
 // stubEngine is a scripted decision engine that counts its calls.
@@ -430,5 +434,117 @@ func TestLoad_ParsesBreakerSlowThreshold(t *testing.T) {
 	cfg, err := Load(path)
 	if err != nil || cfg.Decision.BreakerSlowThreshold != 4 {
 		t.Fatalf("cfg=%+v err=%v", cfg.Decision, err)
+	}
+}
+
+// ---- M1: the aiconfig layout (the product's rules first, then the engines) ----
+
+func TestBuild_DurablePolicyKeepsRuleMatchesDeterministicAndFree(t *testing.T) {
+	rule := rules.New("rules", rules.Rule{Name: "show", Match: func(text string, _ session.State) (decision.Decision, bool) {
+		return decision.Decision{Module: decision.Scored{Value: "m"}, Intent: decision.Scored{Value: "i"}, Interaction: decision.InteractionCommand}, text == "show"
+	}})
+	jev := &stubEngine{name: "jev", d: engineDecision("j"), ok: true}
+	p, err := buildDecision(t, func(c *Config) { c.Decision.Engines, c.Decision.Policy = []string{"jev"}, "durable" },
+		Deps{ExtraDecision: []decision.Provider{rule}, Engines: map[string]decision.Provider{"jev": jev}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := engineRequest()
+	req.Text = "Show!"
+	d, ok, tr := p.Chain().Decide(context.Background(), req)
+	if !ok || d.Outcome != decision.OutcomeDeterministic || !d.Actionable() || jev.calls != 0 || tr.DecidedBy != "rules" || tr.Provenance != decision.ProvenanceDeterministic {
+		t.Fatalf("a rule match under policy: durable must be accepted without a paid call: ok=%v d=%+v jev=%d tr=%+v", ok, d, jev.calls, tr)
+	}
+	// No rule matches: the engine decides, and its uncalibrated answer is not accepted by durable.
+	req.Text = "something else"
+	if d, ok, _ := p.Chain().Decide(context.Background(), req); ok || d.Actionable() || jev.calls != 1 {
+		t.Fatalf("ok=%v d=%+v calls=%d", ok, d, jev.calls)
+	}
+}
+
+// ---- m5: stop on quota / misconfiguration ----
+
+func TestBuild_ChainStopsAtQuotaAndMisconfigurationUnlessOptedOut(t *testing.T) {
+	quota := fmt.Errorf("jev: %w", decision.ErrQuota)
+	mis := fmt.Errorf("jev: %w", decision.ErrMisconfigured)
+	for name, tc := range map[string]struct {
+		err      error
+		mutate   func(*Config)
+		stopped  string
+		cloudHit int
+	}{
+		"quota, default":                   {quota, func(*Config) {}, decision.AttemptQuota, 0},
+		"quota, explicit on":               {quota, func(c *Config) { c.Decision.StopOnQuota = ptr(true) }, decision.AttemptQuota, 0},
+		"quota, opted out":                 {quota, func(c *Config) { c.Decision.StopOnQuota = ptr(false) }, "", 1},
+		"quota, only misconfigured is off": {quota, func(c *Config) { c.Decision.StopOnMisconfigured = ptr(false) }, decision.AttemptQuota, 0},
+		"misconfigured, default":           {mis, func(*Config) {}, decision.AttemptMisconfigured, 0},
+		"misconfigured, opted out":         {mis, func(c *Config) { c.Decision.StopOnMisconfigured = ptr(false) }, "", 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var hits int
+			deps := Deps{
+				Product: "p", CloudBaseURL: "https://cloud.example/v0/", CloudToken: func(context.Context) (string, error) { return "t", nil },
+				HTTPClient: &http.Client{Transport: rtFunc(func(*http.Request) (*http.Response, error) {
+					hits++
+					return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"decided":false}`))}, nil
+				})},
+				Engines: map[string]decision.Provider{"jev": &stubEngine{name: "jev", err: tc.err}},
+			}
+			p, err := buildDecision(t, func(c *Config) { c.Decision.Engines = []string{"jev"}; tc.mutate(c) }, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, ok, tr := p.Chain().Decide(context.Background(), engineRequest())
+			if ok || tr.StoppedBy != tc.stopped || hits != tc.cloudHit {
+				t.Fatalf("ok=%v stoppedBy=%q cloud calls=%d tr=%+v", ok, tr.StoppedBy, hits, tr)
+			}
+			if tc.stopped != "" && tr.Err() == nil {
+				t.Fatal("a stopped chain has an error")
+			}
+		})
+	}
+}
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func ptr[T any](v T) *T { return &v }
+
+func TestProviders_ChainCarriesProvidersPolicyAndStopSettings(t *testing.T) {
+	p, err := buildDecision(t, func(c *Config) {
+		c.Decision.Policy = "narrowing"
+		c.Decision.StopOnQuota = ptr(false)
+	}, Deps{ExtraDecision: []decision.Provider{&stubEngine{name: "rules"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := p.Chain()
+	if len(c.Providers) != 1 || c.Policy == nil || c.Policy.Name != "narrowing" || c.StopOnQuota != decision.FallThrough || c.StopOnMisconfigured != decision.StopChain {
+		t.Fatalf("%+v", c)
+	}
+}
+
+func TestLoad_ParsesStopOptions(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "ai.yaml")
+	if err := os.WriteFile(p, []byte("decision:\n  stopOnQuota: false\n  stopOnMisconfigured: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil || cfg.Decision.StopOnQuota == nil || *cfg.Decision.StopOnQuota || cfg.Decision.StopOnMisconfigured == nil || !*cfg.Decision.StopOnMisconfigured {
+		t.Fatalf("%+v %v", cfg.Decision, err)
+	}
+}
+
+func TestBuild_PolicyValuesSetTheSideEffectOptIn(t *testing.T) {
+	p, err := buildDecision(t, func(c *Config) {
+		c.Decision.Policy, c.Decision.PolicyValues = "narrowing", &PolicyValues{AcceptUncalibratedSideEffects: ptr(true)}
+	}, Deps{})
+	if err != nil || p.Policy == nil || !p.Policy.AcceptUncalibratedSideEffects {
+		t.Fatalf("%+v %v", p.Policy, err)
+	}
+	p, err = buildDecision(t, func(c *Config) { c.Decision.Policy = "narrowing" }, Deps{})
+	if err != nil || p.Policy.AcceptUncalibratedSideEffects {
+		t.Fatalf("the opt-in is off by default: %+v %v", p.Policy, err)
 	}
 }

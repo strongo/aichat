@@ -24,7 +24,10 @@ const (
 // (Fallback, Hedged) starts its backup. Failures (error, timeout, an open
 // breaker, an unsupported operation, an invalid answer, a request or credentials
 // the engine refused) always start it. An exhausted allowance (OnQuota) and a
-// misconfigured endpoint never do, unless OnQuota asks for the former.
+// misconfigured endpoint never do, unless OnQuota asks for the former. A spent
+// budget (decision.ErrBudget, see NewBudget) never starts a backup either, and
+// OnQuota does not change that. In Hedged and Race these conditions also end the
+// call when they come from a leg that is already running (see Engine.halts).
 type Trigger uint
 
 const (
@@ -105,8 +108,9 @@ type Engine struct {
 }
 
 var (
-	_ decision.TracedProvider = (*Engine)(nil)
-	_ decision.TracedScorer   = (*Engine)(nil)
+	_ decision.TracedProvider        = (*Engine)(nil)
+	_ decision.TracedScorer          = (*Engine)(nil)
+	_ decision.DeterministicProvider = (*Engine)(nil)
 )
 
 func newEngine(s Strategy, providers []decision.Provider, hedgeAfter time.Duration, opts []Option) *Engine {
@@ -179,6 +183,23 @@ func (e *Engine) Name() string { return e.cfg.name }
 // Strategy returns the engine's strategy.
 func (e *Engine) Strategy() Strategy { return e.strategy }
 
+// IsDeterministic implements decision.DeterministicProvider: true only when the
+// engine has providers and every one of them is deterministic, so wrapping rules
+// in an engine does not hide them from aiconfig's ordering check.
+func (e *Engine) IsDeterministic() bool {
+	return len(e.providers) > 0 && allDeterministic(e.providers...)
+}
+
+// allDeterministic reports whether every provider is a deterministic one.
+func allDeterministic(ps ...decision.Provider) bool {
+	for _, p := range ps {
+		if dp, ok := p.(decision.DeterministicProvider); !ok || !dp.IsDeterministic() {
+			return false
+		}
+	}
+	return true
+}
+
 // DecisionTimeout implements the optional interface decision.Chain honours: the
 // longest this engine can take, so a hedged backup is not starved by what is
 // left of a chain's default.
@@ -243,11 +264,30 @@ func (e *Engine) triggers(outcome string) bool {
 		return false // the caller gave up: nothing to fail over to
 	case decision.AttemptQuota:
 		return e.cfg.also&OnQuota != 0
-	case decision.AttemptMisconfigured:
-		return false // a person must fix it; a backup would hide it
+	case decision.AttemptBudget, decision.AttemptMisconfigured:
+		// A spent budget is a cap the caller set to keep a leg from being billed: a
+		// backup never takes over for it, whatever OnQuota says (OnQuota is only about
+		// the allowance of an engine the backup stands in for). A misconfigured
+		// endpoint must be fixed, and a backup would hide it.
+		return false
 	default: // error, timeout, unavailable, unsupported, invalid, rejected, auth
 		return true
 	}
+}
+
+// halts reports whether a leg that ended with outcome ends the whole call, in the
+// strategies that run legs concurrently (Hedged, Race): an exhausted allowance
+// (unless OnQuota chose to fail over), a spent budget and a misconfigured endpoint. Without it a
+// backup that was already started, by the hedge timer or because a race starts
+// everyone, would answer and quietly take over the metered caller's traffic.
+func (e *Engine) halts(outcome string) bool {
+	switch outcome {
+	case decision.AttemptQuota:
+		return e.cfg.also&OnQuota == 0
+	case decision.AttemptBudget, decision.AttemptMisconfigured:
+		return true
+	}
+	return false
 }
 
 // ---- Provider (decisions) ----
@@ -284,7 +324,9 @@ func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decisi
 			return decision.AttemptInvalid, decision.InvalidDetail(err)
 		}
 		if e.cfg.policy != nil {
-			if sel := e.cfg.policy.EvaluateDecision(v.d); !sel.Actionable() {
+			if sel := e.cfg.policy.EvaluateDecision(v.d); sel.Outcome == decision.OutcomeInvalid {
+				return decision.AttemptInvalid, sel.Detail()
+			} else if !sel.Actionable() {
 				return decision.AttemptUncertain, sel.Detail()
 			}
 		}
@@ -295,14 +337,16 @@ func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decisi
 	if v, ok := out.value(); ok {
 		rep.Model = v.d.Model
 		if e.cfg.policy != nil {
-			// With a policy every answer carries its verdict, so a direct caller of
-			// the engine can tell an accepted answer from one that was only
-			// returned because an uncertain answer is an answer (Actionable).
-			v.d.Outcome = e.cfg.policy.EvaluateDecision(v.d).Outcome
+			// With a policy every answer carries its stamped verdict, so a direct caller
+			// of the engine can tell an accepted answer from one that was only
+			// returned because an uncertain answer is an answer (Actionable). Without
+			// one nothing judged the answer: its verdict stays whatever the provider
+			// behind it stamped (an inner engine's), never what a provider wrote.
+			v.d, _ = e.cfg.policy.JudgeDecision(v.d)
 		}
 		return v.d, true, rep, nil
 	}
-	if out.abstained() {
+	if out.abstained() && !out.halted && !out.refused(e) {
 		return decision.Decision{}, false, rep, nil
 	}
 	return decision.Decision{}, false, rep, out.failure(e)
@@ -454,7 +498,9 @@ func runLeg[T any](ctx context.Context, e *Engine, l leg[T], judge func(T) (stri
 		a.Usage = l.usage(res.val)
 	}
 	if rep != nil {
-		res.engine = rep.Engine
+		if rep.Engine != "" {
+			res.engine = rep.Engine
+		}
 		res.attempts = decision.MergeReport(*rep, a, res.err == nil && res.answered)
 	} else {
 		res.attempts = []decision.Attempt{a}
@@ -466,17 +512,21 @@ func runLeg[T any](ctx context.Context, e *Engine, l leg[T], judge func(T) (stri
 // the leg's context: DeadlineExceeded when the leg timed out (or its parent's
 // deadline passed), another non-nil value when it was cancelled.
 func classify(err, cause error) (outcome, detail string) {
+	// The conditions that must stay loud come first: an engine error that joins
+	// several legs' errors must not have them hidden behind a quieter one.
 	switch {
+	case errors.Is(err, decision.ErrQuota):
+		return decision.AttemptQuota, err.Error()
+	case errors.Is(err, decision.ErrBudget):
+		return decision.AttemptBudget, err.Error()
+	case errors.Is(err, decision.ErrMisconfigured):
+		return decision.AttemptMisconfigured, err.Error()
 	case errors.Is(err, decision.ErrUnavailable):
 		return decision.AttemptUnavailable, err.Error()
 	case errors.Is(err, decision.ErrUnsupported):
 		return decision.AttemptUnsupported, err.Error()
 	case errors.Is(err, decision.ErrAuth):
 		return decision.AttemptAuth, err.Error()
-	case errors.Is(err, decision.ErrQuota):
-		return decision.AttemptQuota, err.Error()
-	case errors.Is(err, decision.ErrMisconfigured):
-		return decision.AttemptMisconfigured, err.Error()
 	case errors.Is(err, decision.ErrInvalidRequest):
 		return decision.AttemptRejected, err.Error()
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded):
@@ -499,6 +549,10 @@ type runOut[T any] struct {
 	// an uncertain answer that does not trigger the backup: that answer is the
 	// result, whatever the backup was doing.
 	primaryStands bool
+	// halted is true when a started leg reported an exhausted allowance or a
+	// misconfigured endpoint that the engine does not fail over (see halts): the
+	// other legs were cancelled and no answer is returned, only the failure.
+	halted bool
 }
 
 // pickAnswer chooses the answer an engine returns: the accepted one, else the
@@ -506,6 +560,9 @@ type runOut[T any] struct {
 func (o runOut[T]) pickAnswer() int {
 	if o.winner >= 0 {
 		return o.winner
+	}
+	if o.halted {
+		return -1
 	}
 	if o.primaryStands {
 		if o.results[0].outcome == decision.AttemptUncertain {
@@ -532,6 +589,24 @@ func (o runOut[T]) value() (T, bool) {
 func (o runOut[T]) abstained() bool {
 	for _, r := range o.results {
 		if r.outcome == decision.AttemptAbstained {
+			return true
+		}
+	}
+	return false
+}
+
+// refused reports whether a started leg ended in a refusal this engine does not
+// absorb (see halts): an exhausted allowance, a spent budget or a misconfigured
+// endpoint. Neither an abstention nor an uncertain answer elsewhere in the call may
+// swallow it: a backup that an abstention (OnAbstain) or an uncertain answer
+// (OnUncertain) started and that was out of budget would otherwise read as "nobody
+// decided" or as the primary's answer, which a product answers with its paid
+// main-LLM path while the chain never stops. A spent budget counts even when a
+// Hedged primary stands on its own abstention or uncertain answer; the other
+// refusals do not, because that primary's answer is then the call's.
+func (o runOut[T]) refused(e *Engine) bool {
+	for _, r := range o.results {
+		if r.outcome == decision.AttemptBudget || (!o.primaryStands && e.halts(r.outcome)) {
 			return true
 		}
 	}
@@ -572,6 +647,13 @@ func run[T any](ctx context.Context, e *Engine, legs []leg[T], judge func(T) (st
 		out = runSequential(ctx, e, legs, judge)
 	}
 	out.answerIdx = out.pickAnswer()
+	if out.winner < 0 && out.refused(e) {
+		// A refusal the engine does not absorb (a spent budget, an exhausted allowance,
+		// a misconfigured endpoint) is the result, even when another leg answered
+		// uncertain or abstained: a caller that got the uncertain answer instead would
+		// never learn that the backup was refused, and would keep calling it.
+		out.answerIdx = -1
+	}
 	return out
 }
 
@@ -630,7 +712,7 @@ func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge f
 	}
 
 	winnerLeg := -1
-	for running > 0 && winnerLeg < 0 && !out.primaryStands {
+	for running > 0 && winnerLeg < 0 && !out.primaryStands && !out.halted {
 		select {
 		case <-hedgeC:
 			hedgeC = nil // a nil channel never fires again
@@ -645,6 +727,12 @@ func runConcurrent[T any](ctx context.Context, e *Engine, legs []leg[T], judge f
 			switch {
 			case rr.accepted():
 				winnerLeg = r.idx
+			case e.halts(rr.outcome) && (e.strategy == StrategyRace || r.idx == 0):
+				// A race pays every engine on every call, so one engine's refusal
+				// of the allowance ends the call. A hedge's backup is only the
+				// primary's stand-in: the primary's refusal ends it, the backup's
+				// own is just a failed backup.
+				out.halted = true
 			case e.strategy == StrategyHedged && r.idx == 0 && e.triggers(rr.outcome):
 				if !started[1] {
 					out.fallback = true

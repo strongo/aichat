@@ -1,6 +1,7 @@
 // Package compose holds engine combinators over decision.Provider (and
 // decision.ScoredProvider): Single, Fallback, Hedged and Race, plus Breaker, a
-// circuit breaker that stops calling an engine that is down.
+// circuit breaker that stops calling an engine that is down, and Budget, a cap on
+// how often an engine (typically a paid backup) is called.
 //
 // Every combinator is itself a decision.Provider, so it nests inside a
 // decision.Chain (and inside another combinator), and every one is a
@@ -54,14 +55,37 @@
 //     does NOT start the backup unless WithFallbackOn(OnQuota) says so, and the
 //     error is returned to the caller. A misconfigured endpoint
 //     (decision.ErrMisconfigured, outcome "misconfigured") never starts a backup
-//     and never opens a breaker: it is loud on purpose.
+//     and never opens a breaker: it is loud on purpose. The same holds for the
+//     strategies that run engines at once: a Hedged primary's refusal, even after
+//     the hedge fired and the backup is already running, and any Race engine's
+//     refusal, ends the call with that error, cancels the others and returns no
+//     answer (WithFallbackOn(OnQuota) opts out of the quota case only). A Hedged
+//     backup's own refusal is just a failed backup.
+//   - A spent budget (decision.ErrBudget, outcome "budget"; see Budget) is a
+//     quota-class refusal that OnQuota does NOT govern: it is not the engine's fault
+//     (a Breaker ignores it), no Fallback, Hedged or Race ever starts another engine
+//     in its place, and it ends a concurrent call. Like every refusal an engine does
+//     not absorb (an exhausted allowance, a misconfigured endpoint), it wins over an
+//     abstention or an uncertain answer from another leg: the call fails with the
+//     error, so a Chain stops instead of treating it as "nobody decided". (A Hedged
+//     backup's budget refusal still lets its primary answer.)
 //   - With WithPolicy, every decision an engine returns carries the policy's
-//     Outcome, and only an actionable one counts as decided: an answer the policy
+//     stamped verdict (decision.Decision.Outcome, and the judged state Actionable
+//     reads), and only an actionable one counts as decided: an answer the policy
 //     judged uncertain, none or unscored is recorded "uncertain" (and returned, as
 //     an answer, when nothing better exists) and Decision.Actionable is false for
-//     it. Without WithPolicy an engine has no bar to judge by and returns the
-//     decision unjudged (empty Outcome): wrap it in a decision.Chain, which owns
-//     the bar.
+//     it. A deterministic decision (decision.Deterministic, what
+//     ai/decision/rules returns) is accepted under any policy as
+//     OutcomeDeterministic, and a calibrated decision that contradicts its own
+//     Scores is recorded "invalid". Without WithPolicy an engine has no bar to
+//     judge by and returns the decision with whatever verdict an engine behind it
+//     stamped, none for a plain provider (Decision.Actionable is false, whatever
+//     Outcome the provider wrote): wrap it in a decision.Chain, which owns the bar
+//     and stamps the verdict.
+//   - A Breaker is transparent for tracing: it passes on the Report of an engine
+//     that reports one (a combinator, or an engine that explains its abstentions,
+//     as ai/decision/typesafe does), so a breaker never hides attempts from a
+//     decision.Chain's trace.
 //   - Each answered scored attempt carries its own decision.Usage, so a hedged or
 //     fallen-back call can be metered per engine.
 //   - A Breaker honours a failure's retry delay (a Retry-After, see
@@ -73,4 +97,25 @@
 //     decision.ScoredProvider: a Fallback from a decision model to an LLM decider
 //     (ai/decision/llmdecider) still answers them, with uncalibrated scores that
 //     a decision.SelectionPolicy turns into a proposal, never a selection.
+//
+// # Cost control: the hole and the guard
+//
+// A provider's own errors cannot bound the bill of a paid backup. TypeSafe
+// documents one 429 error, a rate limit, and no way to tell it from a spent
+// account, so ai/decision/typesafe keeps every 429 transient; with
+// Fallback(Breaker(typesafe), Breaker(llm)) an exhausted Jev account therefore
+// sends EVERY call to the paid LLM (a probe saw 5 Jev calls and 50 LLM calls in
+// 50 turns), and nothing bounds it. Budget is the guard: wrap the backup,
+// INSIDE its Breaker so blocked calls are not counted,
+//
+//	compose.Fallback(
+//		compose.NewBreaker(typesafe),
+//		compose.NewBreaker(compose.NewBudget(llm, compose.BudgetOptions{MaxCalls: 200, Per: time.Hour})),
+//	)
+//
+// and the call after the cap fails with decision.ErrBudget, which a decision.Chain
+// stops at by default (Trace.StoppedBy "budget"). For anonymous or public traffic
+// run the calibrated engine alone, with no paid backup, or with a budgeted one; and
+// a product that sees a stopped chain must not escalate to its paid main LLM as if
+// nobody had decided (check decision.Trace.StoppedBy).
 package compose

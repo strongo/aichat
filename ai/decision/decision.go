@@ -26,19 +26,63 @@
 // # Acting on a chain's answer
 //
 // One rule decides whether an answer may be acted on (Decision.Actionable and
-// Selection.Actionable): a SelectionPolicy selected a calibrated answer
-// (selected, several), or the caller's policy explicitly accepted an
-// uncalibrated decision at a stated bar (accepted; SelectionPolicy.
-// AcceptUncalibratedAt, off for DurablePolicy). An uncalibrated LLM emulator's
-// self-reported confidence is otherwise a proposal, never a selection.
+// Selection.Actionable): a positive verdict was stamped on it by this package's
+// judges. A decision never becomes actionable by omission or by claim: an engine or
+// provider used directly returns it unjudged, which is NOT actionable until a
+// Chain, or an engine built with a policy (compose.WithPolicy), judged it; the
+// zero Decision is not actionable; and the exported Outcome field, which is kept on
+// the wire for traces and telemetry, is informational only: what a remote engine,
+// a stored decision or a provider writes there is never believed.
+//
+// The positive verdicts are: a SelectionPolicy selected a calibrated answer
+// (selected, several); the policy explicitly accepted an uncalibrated LLM
+// self-report at a stated bar (accepted; SelectionPolicy.AcceptUncalibratedAt, off
+// for DurablePolicy); the decision is deterministic (deterministic: it came from
+// exact logic such as a rule table, declared with Deterministic, and no policy
+// threshold applies to it); or a Chain without a Policy accepted it at its
+// MinConfidence floor (floor). An LLM emulator's self-reported confidence is
+// otherwise a proposal, never a selection.
+//
+// A side-effectful interaction (SideEffectful: confirmation, rejection,
+// correction, cancellation, undo) is held to one more bar, with or without a
+// policy: its own InteractionConfidence must be above 0 and at least
+// DurableMinConfidence, and a CALIBRATED claim about it must be backed by
+// Decision.InteractionScores (a remote engine's calibrated flag is only a claim);
+// an unbacked one counts as a self-report, which a policy accepts only with
+// SelectionPolicy.AcceptUncalibratedSideEffects. Deterministic decisions are exact
+// and exempt.
 //
 // A Chain with a Policy only returns ok=true for an answer that rule accepts; an
-// uncertain, "none" or unscored answer falls through to the next provider. A
-// chain built with KeepNonSelected can return ok=true for such an answer, and so
-// can an engine called directly (compose.WithPolicy sets its Outcome): such a
-// caller MUST check Decision.Actionable before acting on the decision. A chain
-// without a Policy has only its MinConfidence floor, and an empty Outcome (no
-// policy judged the answer) is then actionable.
+// uncertain, "none", unscored or invalid answer falls through to the next
+// provider. A chain built with KeepNonSelected can return ok=true for such an
+// answer (but never an invalid one), and so can an engine called directly
+// (compose.WithPolicy stamps its verdict): such a caller MUST check
+// Decision.Actionable before acting on the decision.
+//
+// # Stored and replayed decisions
+//
+// A Decision that was marshalled and read back (a database row, a trace, a cloud
+// response) is NOT actionable and has lost its provenance class: the verdict and
+// the deterministic class live in unexported fields no data can set, so a rule
+// decision replayed from storage reads self_reported. A product that replays must
+// re-judge it through a chain or policy (Chain.Rejudge, SelectionPolicy.JudgeDecision),
+// which treats it as the ordinary decision it now is, or re-run its rules. Rejudge
+// keeps a refusal recorded in Outcome (a policy-less chain knows only its floor), so
+// rejudge with the chain that carries the policy that applied. The verdict is also
+// bound to the decision's module, intent, interaction, confidences and Calibrated:
+// editing any of them after judging makes the decision not actionable until it is
+// judged again, and decoding JSON into a judged value discards its verdict.
+//
+// # Stopped chains
+//
+// A Chain stops at an exhausted allowance (ErrQuota), a spent budget (ErrBudget,
+// see compose.NewBudget) or a misconfigured engine (ErrMisconfigured) instead of
+// handing the call to the next, possibly paid, provider (Chain.StopOnQuota,
+// Chain.StopOnMisconfigured). A stopped chain returns ok=false, exactly like a
+// chain nobody decided in, so a product MUST check Trace.StoppedBy (and use
+// Trace.Err) before treating ok=false as "use the paid main-LLM path": the stop
+// exists to keep that path from being billed. Place deterministic providers (rules)
+// BEFORE the engines: a stop skips every provider after the one that stopped.
 package decision
 
 import (
@@ -46,6 +90,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 
@@ -92,8 +137,14 @@ type Decision struct {
 	// Interaction is only ever set from an answer the engine's selection policy
 	// selected, so a caller need not threshold it, but it may apply a stricter
 	// bar of its own to an interaction that acts on a pending action.
-	InteractionConfidence float64    `json:"interactionConfidence,omitempty"`
-	Reference             *Reference `json:"reference,omitempty"`
+	InteractionConfidence float64 `json:"interactionConfidence,omitempty"`
+	// InteractionScores are a calibrated engine's probabilities for the options of
+	// the Choice that picked Interaction, keyed by Interaction value. It is the
+	// evidence a calibrated claim about a SIDE-EFFECTFUL interaction needs (see
+	// SideEffectful): without it, or when it contradicts Interaction, the claim is
+	// only as strong as a self-report. Additive; empty when the engine has none.
+	InteractionScores map[string]float64 `json:"interactionScores,omitempty"`
+	Reference         *Reference         `json:"reference,omitempty"`
 	// RequiredScopes is the MINIMUM context needed. It does not mean other
 	// cached scopes must be dropped; see package ctxmgr.
 	RequiredScopes []string `json:"requiredScopes,omitempty"`
@@ -112,29 +163,102 @@ type Decision struct {
 	// Calibrated is true only when Scores and the confidences are calibrated
 	// probabilities (a real decision model), false for an LLM emulator's
 	// self-reported confidence. A SelectionPolicy is applied only to
-	// calibrated scores.
+	// calibrated scores. Provenance layers a third class (deterministic) over
+	// this flag.
 	Calibrated bool `json:"calibrated,omitempty"`
-	// Outcome is the policy's verdict, set by a Chain with a SelectionPolicy and
-	// by an engine built with a policy. A caller that cannot rule out a chain
-	// with KeepNonSelected, or that calls an engine directly, MUST act only on a
-	// decision for which Actionable is true.
+	// Outcome is the verdict as a record: a Chain (with or without a
+	// SelectionPolicy), SelectionPolicy.JudgeDecision and an engine built with a
+	// policy set it, and it is kept on the wire so traces and telemetry can show it.
+	// It is INFORMATIONAL: what a remote engine, a stored decision or a provider
+	// writes here is never trusted. Whether a caller may act is decided by the
+	// unexported verdict only those judges stamp, which Actionable reads, so a
+	// decision that came off the wire or out of storage is NOT actionable whatever
+	// its Outcome says (see Rejudge). A caller that cannot rule out a chain with
+	// KeepNonSelected, or that calls an engine or provider directly, MUST act only
+	// on a decision for which Actionable is true.
 	Outcome Outcome `json:"outcome,omitempty"`
 	// Model is the model id the engine reported for this decision ("" when it
 	// reports none). Thresholds only hold for the model they were measured on.
 	Model string `json:"model,omitempty"`
+
+	// deterministic marks a decision produced by exact logic (see Deterministic).
+	// Unexported on purpose: no JSON from a remote engine, no LLM output and no
+	// stored decision can set it.
+	deterministic bool
+	// verdict is the judged state: the positive or refusing Outcome stamped by this
+	// package's judges (Chain, SelectionPolicy.JudgeDecision, Deterministic) and by
+	// nothing else. Unexported for the same reason as deterministic: no JSON and no
+	// provider can set it, so no decision becomes actionable by claiming an Outcome.
+	verdict Outcome
+	// sealed is the content the verdict was stamped on (see sealOf): Actionable is
+	// true only while the decision still reads the same, so a judged decision that is
+	// then edited (a different interaction, a different confidence) is no longer
+	// actionable.
+	sealed seal
+}
+
+// seal is the part of a decision that decides whether to act: what the user asked
+// (module, intent, interaction), how sure the engine was, and which class of
+// evidence stood behind it. Scalars only, so seals compare with ==.
+type seal struct {
+	module, intent         string
+	moduleConf, intentConf float64
+	interaction            Interaction
+	interactionConf        float64
+	calibrated             bool
+	deterministic          bool
+}
+
+func sealOf(d Decision) seal {
+	return seal{
+		module: d.Module.Value, intent: d.Intent.Value, moduleConf: d.Module.Confidence, intentConf: d.Intent.Confidence,
+		interaction: d.Interaction, interactionConf: d.InteractionConfidence,
+		calibrated: d.Calibrated, deterministic: d.deterministic,
+	}
+}
+
+// stamped returns d judged as o: the unexported verdict, bound to d's content, and
+// the exported record.
+func (d Decision) stamped(o Outcome) Decision {
+	d.verdict, d.Outcome, d.sealed = o, o, sealOf(d)
+	return d
+}
+
+// UnmarshalJSON decodes d like encoding/json does and then discards the judged
+// state: whatever verdict d held before (decoding INTO a judged value) is cleared,
+// and so is the deterministic class, because the decoded content is new and nothing
+// judged it. The wire form is unchanged; Outcome is read as the informational
+// record it is.
+func (d *Decision) UnmarshalJSON(b []byte) error {
+	type plain Decision // no methods: avoids recursing into this one
+	p := plain(*d)
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*d = Decision(p)
+	d.verdict, d.sealed, d.deterministic = "", seal{}, false
+	return nil
 }
 
 // Actionable reports whether a caller may act on d. The rule is one and
-// explicit, the same as Selection.Actionable: a policy selected a calibrated
-// answer (OutcomeSelected) or explicitly accepted an uncalibrated one at its
-// stated bar (OutcomeAccepted, SelectionPolicy.AcceptUncalibratedAt). Uncertain,
-// none and unscored decisions are not actionable. The one other actionable
-// state is the empty Outcome, which means NO policy judged d: the answer of a
-// Chain without a Policy, whose own MinConfidence is then the caller's explicit
-// bar. Every engine built with a policy (compose.WithPolicy) and every Chain with
-// a Policy sets an Outcome, so a decision is never actionable by omission.
+// explicit, the same as Selection.Actionable: this package's judges stamped a
+// positive verdict on d (selected, several, accepted, deterministic or floor; see
+// Outcome.Actionable). The exported Outcome is not consulted: it is informational
+// and can be written by JSON or by a provider. An unjudged decision is not
+// actionable: a provider or engine used directly returns one, the zero Decision
+// is one, and so is every decision that was marshalled and read back (a stored or
+// remote decision has lost its verdict and its provenance class; re-judge it with
+// Chain.Rejudge). Chain (with or without a Policy) and every engine built with a
+// policy stamp the verdict.
+//
+// The verdict is bound to the fields that decide whether to act: module, intent,
+// their confidences, Interaction, InteractionConfidence, Calibrated and the
+// deterministic class. Editing any of them after judging makes the decision not
+// actionable until it is judged again. Other fields (Scores, InteractionScores,
+// Slots, Reference, RequiredScopes, RequiredData, Presentation) are not bound: a
+// product that edits a judged decision's evidence or arguments must re-judge it.
 func (d Decision) Actionable() bool {
-	return d.Outcome == "" || d.Outcome.Actionable()
+	return d.verdict.Actionable() && d.sealed == sealOf(d)
 }
 
 // ModuleSpec declares a product module and its intents.
@@ -199,6 +323,24 @@ var moduleOptionalInteractions = map[Interaction]bool{
 	InteractionChat:         true,
 }
 
+// sideEffectful lists the interactions that act on a pending or previous
+// action: when wrong they are a side effect (confirming, cancelling or undoing
+// something the user never meant).
+var sideEffectful = map[Interaction]bool{
+	InteractionConfirmation: true,
+	InteractionRejection:    true,
+	InteractionCorrection:   true,
+	InteractionCancellation: true,
+	InteractionUndo:         true,
+}
+
+// SideEffectful reports whether i acts on a pending or previous action
+// (confirmation, rejection, correction, cancellation, undo), so a wrong answer
+// is a side effect rather than a wasted lookup. A policy never accepts such an
+// interaction from an uncalibrated engine without an explicit opt-in
+// (SelectionPolicy.AcceptUncalibratedSideEffects), and never at confidence 0.
+func SideEffectful(i Interaction) bool { return sideEffectful[i] }
+
 // knownInteractions is the full Interaction enum.
 var knownInteractions = map[Interaction]bool{
 	InteractionCommand:      true,
@@ -216,7 +358,7 @@ var knownInteractions = map[Interaction]bool{
 // empty value; module and intent must be declared UNLESS Interaction is one
 // of the module-optional kinds (confirmation/rejection/cancellation/undo)
 // and Module is empty, in which case both checks are skipped; confidences
-// must be in [0,1]; scopes, presentation, Reference.Kind and RequiredData
+// (module, intent, interaction) must be in [0,1]; scopes, presentation, Reference.Kind and RequiredData
 // must be known to the taxonomy when the taxonomy declares a non-empty list
 // for that dimension. A decision that fails validation is treated as an
 // abstention.
@@ -227,7 +369,7 @@ func Validate(d Decision, t Taxonomy) error {
 	} else if !knownInteractions[d.Interaction] {
 		errs = append(errs, fmt.Errorf("unknown interaction %q", d.Interaction))
 	}
-	if d.Module.Confidence < 0 || d.Module.Confidence > 1 || d.Intent.Confidence < 0 || d.Intent.Confidence > 1 {
+	if !d.confidencesValid() {
 		errs = append(errs, errors.New("confidence out of range"))
 	}
 	moduleOptional := d.Module.Value == "" && moduleOptionalInteractions[d.Interaction]
@@ -265,6 +407,21 @@ func Validate(d Decision, t Taxonomy) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// confidencesValid reports whether every confidence and interaction probability of
+// d is a number in [0,1]. (Scores are checked by the policy that reads them.)
+func (d Decision) confidencesValid() bool {
+	ok := func(c float64) bool { return !math.IsNaN(c) && c >= 0 && c <= 1 }
+	if !ok(d.Module.Confidence) || !ok(d.Intent.Confidence) || !ok(d.InteractionConfidence) {
+		return false
+	}
+	for _, p := range d.InteractionScores {
+		if !ok(p) {
+			return false
+		}
+	}
+	return true
 }
 
 // Attempt records one provider's outcome for diagnostics.
@@ -333,16 +490,105 @@ type Trace struct {
 	Strategy      string `json:"strategy,omitempty"`
 	FallbackFired bool   `json:"fallbackFired,omitempty"`
 	HedgeFired    bool   `json:"hedgeFired,omitempty"`
-	// Calibrated, Outcome and Model echo the decision's flag, the policy's
-	// verdict and the model id the answering engine reported.
-	Calibrated bool    `json:"calibrated,omitempty"`
-	Outcome    Outcome `json:"outcome,omitempty"`
-	Model      string  `json:"model,omitempty"`
+	// Calibrated, Provenance, Outcome and Model echo the decision's flag, its
+	// class (calibrated, self_reported or deterministic), the verdict and the
+	// model id the answering engine reported.
+	Calibrated bool       `json:"calibrated,omitempty"`
+	Provenance Provenance `json:"provenance,omitempty"`
+	Outcome    Outcome    `json:"outcome,omitempty"`
+	Model      string     `json:"model,omitempty"`
+	// StoppedBy is set when the chain stopped early instead of trying its next
+	// provider: AttemptQuota (an exhausted allowance) or AttemptMisconfigured (an
+	// endpoint a person has to fix). The decision is then ok=false, like any chain
+	// that decided nothing, but the product MUST NOT read it as "nobody decided,
+	// use the paid main-LLM path" without choosing to: Err returns the error.
+	StoppedBy string `json:"stoppedBy,omitempty"`
+}
+
+// Err returns the error a chain that stopped early (Trace.StoppedBy) stands for:
+// it matches (errors.Is) ErrQuota, ErrBudget or ErrMisconfigured and names the
+// provider that said so. It is nil for a trace that was not stopped. The message is
+// the provider's own error text, as the attempt's detail has it, so the condition
+// is stated once.
+func (t Trace) Err() error {
+	var sentinel error
+	switch t.StoppedBy {
+	case AttemptQuota:
+		sentinel = ErrQuota
+	case AttemptBudget:
+		sentinel = ErrBudget
+	case AttemptMisconfigured:
+		sentinel = ErrMisconfigured
+	default:
+		return nil
+	}
+	for i := len(t.Attempts) - 1; i >= 0; i-- {
+		if a := t.Attempts[i]; a.Outcome == t.StoppedBy {
+			return &stoppedError{msg: fmt.Sprintf("decision: chain stopped at %s (%s): %s", a.Provider, t.StoppedBy, a.Detail), kind: sentinel}
+		}
+	}
+	return &stoppedError{msg: fmt.Sprintf("decision: chain stopped (%s): %s", t.StoppedBy, sentinel), kind: sentinel}
+}
+
+// stoppedError is Trace.Err's value: a fixed message that matches its sentinel.
+type stoppedError struct {
+	msg  string
+	kind error
+}
+
+func (e *stoppedError) Error() string { return e.msg }
+func (e *stoppedError) Unwrap() error { return e.kind }
+
+// StopPolicy says whether a Chain stops when a provider reports a condition it
+// must not paper over. The zero value STOPS: stopping is the default, and falling
+// through to the next provider is the deliberate, named opt-out.
+type StopPolicy uint8
+
+const (
+	// StopChain (the zero value) stops the chain: no later provider is called, the
+	// decision is ok=false and Trace.StoppedBy / Trace.Err say why.
+	StopChain StopPolicy = iota
+	// FallThrough lets the chain go on to the next provider, as a plain failure
+	// does. Choosing it for a quota or a budget means a paid provider behind it can
+	// take over the traffic.
+	FallThrough
+)
+
+func (s StopPolicy) stops() bool { return s != FallThrough }
+
+// String is "stop" or "fall_through" (and "StopPolicy(n)" for anything else).
+func (s StopPolicy) String() string {
+	switch s {
+	case StopChain:
+		return "stop"
+	case FallThrough:
+		return "fall_through"
+	}
+	return fmt.Sprintf("StopPolicy(%d)", uint8(s))
+}
+
+// MarshalText writes String, so a policy marshals to JSON as a string.
+func (s StopPolicy) MarshalText() ([]byte, error) { return []byte(s.String()), nil }
+
+// UnmarshalText reads "stop" or "fall_through"; anything else is an error.
+func (s *StopPolicy) UnmarshalText(b []byte) error {
+	switch string(b) {
+	case "stop":
+		*s = StopChain
+	case "fall_through":
+		*s = FallThrough
+	default:
+		return fmt.Errorf("decision: unknown stop policy %q (want stop or fall_through)", b)
+	}
+	return nil
 }
 
 // Chain runs providers in order; the first valid, confident decision wins.
 // A chain with no deciding provider is not an error: the product falls back
-// to its main-LLM path (which classifies and answers in one inference).
+// to its main-LLM path (which classifies and answers in one inference), unless
+// the chain stopped (Trace.StoppedBy; see the package doc). List deterministic
+// providers (ai/decision/rules) first: they are free and exact, and a stop at an
+// engine would otherwise skip them.
 type Chain struct {
 	Providers []Provider
 	// MinConfidence is the minimum Module and Intent confidence to accept a
@@ -376,6 +622,34 @@ type Chain struct {
 	// default because ok=true is then not enough to act on: check
 	// Decision.Actionable.
 	KeepNonSelected bool
+	// StopOnQuota stops the chain, instead of trying its next provider, when a
+	// provider reports an exhausted allowance (ErrQuota, attempt outcome "quota") or
+	// an exhausted spending cap (ErrBudget, outcome "budget"; see compose.NewBudget).
+	// The zero value STOPS: an exhausted allowance must be loud and must not
+	// silently bill a paid backup that follows it in the chain; the product reads
+	// Trace.StoppedBy and Trace.Err. Opt out with FallThrough, naming the decision.
+	// An engine that was given compose.OnQuota has already chosen to fail over, and
+	// reports no quota error when its backup answers.
+	//
+	// A stopped chain returns ok=false, exactly like a chain nobody decided in: a
+	// product MUST check Trace.StoppedBy before treating ok=false as "use the paid
+	// main-LLM path", because the stop is there to keep that path from being billed.
+	//
+	// A stop also skips every provider after the one that stopped, deterministic
+	// ones included: put rules BEFORE the engines (aiconfig does).
+	StopOnQuota StopPolicy
+	// StopOnMisconfigured is StopOnQuota for ErrMisconfigured (an unknown product,
+	// a base URL that does not speak the protocol): a person has to fix it, so it is
+	// never absorbed by the next provider. The zero value stops.
+	StopOnMisconfigured StopPolicy
+}
+
+// minConfidence is MinConfidence with its zero value read as the 0.7 default.
+func (c Chain) minConfidence() float64 {
+	if c.MinConfidence == 0 {
+		return 0.7
+	}
+	return c.MinConfidence
 }
 
 // decisionTimeouter is the optional per-provider timeout override.
@@ -385,10 +659,7 @@ type decisionTimeouter interface {
 
 // Decide runs the chain.
 func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) {
-	minConf := c.MinConfidence
-	if minConf == 0 {
-		minConf = 0.7
-	}
+	minConf := c.minConfidence()
 	defaultTimeout := c.Timeout
 	if defaultTimeout == 0 {
 		defaultTimeout = 1500 * time.Millisecond
@@ -422,15 +693,21 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 		// rather than a generic error.
 		timedOut := err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(pctx.Err(), context.DeadlineExceeded))
 		cancel()
+		// A condition that must stop the chain is classified before the ordinary
+		// failures: an engine that joins several legs' errors (a Fallback whose
+		// primary was unavailable and whose backup was out of budget) must not
+		// have the loud one hidden behind the quiet one.
 		switch {
+		case err != nil && errors.Is(err, ErrQuota):
+			a.Outcome, a.Detail = AttemptQuota, err.Error()
+		case err != nil && errors.Is(err, ErrBudget):
+			a.Outcome, a.Detail = AttemptBudget, err.Error()
+		case err != nil && errors.Is(err, ErrMisconfigured):
+			a.Outcome, a.Detail = AttemptMisconfigured, err.Error()
 		case err != nil && errors.Is(err, ErrUnavailable):
 			a.Outcome, a.Detail = AttemptUnavailable, err.Error()
 		case err != nil && errors.Is(err, ErrAuth):
 			a.Outcome, a.Detail = AttemptAuth, err.Error()
-		case err != nil && errors.Is(err, ErrQuota):
-			a.Outcome, a.Detail = AttemptQuota, err.Error()
-		case err != nil && errors.Is(err, ErrMisconfigured):
-			a.Outcome, a.Detail = AttemptMisconfigured, err.Error()
 		case err != nil && errors.Is(err, ErrInvalidRequest):
 			a.Outcome, a.Detail = AttemptRejected, err.Error()
 		case err != nil && timedOut:
@@ -443,19 +720,26 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 			d, a = c.judge(d, a, req, minConf)
 		}
 		decided := a.Outcome == AttemptDecided
+		stop := ((a.Outcome == AttemptQuota || a.Outcome == AttemptBudget) && c.StopOnQuota.stops()) || (a.Outcome == AttemptMisconfigured && c.StopOnMisconfigured.stops())
 		if rep == nil {
 			tr.Attempts = append(tr.Attempts, a)
 		} else {
 			tr.Attempts = append(tr.Attempts, MergeReport(*rep, a, ok && err == nil)...)
 		}
+		if stop {
+			tr.StoppedBy = a.Outcome
+			return Decision{}, false, tr
+		}
 		if decided {
 			tr.DecidedBy = a.Provider
 			tr.Engine = a.Provider
 			if rep != nil {
-				tr.Engine = rep.Engine
+				if rep.Engine != "" {
+					tr.Engine = rep.Engine
+				}
 				tr.Strategy, tr.FallbackFired, tr.HedgeFired = rep.Strategy, rep.FallbackFired, rep.HedgeFired
 			}
-			tr.Calibrated, tr.Outcome, tr.Model = d.Calibrated, d.Outcome, d.Model
+			tr.Calibrated, tr.Provenance, tr.Outcome, tr.Model = d.Calibrated, d.Provenance(), d.Outcome, d.Model
 			if rep != nil && rep.Model != "" {
 				tr.Model = rep.Model
 			}
@@ -468,46 +752,124 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 	return Decision{}, false, tr
 }
 
-// judge classifies a provider's answer: invalid, rejected, or decided. With a
-// SelectionPolicy set the policy alone owns the bar (EvaluateDecision): a
-// calibrated answer is judged by its probabilities, an uncalibrated one is
-// accepted only if the policy opts in (AcceptUncalibratedAt) and is unscored,
-// not actionable, otherwise. An actionable verdict is "decided"; any other is
-// recorded as "uncertain" and the chain falls through, unless KeepNonSelected
-// makes it "decided" for the caller to read Decision.Outcome. Without a policy
-// the MinConfidence floor is the bar; a provider that returned a non-actionable
-// verdict of its own (an engine built with a policy: uncertain, none or
-// unscored) is still honoured, never acted on by omission.
+// judge classifies a provider's answer: invalid, rejected, or decided, and stamps
+// the verdict. With a SelectionPolicy set the policy alone owns the bar
+// (EvaluateDecision): a calibrated answer is judged by its probabilities, a
+// deterministic one (see Deterministic) is always accepted, an uncalibrated one is
+// accepted only if the policy opts in (AcceptUncalibratedAt) and is unscored, not
+// actionable, otherwise; an answer that contradicts its own scores is invalid. An
+// actionable verdict is "decided"; an invalid one falls through whatever
+// KeepNonSelected says; any other is recorded as "uncertain" and the chain falls
+// through, unless KeepNonSelected makes it "decided" for the caller to read
+// Decision.Actionable. Without a policy the MinConfidence floor is the bar and a
+// passing answer is ALWAYS stamped OutcomeFloor (OutcomeDeterministic for a
+// deterministic one), whatever Outcome the provider wrote: only a verdict stamped
+// by this package's judges counts, so a provider cannot claim "selected" or
+// "deterministic" for itself. A non-actionable verdict stamped by an engine built
+// with a policy (uncertain, none, unscored) is still honoured.
 func (c Chain) judge(d Decision, a Attempt, req Request, minConf float64) (Decision, Attempt) {
+	engineVerdict := d.verdict
+	d.verdict, d.Outcome = "", "" // a claimed or stale verdict never survives; the judge stamps its own
 	if verr := Validate(d, req.Taxonomy); verr != nil {
 		a.Outcome, a.Detail = AttemptInvalid, InvalidDetail(verr)
-		return d, a
+		return d.stamped(OutcomeInvalid), a
 	}
 	if c.Policy != nil {
-		sel := c.Policy.EvaluateDecision(d)
-		d.Outcome = sel.Outcome
+		var sel Selection
+		d, sel = c.Policy.JudgeDecision(d)
 		a.Detail = sel.Detail()
-		a.Outcome = AttemptUncertain
-		if sel.Actionable() || c.KeepNonSelected {
+		switch {
+		case sel.Outcome == OutcomeInvalid:
+			a.Outcome = AttemptInvalid
+		case sel.Actionable() || c.KeepNonSelected:
 			a.Outcome = AttemptDecided
+		default:
+			a.Outcome = AttemptUncertain
 		}
 		return d, a
 	}
-	if d.Outcome != "" && !d.Outcome.Actionable() {
-		a.Detail = string(d.Outcome)
+	if engineVerdict != "" && !engineVerdict.Actionable() {
+		a.Detail = string(engineVerdict)
 		a.Outcome = AttemptUncertain
 		if c.KeepNonSelected {
 			a.Outcome = AttemptDecided
 		}
-		return d, a
+		return d.stamped(engineVerdict), a
 	}
 	if lowConfidence(d, minConf) {
 		a.Outcome = AttemptLowConfidence
 		a.Detail = fmt.Sprintf("module=%.2f intent=%.2f", d.Module.Confidence, d.Intent.Confidence)
 		return d, a
 	}
+	if why := sideEffectUnsupported(d, minConf); why != "" {
+		a.Outcome = AttemptLowConfidence
+		a.Detail = why
+		return d, a
+	}
+	if d.deterministic {
+		d = d.stamped(OutcomeDeterministic)
+	} else {
+		d = d.stamped(OutcomeFloor)
+	}
 	a.Outcome = AttemptDecided
 	return d, a
+}
+
+// Rejudge judges d the way this chain judges a provider's answer (its Policy, or
+// its MinConfidence floor, and the side-effect gate), and reports whether the
+// result is actionable. It is how a product acts on a decision it stored or
+// received: a decision read back from JSON (a database row, a cloud response)
+// is NOT actionable and has lost its provenance class (deterministic included),
+// because the verdict and the class live in unexported fields no data can set.
+//
+// Rejudge can only know what the decision and THIS chain say. It can never make a
+// decision deterministic (a product that must replay a rule decision as
+// deterministic re-runs its rules, ai/decision/rules), and a policy-less chain
+// knows only its floor: a decision that a stricter policy refused in the live chain
+// (an engine built with compose.WithPolicy(DurablePolicy) inside a policy-less
+// chain with KeepNonSelected) would pass that floor. So the safer rule applies: a
+// refusal recorded in Outcome (uncertain, none, unscored, invalid) is kept, never
+// upgraded: Rejudge returns the decision with that outcome, not actionable. To
+// re-judge a stored refusal under another policy, clear its Outcome first. Rejudge
+// with the chain that carries the policy that should apply (its Policy, not the
+// floor) whenever the decision was judged under one. The taxonomy validates the
+// decision, as Request.Taxonomy does for a provider's answer.
+//
+// A decision that is not actionable is returned with the outcome its judge gave it
+// (OutcomeInvalid for one that fails validation or the policy's range checks, the
+// policy's own refusal under a Policy, the stored refusal) and ok=false; one the
+// policy-less floor or the side-effect gate refused has an empty Outcome, because
+// no policy outcome describes it.
+func (c Chain) Rejudge(d Decision, taxonomy Taxonomy) (Decision, bool) {
+	d.deterministic = false // a decision is deterministic only in the process that matched the rule
+	if stored := d.Outcome; stored != "" && !stored.Actionable() {
+		d.verdict, d.sealed = "", seal{}
+		return d.stamped(stored), false
+	}
+	d, _ = c.judge(d, Attempt{}, Request{Taxonomy: taxonomy}, c.minConfidence())
+	return d, d.Actionable()
+}
+
+// sideEffectUnsupported closes the hole a side-effectful interaction ("yes",
+// "cancel", "undo that") leaves in a policy-less chain: the module-optional
+// exemption of lowConfidence gives it no module or intent confidence to fail the
+// floor, so it would pass at confidence 0, and a remote engine's calibrated flag
+// is only a claim. Such a decision needs its own InteractionConfidence, above 0 and
+// at the larger of the floor and DurableMinConfidence, with or without a policy
+// (SelectionPolicy.EvaluateDecision applies the same gate); a calibrated claim
+// additionally needs InteractionScores that back it, else it counts as a
+// self-report (the bar above is then the whole gate). Deterministic decisions are
+// exact and unaffected. It returns why the decision is refused, "" when it is not.
+func sideEffectUnsupported(d Decision, minConf float64) string {
+	if d.deterministic || !SideEffectful(d.Interaction) {
+		return ""
+	}
+	pol := DurablePolicy()
+	pol.MinConfidence = max(pol.MinConfidence, minConf)
+	if reason := pol.interactionRefusal(d); reason != "" {
+		return fmt.Sprintf("interaction=%.2f (%s)", d.InteractionConfidence, reason)
+	}
+	return ""
 }
 
 // MergeReport returns the attempts to record for a TracedProvider: the engines

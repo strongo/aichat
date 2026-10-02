@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/strongo/aichat/ai/decision"
 	"github.com/strongo/aichat/ai/session"
@@ -103,14 +104,57 @@ type decidePlan struct {
 //
 // The Decision is Calibrated, carries Scores and the model id the API reported
 // (Decision.Model), and has NeedsLLM set: the model says which route to take, not
-// that the product can answer without a language model.
+// that the product can answer without a language model. Called directly, Decide
+// returns it UNJUDGED: its Outcome is empty and Decision.Actionable is false, whatever
+// the intent confidence, until a decision.Chain (or compose.WithPolicy) judges it
+// on its own intent. When it abstains, DecideTraced says why (Abstain* codes).
 func (c *Client) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
+	d, ok, _, err := c.DecideTraced(ctx, req)
+	return d, ok, err
+}
+
+// Abstention reason codes, recorded as the Detail of the abstained attempt (and so
+// in decision.Trace) when Decide abstains. They are fixed, non-sensitive strings:
+// never caller text, ids or probabilities. Counting them tells how often the model
+// is sure of the intent but not of the kind of turn, which is what a threshold
+// change should be measured against.
+const (
+	// AbstainIntentOther: the intent Choice answered "other": none of the taxonomy.
+	AbstainIntentOther = "intent_other"
+	// AbstainInteractionLowConfidence: the interaction Choice's confidence was
+	// below the policy's MinConfidence.
+	AbstainInteractionLowConfidence = "interaction_low_confidence"
+	// AbstainInteractionGap: the interaction's top option did not lead its
+	// runner-up by the policy's MinGap.
+	AbstainInteractionGap = "interaction_gap"
+	// AbstainInteractionBelowDurable: a side-effectful interaction (confirmation,
+	// rejection, correction, cancellation, undo) was selected by the policy but did
+	// not clear the stricter durable bar.
+	AbstainInteractionBelowDurable = "interaction_below_durable"
+)
+
+// DecideTraced implements decision.TracedProvider. It is Decide, plus: when the
+// provider abstains, the report carries one abstained attempt whose Detail is an
+// Abstain* reason code and whose Usage is what the call billed, so the
+// abstention rate and its cause can be measured and metered. A decided answer or
+// an error leaves the report without attempts, for the caller to record.
+func (c *Client) DecideTraced(ctx context.Context, req decision.Request) (decision.Decision, bool, decision.Report, error) {
+	start := time.Now()
+	rep := decision.Report{Engine: c.Name()}
 	plan := c.plan(req)
 	resp, err := c.Ask(ctx, AskRequest{State: decideState(req), Questions: plan.questions})
 	if err != nil {
-		return decision.Decision{}, false, err
+		return decision.Decision{}, false, rep, err
 	}
-	return c.fold(req, plan, resp)
+	rep.Model = resp.Model
+	d, ok, why, err := c.fold(req, plan, resp)
+	if !ok && err == nil {
+		rep.Attempts = []decision.Attempt{{
+			Provider: c.Name(), Outcome: decision.AttemptAbstained, Detail: why, Latency: time.Since(start),
+			Usage: &decision.Usage{InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens},
+		}}
+	}
+	return d, ok, rep, err
 }
 
 func (c *Client) plan(req decision.Request) decidePlan {
@@ -249,18 +293,20 @@ func decideState(req decision.Request) map[string]any {
 }
 
 // fold turns the API's answers into a Decision.
-func (c *Client) fold(req decision.Request, p decidePlan, resp *AskResponse) (decision.Decision, bool, error) {
+//
+// The string is, when it abstains, the reason code (Abstain*).
+func (c *Client) fold(req decision.Request, p decidePlan, resp *AskResponse) (decision.Decision, bool, string, error) {
 	pol := c.selection()
 	intent, err := choiceAnswer(resp, "intent")
 	if err != nil {
-		return decision.Decision{}, false, err
+		return decision.Decision{}, false, "", err
 	}
 	if intent.top == otherOption {
-		return decision.Decision{}, false, nil
+		return decision.Decision{}, false, AbstainIntentOther, nil
 	}
 	ref, known := p.options[intent.top]
 	if !known {
-		return decision.Decision{}, false, fmt.Errorf("%w: the intent answer is not one of the options", ErrBadResponse)
+		return decision.Decision{}, false, "", fmt.Errorf("%w: the intent answer is not one of the options", ErrBadResponse)
 	}
 	d := decision.Decision{
 		Module:      decision.Scored{Value: ref.module, Confidence: intent.confidence},
@@ -293,64 +339,63 @@ func (c *Client) fold(req decision.Request, p decidePlan, resp *AskResponse) (de
 	// Secondary choices are used only when the policy says "selected".
 	if p.entity {
 		if v, ok, err := selectedChoice(resp, "entity", noneOption, pol); err != nil {
-			return decision.Decision{}, false, err
+			return decision.Decision{}, false, "", err
 		} else if ok {
 			d.Reference = &decision.Reference{Kind: v}
 		}
 	}
 	if p.present {
 		if v, ok, err := selectedChoice(resp, "presentation", noneOption, pol); err != nil {
-			return decision.Decision{}, false, err
+			return decision.Decision{}, false, "", err
 		} else if ok {
 			d.Presentation = v
 		}
 	}
 	if p.interact {
-		it, conf, ok, err := selectedInteraction(resp, pol)
-		if err != nil || !ok {
-			return decision.Decision{}, false, err
+		it, conf, scores, why, err := selectedInteraction(resp, pol)
+		if err != nil || why != "" {
+			return decision.Decision{}, false, why, err
 		}
-		d.Interaction, d.InteractionConfidence = it, conf
+		d.Interaction, d.InteractionConfidence, d.InteractionScores = it, conf, scores
 	}
-	return d, true, nil
-}
-
-// sideEffectful lists the interactions that act on a pending or previous
-// action: when wrong they are a side effect (confirming, cancelling or undoing
-// something the user never meant), so they need the durable bar.
-var sideEffectful = map[decision.Interaction]bool{
-	decision.InteractionConfirmation: true,
-	decision.InteractionRejection:    true,
-	decision.InteractionCorrection:   true,
-	decision.InteractionCancellation: true,
-	decision.InteractionUndo:         true,
+	return d, true, "", nil
 }
 
 // selectedInteraction runs the interaction Choice through the selection policy.
-// It returns the interaction and its confidence when the policy selects it, and
-// ok=false (no error) when it does not. An answer outside the enum is
-// ErrBadResponse, whatever the policy says.
-func selectedInteraction(resp *AskResponse, pol decision.SelectionPolicy) (decision.Interaction, float64, bool, error) {
+// It returns the interaction, its confidence and the Choice's probabilities (the
+// Decision's InteractionScores, the evidence for a side-effectful interaction)
+// when the policy selects it, and
+// otherwise the abstention reason code (Abstain*, no error). An answer outside the
+// enum is ErrBadResponse, whatever the policy says. A side-effectful interaction
+// (decision.SideEffectful) must clear the stricter of the policy and
+// decision.DurablePolicy, because a wrong "yes" is a side effect.
+func selectedInteraction(resp *AskResponse, pol decision.SelectionPolicy) (decision.Interaction, float64, map[string]float64, string, error) {
 	v, err := choiceAnswer(resp, "interaction")
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, nil, "", err
 	}
 	if !slices.Contains(interactionOrder, decision.Interaction(v.top)) {
-		return "", 0, false, fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
+		return "", 0, nil, "", fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
 	}
 	ans := v.asAnswer("interaction")
 	sel := pol.Evaluate(ans)
 	if sel.Outcome != decision.OutcomeSelected {
-		return "", 0, false, nil
+		switch sel.Reason {
+		case decision.ReasonLowConfidence:
+			return "", 0, nil, AbstainInteractionLowConfidence, nil
+		case decision.ReasonNarrowGap:
+			return "", 0, nil, AbstainInteractionGap, nil
+		}
+		return "", 0, nil, "interaction_" + sel.Reason, nil
 	}
 	top := decision.Interaction(sel.Picks[0])
 	if !slices.Contains(interactionOrder, top) {
-		return "", 0, false, fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
+		return "", 0, nil, "", fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
 	}
-	if sideEffectful[top] && pol.AtLeast(decision.DurablePolicy()).Evaluate(ans).Outcome != decision.OutcomeSelected {
-		return "", 0, false, nil
+	if decision.SideEffectful(top) && pol.AtLeast(decision.DurablePolicy()).Evaluate(ans).Outcome != decision.OutcomeSelected {
+		return "", 0, nil, AbstainInteractionBelowDurable, nil
 	}
-	return top, v.confidence, true, nil
+	return top, v.confidence, v.probabilities, "", nil
 }
 
 type choiceView struct {

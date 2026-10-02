@@ -43,7 +43,9 @@ func newGatedResult(name string, d decision.Decision, ok bool, err error) *gated
 func uncertainDecision(intent string) decision.Decision {
 	d := answer(intent, 0.07)
 	d.Calibrated = true
-	d.Scores = map[string]float64{"m/i": 0.38, "m/j": 0.35, "x": 0.33}
+	// The decision's own option leads (0.38), but too narrowly and with too little
+	// confidence for any policy to select it.
+	d.Scores = map[string]float64{"m/" + intent: 0.38, "m/other": 0.35, "x": 0.33}
 	return d
 }
 

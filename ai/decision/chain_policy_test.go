@@ -70,19 +70,21 @@ func TestChain_KeepNonSelectedReturnsTheAnswerButItIsNotActionable(t *testing.T)
 }
 
 func TestDecision_Actionable(t *testing.T) {
-	want := map[Outcome]bool{"": true, OutcomeSelected: true, OutcomeSeveral: true, OutcomeAccepted: true,
-		OutcomeUnscored: false, OutcomeUncertain: false, OutcomeNone: false}
+	want := map[Outcome]bool{OutcomeSelected: true, OutcomeSeveral: true, OutcomeAccepted: true, OutcomeDeterministic: true, OutcomeFloor: true,
+		"": false, OutcomeUnscored: false, OutcomeUncertain: false, OutcomeNone: false, OutcomeInvalid: false, "Selected": false}
 	for outcome, w := range want {
-		if got := (Decision{Outcome: outcome}).Actionable(); got != w {
+		if got := (Decision{}).stamped(outcome).Actionable(); got != w {
 			t.Errorf("Decision %q: %v", outcome, got)
 		}
-		// One rule: a Selection with the same verdict agrees (the empty outcome
-		// is "no policy ran", which a Selection never is).
-		if outcome != "" {
-			if got := (Selection{Outcome: outcome}).Actionable(); got != w {
-				t.Errorf("Selection %q: %v", outcome, got)
-			}
+		// One rule: a Selection with the same verdict agrees.
+		if got := (Selection{Outcome: outcome}).Actionable(); got != w {
+			t.Errorf("Selection %q: %v", outcome, got)
 		}
+	}
+	// Nothing is actionable by omission: not the zero value, not a decision a
+	// provider returned with no verdict.
+	if (Decision{}).Actionable() || decided("calendar", "show", 1).Actionable() {
+		t.Fatal("an unjudged decision must not be actionable")
 	}
 }
 
@@ -164,8 +166,7 @@ func TestChain_PolicyDoesNotThresholdUncalibratedScores(t *testing.T) {
 // with a policy) is honoured even by a chain without a policy.
 func TestChain_NoPolicyHonoursAProvidersExplicitNonActionableVerdict(t *testing.T) {
 	for _, o := range []Outcome{OutcomeUncertain, OutcomeNone, OutcomeUnscored} {
-		d := decided("calendar", "show", 0.95)
-		d.Outcome = o
+		d := decided("calendar", "show", 0.95).stamped(o)
 		if got, ok, tr := chainOf(nil, constProvider("e", d)).Decide(context.Background(), req()); ok || tr.Attempts[0].Outcome != AttemptUncertain || tr.Attempts[0].Detail != string(o) {
 			t.Fatalf("%s: ok=%v got=%+v tr=%+v", o, ok, got, tr)
 		}
@@ -174,10 +175,9 @@ func TestChain_NoPolicyHonoursAProvidersExplicitNonActionableVerdict(t *testing.
 			t.Fatalf("%s keep: ok=%v got=%+v tr=%+v", o, ok, got, tr)
 		}
 	}
-	// A selected verdict still passes the chain's own floor.
-	d := decided("calendar", "show", 0.95)
-	d.Outcome = OutcomeSelected
-	if got, ok, _ := chainOf(nil, constProvider("e", d)).Decide(context.Background(), req()); !ok || got.Outcome != OutcomeSelected {
+	// A policy-less chain always stamps its own floor verdict over a provider's positive one.
+	d := decided("calendar", "show", 0.95).stamped(OutcomeSelected)
+	if got, ok, _ := chainOf(nil, constProvider("e", d)).Decide(context.Background(), req()); !ok || got.Outcome != OutcomeFloor {
 		t.Fatalf("ok=%v got=%+v", ok, got)
 	}
 }

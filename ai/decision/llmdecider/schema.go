@@ -43,6 +43,7 @@ const decisionSchema = `{
       "type": "string",
       "enum": ["command", "question", "confirmation", "rejection", "correction", "continuation", "cancellation", "undo", "chat"]
     },
+    "interactionConfidence": {"type": "number", "minimum": 0, "maximum": 1},
     "reference": {
       "type": ["object", "null"],
       "additionalProperties": false,
@@ -71,7 +72,7 @@ const decisionSchema = `{
     "needsLLM": {"type": "boolean"},
     "presentation": {"type": ["string", "null"]}
   },
-  "required": ["module", "intent", "interaction", "reference", "requiredScopes", "requiredData", "slots", "canHandleDeterministically", "needsLLM", "presentation"]
+  "required": ["module", "intent", "interaction", "interactionConfidence", "reference", "requiredScopes", "requiredData", "slots", "canHandleDeterministically", "needsLLM", "presentation"]
 }`
 
 // scoreSchema is the WIRE JSON Schema of a Decider.Score answer: one entry per

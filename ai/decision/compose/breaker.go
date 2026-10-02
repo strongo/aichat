@@ -116,8 +116,8 @@ func WithBreakerOnChange(f func(engine string, from, to BreakerState)) BreakerOp
 // error, and a rate limit or overload. These do NOT count: a request the engine
 // rejected as invalid or an authentication failure (decision.ErrInvalidRequest,
 // decision.ErrAuth: the caller's fault, which must not take a healthy engine out
-// of service for everyone), an exhausted allowance (decision.ErrQuota), a
-// misconfigured endpoint (decision.ErrMisconfigured), an unsupported operation,
+// of service for everyone), an exhausted allowance (decision.ErrQuota) or a spent
+// budget (decision.ErrBudget), a misconfigured endpoint (decision.ErrMisconfigured), an unsupported operation,
 // an abstention, an invalid answer, and a cancellation by the caller or by a race
 // winner.
 //
@@ -156,8 +156,10 @@ type Breaker struct {
 }
 
 var (
-	_ decision.Provider       = (*Breaker)(nil)
-	_ decision.ScoredProvider = (*Breaker)(nil)
+	_ decision.Provider              = (*Breaker)(nil)
+	_ decision.TracedProvider        = (*Breaker)(nil)
+	_ decision.ScoredProvider        = (*Breaker)(nil)
+	_ decision.DeterministicProvider = (*Breaker)(nil)
 )
 
 // BreakerStats is a breaker's running tally.
@@ -191,6 +193,10 @@ func NewBreaker(p decision.Provider, opts ...BreakerOption) *Breaker {
 
 // Name is the wrapped engine's name: the breaker is transparent in traces.
 func (b *Breaker) Name() string { return providerName(b.inner) }
+
+// IsDeterministic forwards decision.DeterministicProvider: a breaker around rules is
+// still deterministic.
+func (b *Breaker) IsDeterministic() bool { return allDeterministic(b.inner) }
 
 // DecisionTimeout passes through the wrapped engine's timeout, if it has one.
 func (b *Breaker) DecisionTimeout() time.Duration {
@@ -258,7 +264,7 @@ func judge(ctx context.Context, err error) verdict {
 	case err == nil:
 		return verdictSuccess
 	case errors.Is(err, decision.ErrUnsupported), errors.Is(err, decision.ErrInvalidRequest), errors.Is(err, decision.ErrAuth),
-		errors.Is(err, decision.ErrQuota), errors.Is(err, decision.ErrMisconfigured):
+		errors.Is(err, decision.ErrQuota), errors.Is(err, decision.ErrBudget), errors.Is(err, decision.ErrMisconfigured):
 		return verdictNeutral
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded):
 		return verdictFailure
@@ -358,20 +364,35 @@ func callBreaker[T any](b *Breaker, ctx context.Context, fn func(context.Context
 }
 
 type decideResult struct {
-	d  decision.Decision
-	ok bool
+	d   decision.Decision
+	ok  bool
+	rep decision.Report
 }
 
 // Decide implements decision.Provider.
 func (b *Breaker) Decide(ctx context.Context, req decision.Request) (decision.Decision, bool, error) {
+	d, ok, _, err := b.DecideTraced(ctx, req)
+	return d, ok, err
+}
+
+// DecideTraced implements decision.TracedProvider, transparently: when the wrapped
+// engine reports how it answered (a combinator, or an engine that explains an
+// abstention, as typesafe.Client does), the breaker passes that report on, so a
+// circuit breaker around an engine never hides its attempts from a Chain's trace.
+// For an engine that reports nothing the report is empty.
+func (b *Breaker) DecideTraced(ctx context.Context, req decision.Request) (decision.Decision, bool, decision.Report, error) {
 	if b.inner == nil {
-		return decision.Decision{}, false, fmt.Errorf("%s: %w", b.Name(), ErrNoEngine)
+		return decision.Decision{}, false, decision.Report{}, fmt.Errorf("%s: %w", b.Name(), ErrNoEngine)
 	}
 	r, err := callBreaker(b, ctx, func(ctx context.Context) (decideResult, error) {
+		if tp, ok := b.inner.(decision.TracedProvider); ok {
+			d, ok, rep, err := tp.DecideTraced(ctx, req)
+			return decideResult{d, ok, rep}, err
+		}
 		d, ok, err := b.inner.Decide(ctx, req)
-		return decideResult{d, ok}, err
+		return decideResult{d: d, ok: ok, rep: decision.Report{Engine: b.Name()}}, err
 	})
-	return r.d, r.ok, err
+	return r.d, r.ok, r.rep, err
 }
 
 // Score implements decision.ScoredProvider. A breaker with no engine returns

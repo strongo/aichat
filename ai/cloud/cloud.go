@@ -15,7 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/strongo/aichat/ai"
@@ -48,7 +48,25 @@ type Config struct {
 	// Token returns the bearer token for each request.
 	Token      func(context.Context) (string, error)
 	HTTPClient *http.Client
+	// CapabilityTTL is how long the client remembers that the server has no ai/score
+	// route (decision.ErrUnsupported) before it asks again: 0 means
+	// DefaultCapabilityTTL, a negative value means until ResetCapabilities. A finite
+	// TTL keeps one stray 404 during a rolling deploy from switching scoring off
+	// until restart.
+	CapabilityTTL time.Duration
+	// MisconfiguredTTL is how long a "this base URL does not speak the protocol"
+	// verdict (decision.ErrMisconfigured) is remembered, so a wrong base URL costs
+	// one probe per TTL instead of two round trips per call, and stays loud: calls
+	// in the window fail at once with the same error. 0 means
+	// DefaultMisconfiguredTTL, a negative value means do not remember it.
+	MisconfiguredTTL time.Duration
 }
+
+// Defaults of Config.CapabilityTTL and Config.MisconfiguredTTL.
+const (
+	DefaultCapabilityTTL    = 5 * time.Minute
+	DefaultMisconfiguredTTL = 30 * time.Second
+)
 
 // Client implements ai.LLMProvider (Name "cloud"). Its decision.Provider
 // role is a SEPARATE value returned by Decider() (Name "cloud-decision"):
@@ -57,16 +75,88 @@ type Config struct {
 // that split is actually satisfied.
 type Client struct {
 	cfg Config
-	// scoreAbsent is set once the server is confirmed to have no ai/score route
-	// (see ResetCapabilities).
-	scoreAbsent atomic.Bool
+	now func() time.Time // time.Now; tests replace it
+
+	mu sync.Mutex // guards what follows
+	// absent is set once the server is confirmed to have no ai/score route, until
+	// absentUntil (the zero time: until ResetCapabilities).
+	absent      bool
+	absentUntil time.Time
+	// misconfigured is the remembered "wrong base URL" error, until misconfUntil.
+	misconfigured error
+	misconfUntil  time.Time
+	// probe is the GET ai/usage call in flight, shared by concurrent callers.
+	probe *probeCall
 }
 
-// ResetCapabilities forgets what the client learned about the server: today, that
-// it has no ai/score route. Scoring against an old server is remembered for the
-// client's lifetime so the route is not probed on every call; call this after the
-// server was upgraded (or after fixing a base URL) to probe again.
-func (c *Client) ResetCapabilities() { c.scoreAbsent.Store(false) }
+// probeCall is one shared GET ai/usage probe: its callers wait on done.
+type probeCall struct {
+	done     chan struct{}
+	err      error // the verdict every caller of the probe returns
+	canceled bool  // the leader's own context ended, so followers may retry
+}
+
+// ResetCapabilities forgets what the client learned about the server: that it
+// has no ai/score route, and that its base URL does not speak the protocol.
+// Both verdicts expire on their own (Config.CapabilityTTL,
+// Config.MisconfiguredTTL); call this after the server was upgraded or a base URL
+// fixed to probe again at once.
+func (c *Client) ResetCapabilities() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.absent, c.absentUntil, c.misconfigured, c.misconfUntil = false, time.Time{}, nil, time.Time{}
+}
+
+// verdict returns the remembered, still valid verdict about the server (the
+// error a score call fails with at once), nil when there is none.
+func (c *Client) verdict() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.verdictLocked()
+}
+
+func (c *Client) verdictLocked() error {
+	now := c.now()
+	if c.absent {
+		if c.absentUntil.IsZero() || now.Before(c.absentUntil) {
+			return errScoreAbsent()
+		}
+		c.absent = false
+	}
+	if c.misconfigured != nil {
+		if now.Before(c.misconfUntil) {
+			return c.misconfigured
+		}
+		c.misconfigured = nil
+	}
+	return nil
+}
+
+func (c *Client) rememberAbsent() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rememberAbsentLocked()
+}
+
+func (c *Client) rememberAbsentLocked() {
+	c.absent, c.absentUntil = true, time.Time{}
+	switch ttl := c.cfg.CapabilityTTL; {
+	case ttl == 0:
+		c.absentUntil = c.now().Add(DefaultCapabilityTTL)
+	case ttl > 0:
+		c.absentUntil = c.now().Add(ttl)
+	}
+}
+
+func (c *Client) rememberMisconfiguredLocked(err error) {
+	ttl := c.cfg.MisconfiguredTTL
+	if ttl == 0 {
+		ttl = DefaultMisconfiguredTTL
+	}
+	if ttl > 0 {
+		c.misconfigured, c.misconfUntil = err, c.now().Add(ttl)
+	}
+}
 
 type interactionIDKey struct{}
 
@@ -91,7 +181,7 @@ func New(cfg Config) *Client {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = http.DefaultClient
 	}
-	return &Client{cfg: cfg}
+	return &Client{cfg: cfg, now: time.Now}
 }
 
 // Name implements ai.LLMProvider.
@@ -261,7 +351,24 @@ func (c *Client) decide(ctx context.Context, req decision.Request) (decision.Dec
 	if !dr.Decided {
 		return decision.Decision{}, false, nil
 	}
-	return dr.Decision, true, nil
+	return remoteDecision(dr.Decision), true, nil
+}
+
+// remoteDecision is what a server's decision is trusted for. A server cannot
+// make a decision deterministic or actionable: those live in unexported fields no
+// JSON can set (decision.Deterministic, the stamped verdict), and the "outcome" in
+// the body is not trusted either way. It is cleared, so a trace never shows a
+// verdict nobody here reached: a server refusal (an "uncertain" with calibrated
+// scores) is advisory input, and the caller's own Chain or engine policy judges
+// the answer (decision.Chain, compose.WithPolicy, decision.Chain.Rejudge). A server
+// that wants a calibrated answer treated as one says Calibrated (with Scores, and
+// InteractionScores for a side-effectful interaction); one that answers by exact
+// rules is, for this client, a self-reported engine, and the product keeps its own
+// rules in front of it (ai/decision/rules) when it needs a deterministic class.
+// Protocol version 1 has no wire form for "deterministic".
+func remoteDecision(d decision.Decision) decision.Decision {
+	d.Outcome = ""
+	return d
 }
 
 // engineError is an error from a decision route (ai/decision, ai/score): the
@@ -380,8 +487,8 @@ func (c *Client) score(ctx context.Context, req decision.ScoreRequest) (decision
 		// Not %w of err: only its sentinel, the ids are the caller's.
 		return decision.ScoreResult{}, decision.Report{}, fmt.Errorf("cloud: %w: the score request failed validation", decision.ErrInvalidRequest)
 	}
-	if c.scoreAbsent.Load() {
-		return decision.ScoreResult{}, decision.Report{}, errScoreAbsent()
+	if err := c.verdict(); err != nil {
+		return decision.ScoreResult{}, decision.Report{}, err
 	}
 	if req.Product == "" {
 		req.Product = c.cfg.Product
@@ -445,24 +552,13 @@ func errScoreAbsent() error {
 func (c *Client) scoreRouteAbsent(ctx context.Context, status int, body []byte) error {
 	switch status {
 	case http.StatusNotImplemented:
-		c.scoreAbsent.Store(true)
+		c.rememberAbsent()
 		return errScoreAbsent()
 	case http.StatusNotFound, http.StatusMethodNotAllowed:
 		if isProtocolError(body) {
 			return nil
 		}
-		speaks, err := c.speaksProtocol(ctx)
-		if err != nil {
-			return err
-		}
-		if speaks {
-			c.scoreAbsent.Store(true)
-			return errScoreAbsent()
-		}
-		return &engineError{
-			err:  &ai.Error{Code: ai.ErrCodeInvalid, Message: fmt.Sprintf("cloud: %s answered HTTP %d and %s does not answer in the protocol either: the base URL is wrong", cloudproto.PathScore, status, cloudproto.PathUsage)},
-			kind: decision.ErrMisconfigured,
-		}
+		return c.routeVerdict(ctx, status)
 	}
 	return nil
 }
@@ -473,12 +569,76 @@ func isProtocolError(body []byte) bool {
 	return json.Unmarshal(body, &er) == nil && er.Error.Code != ""
 }
 
-// speaksProtocol asks GET ai/usage whether the base URL speaks the protocol: a 2xx
-// JSON object, or any status with a protocol ErrorResponse (a 401 included),
-// says yes; a 404 or other non-protocol answer says no. A transport failure, a
-// 429 or a 5xx without a protocol body is inconclusive and returned as an error
-// (an engine fault, nothing remembered).
-func (c *Client) speaksProtocol(ctx context.Context) (bool, error) {
+// routeVerdict settles an ambiguous 404/405 from ai/score by asking GET ai/usage
+// whether the base URL speaks the protocol, and returns the error the score call
+// fails with: decision.ErrUnsupported when it does (the server only lacks ai/score;
+// remembered for Config.CapabilityTTL), decision.ErrMisconfigured when it does not
+// (the base URL is wrong; remembered for Config.MisconfiguredTTL), and an engine
+// fault when the probe was inconclusive (a transport failure, a 429 or a 5xx
+// without a protocol body; nothing remembered). A remembered verdict answers at
+// once.
+//
+// Concurrent callers share ONE probe: the first is the leader, the others wait for
+// its verdict, which it records atomically with finishing, so no caller can start a
+// second probe for a question already answered. A follower whose leader was
+// cancelled by the leader's own context probes again rather than inherit that
+// cancellation.
+func (c *Client) routeVerdict(ctx context.Context, status int) error {
+	for {
+		c.mu.Lock()
+		if err := c.verdictLocked(); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		if call := c.probe; call != nil {
+			c.mu.Unlock()
+			select {
+			case <-call.done:
+			case <-ctx.Done():
+				return &ai.Error{Code: ai.ErrCodeCanceled, Message: ctx.Err().Error()}
+			}
+			if call.canceled && ctx.Err() == nil {
+				continue
+			}
+			return call.err
+		}
+		call := &probeCall{done: make(chan struct{})}
+		c.probe = call
+		c.mu.Unlock()
+
+		speaks, err := c.probeUsage(ctx)
+		call.canceled = ctx.Err() != nil
+		call.err = err
+		if err == nil && !speaks {
+			call.err = &engineError{
+				err:  &ai.Error{Code: ai.ErrCodeInvalid, Message: fmt.Sprintf("cloud: %s answered HTTP %d and %s does not answer in the protocol either: the base URL is wrong", cloudproto.PathScore, status, cloudproto.PathUsage)},
+				kind: decision.ErrMisconfigured,
+			}
+		}
+		c.mu.Lock()
+		c.probe = nil
+		switch {
+		case err != nil:
+		case speaks:
+			call.err = errScoreAbsent()
+			c.rememberAbsentLocked()
+		default:
+			c.rememberMisconfiguredLocked(call.err)
+		}
+		c.mu.Unlock()
+		close(call.done)
+		return call.err
+	}
+}
+
+// probeUsage is one GET ai/usage: whether it shows the base URL speaks the protocol:
+// a 2xx JSON object of the shape of cloudproto.UsageResponse (a "product" string,
+// and an "allowance" that is an object or null when present: any other JSON object,
+// such as a catch-all 200 from a web host or a proxy, does not count), or any status
+// with a protocol ErrorResponse (a 401 included), says yes; a 404 or other
+// non-protocol answer says no. A transport failure, a 429 or a 5xx without a
+// protocol body is inconclusive and returned as an error.
+func (c *Client) probeUsage(ctx context.Context) (bool, error) {
 	httpReq, err := c.newRequestMethod(ctx, http.MethodGet, cloudproto.PathUsage, nil)
 	if err != nil {
 		return false, c.engineErr(err)
@@ -495,8 +655,7 @@ func (c *Client) speaksProtocol(ctx context.Context) (bool, error) {
 	body, _ := io.ReadAll(io.LimitReader(r.Body, maxErrorBodyBytes))
 	switch {
 	case r.StatusCode >= 200 && r.StatusCode < 300:
-		var obj map[string]json.RawMessage
-		return json.Unmarshal(body, &obj) == nil && obj != nil, nil
+		return isUsageResponse(body), nil
 	case isProtocolError(body):
 		return true, nil
 	case r.StatusCode == http.StatusTooManyRequests || r.StatusCode >= 500:
@@ -504,6 +663,27 @@ func (c *Client) speaksProtocol(ctx context.Context) (bool, error) {
 		return false, &engineError{err: aiErr, kind: engineKind(r.StatusCode, aiErr)}
 	}
 	return false, nil
+}
+
+// isUsageResponse reports whether body has the shape of cloudproto.UsageResponse:
+// a JSON object with a non-empty "product" string and, when "allowance" is
+// present, an object (or null).
+func isUsageResponse(body []byte) bool {
+	var obj struct {
+		Product   any             `json:"product"`
+		Allowance json.RawMessage `json:"allowance"`
+	}
+	if json.Unmarshal(body, &obj) != nil {
+		return false
+	}
+	if product, ok := obj.Product.(string); !ok || product == "" {
+		return false
+	}
+	if len(obj.Allowance) > 0 {
+		var al *ai.Allowance
+		return json.Unmarshal(obj.Allowance, &al) == nil
+	}
+	return true
 }
 
 // engineErr wraps a token-source failure (an auth *ai.Error) as an engineError.

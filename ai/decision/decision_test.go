@@ -338,8 +338,9 @@ func TestValidate_RequiredDataAgainstDataKinds(t *testing.T) {
 }
 
 func TestChain_ModuleOptionalDecisionAcceptedAtAnyConfidence(t *testing.T) {
+	// "Yes" from a rule: deterministic, so it needs no confidence of its own.
 	p1 := providerFunc{"p1", func(ctx context.Context, r Request) (Decision, bool, error) {
-		return Decision{Interaction: InteractionConfirmation}, true, nil
+		return Deterministic(Decision{Interaction: InteractionConfirmation}), true, nil
 	}}
 	c := Chain{Providers: []Provider{p1}}
 	d, ok, tr := c.Decide(context.Background(), req())

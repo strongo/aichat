@@ -238,6 +238,7 @@ func TestPolicy_EvaluateDecision(t *testing.T) {
 	}
 	// No Intent: the module's confidence is the one judged.
 	d.Intent = Scored{}
+	d.Scores = map[string]float64{"m": 0.9, "x": 0.1}
 	d.Module.Confidence = 0.1
 	if sel := p.EvaluateDecision(d); sel.Outcome != OutcomeUncertain || !strings.Contains(sel.Reason, "confidence") {
 		t.Fatalf("%+v", sel)
