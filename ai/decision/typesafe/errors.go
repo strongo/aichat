@@ -47,8 +47,13 @@ var (
 	// and opens for the Retry-After, a combinator may fail over. A product that
 	// needs a hard allowance stop (the anonymous demo) must enforce it on its own
 	// side, for example behind the cloud boundary, whose protocol does carry code
-	// "quota" (ai/cloud maps it to decision.ErrQuota); if TypeSafe documents a
-	// distinguishing error type, kindForStatus is the one place to map it.
+	// "quota" (ai/cloud maps it to decision.ErrQuota), and must cap a paid backup
+	// that follows this engine with compose.NewBudget (decision.ErrBudget), which is
+	// what bounds the bill when an exhausted account looks like a rate limit. A 402
+	// is not documented either (llms.txt and the SDK error classes, checked
+	// 2026-10), so it is not mapped to decision.ErrQuota: it is an unexpected
+	// status, a plain engine failure. If TypeSafe documents a distinguishing error
+	// type or status, kindForStatus is the one place to map it.
 	ErrRateLimited = errors.New("typesafe: rate limited")
 	// ErrOverloaded: the service is temporarily overloaded (HTTP 529).
 	ErrOverloaded = errors.New("typesafe: overloaded")

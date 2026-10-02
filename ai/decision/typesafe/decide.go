@@ -352,48 +352,50 @@ func (c *Client) fold(req decision.Request, p decidePlan, resp *AskResponse) (de
 		}
 	}
 	if p.interact {
-		it, conf, why, err := selectedInteraction(resp, pol)
+		it, conf, scores, why, err := selectedInteraction(resp, pol)
 		if err != nil || why != "" {
 			return decision.Decision{}, false, why, err
 		}
-		d.Interaction, d.InteractionConfidence = it, conf
+		d.Interaction, d.InteractionConfidence, d.InteractionScores = it, conf, scores
 	}
 	return d, true, "", nil
 }
 
 // selectedInteraction runs the interaction Choice through the selection policy.
-// It returns the interaction and its confidence when the policy selects it, and
+// It returns the interaction, its confidence and the Choice's probabilities (the
+// Decision's InteractionScores, the evidence for a side-effectful interaction)
+// when the policy selects it, and
 // otherwise the abstention reason code (Abstain*, no error). An answer outside the
 // enum is ErrBadResponse, whatever the policy says. A side-effectful interaction
 // (decision.SideEffectful) must clear the stricter of the policy and
 // decision.DurablePolicy, because a wrong "yes" is a side effect.
-func selectedInteraction(resp *AskResponse, pol decision.SelectionPolicy) (decision.Interaction, float64, string, error) {
+func selectedInteraction(resp *AskResponse, pol decision.SelectionPolicy) (decision.Interaction, float64, map[string]float64, string, error) {
 	v, err := choiceAnswer(resp, "interaction")
 	if err != nil {
-		return "", 0, "", err
+		return "", 0, nil, "", err
 	}
 	if !slices.Contains(interactionOrder, decision.Interaction(v.top)) {
-		return "", 0, "", fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
+		return "", 0, nil, "", fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
 	}
 	ans := v.asAnswer("interaction")
 	sel := pol.Evaluate(ans)
 	if sel.Outcome != decision.OutcomeSelected {
 		switch sel.Reason {
 		case decision.ReasonLowConfidence:
-			return "", 0, AbstainInteractionLowConfidence, nil
+			return "", 0, nil, AbstainInteractionLowConfidence, nil
 		case decision.ReasonNarrowGap:
-			return "", 0, AbstainInteractionGap, nil
+			return "", 0, nil, AbstainInteractionGap, nil
 		}
-		return "", 0, "interaction_" + sel.Reason, nil
+		return "", 0, nil, "interaction_" + sel.Reason, nil
 	}
 	top := decision.Interaction(sel.Picks[0])
 	if !slices.Contains(interactionOrder, top) {
-		return "", 0, "", fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
+		return "", 0, nil, "", fmt.Errorf("%w: the interaction answer is not one of the options", ErrBadResponse)
 	}
 	if decision.SideEffectful(top) && pol.AtLeast(decision.DurablePolicy()).Evaluate(ans).Outcome != decision.OutcomeSelected {
-		return "", 0, AbstainInteractionBelowDurable, nil
+		return "", 0, nil, AbstainInteractionBelowDurable, nil
 	}
-	return top, v.confidence, "", nil
+	return top, v.confidence, v.probabilities, "", nil
 }
 
 type choiceView struct {

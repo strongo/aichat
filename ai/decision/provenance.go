@@ -53,6 +53,10 @@ func (d Decision) Provenance() Provenance {
 // rule; a product's own deterministic provider (a lookup table, a command
 // parser) may do the same.
 //
+// A deterministic decision is a value in THIS process: marshalled and read back
+// (a stored row, a trace replay) it is self-reported and not actionable, because
+// the class and the verdict are in unexported fields. See Chain.Rejudge.
+//
 // A deterministic decision is still validated (Validate) by the chain, and a
 // Chain without a Policy still applies its MinConfidence floor to it, as the
 // caller's explicit bar.
@@ -61,6 +65,17 @@ func Deterministic(d Decision) Decision {
 	d.Calibrated = false
 	d.Scores = nil
 	d.Model = ""
-	d.Outcome = OutcomeDeterministic
-	return d
+	return d.stamped(OutcomeDeterministic)
+}
+
+// DeterministicProvider is implemented by a Provider that answers only by exact
+// logic (ai/decision/rules.Provider does). It lets configuration check the
+// order of a chain: a deterministic provider belongs BEFORE the engines, because a
+// chain that stops at an exhausted allowance or budget never reaches a provider
+// placed after it, and a rule behind a remote engine waits for that engine first
+// (see aiconfig.Build).
+type DeterministicProvider interface {
+	Provider
+	// IsDeterministic reports that every answer is declared with Deterministic.
+	IsDeterministic() bool
 }

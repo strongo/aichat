@@ -243,7 +243,7 @@ func (e *Engine) triggers(outcome string) bool {
 		return e.cfg.also&OnUncertain != 0
 	case decision.AttemptCancelled:
 		return false // the caller gave up: nothing to fail over to
-	case decision.AttemptQuota:
+	case decision.AttemptQuota, decision.AttemptBudget:
 		return e.cfg.also&OnQuota != 0
 	case decision.AttemptMisconfigured:
 		return false // a person must fix it; a backup would hide it
@@ -253,13 +253,13 @@ func (e *Engine) triggers(outcome string) bool {
 }
 
 // halts reports whether a leg that ended with outcome ends the whole call, in the
-// strategies that run legs concurrently (Hedged, Race): an exhausted allowance
-// (unless OnQuota chose to fail over) and a misconfigured endpoint. Without it a
+// strategies that run legs concurrently (Hedged, Race): an exhausted allowance or
+// spending cap (unless OnQuota chose to fail over) and a misconfigured endpoint. Without it a
 // backup that was already started, by the hedge timer or because a race starts
 // everyone, would answer and quietly take over the metered caller's traffic.
 func (e *Engine) halts(outcome string) bool {
 	switch outcome {
-	case decision.AttemptQuota:
+	case decision.AttemptQuota, decision.AttemptBudget:
 		return e.cfg.also&OnQuota == 0
 	case decision.AttemptMisconfigured:
 		return true
@@ -314,14 +314,16 @@ func (e *Engine) DecideTraced(ctx context.Context, req decision.Request) (decisi
 	if v, ok := out.value(); ok {
 		rep.Model = v.d.Model
 		if e.cfg.policy != nil {
-			// With a policy every answer carries its verdict, so a direct caller of
-			// the engine can tell an accepted answer from one that was only
-			// returned because an uncertain answer is an answer (Actionable).
-			v.d.Outcome = e.cfg.policy.EvaluateDecision(v.d).Outcome
+			// With a policy every answer carries its stamped verdict, so a direct caller
+			// of the engine can tell an accepted answer from one that was only
+			// returned because an uncertain answer is an answer (Actionable). Without
+			// one nothing judged the answer: its verdict stays whatever the provider
+			// behind it stamped (an inner engine's), never what a provider wrote.
+			v.d, _ = e.cfg.policy.JudgeDecision(v.d)
 		}
 		return v.d, true, rep, nil
 	}
-	if out.abstained() && !out.halted {
+	if out.abstained() && !out.halted && !out.refused(e) {
 		return decision.Decision{}, false, rep, nil
 	}
 	return decision.Decision{}, false, rep, out.failure(e)
@@ -487,17 +489,21 @@ func runLeg[T any](ctx context.Context, e *Engine, l leg[T], judge func(T) (stri
 // the leg's context: DeadlineExceeded when the leg timed out (or its parent's
 // deadline passed), another non-nil value when it was cancelled.
 func classify(err, cause error) (outcome, detail string) {
+	// The conditions that must stay loud come first: an engine error that joins
+	// several legs' errors must not have them hidden behind a quieter one.
 	switch {
+	case errors.Is(err, decision.ErrQuota):
+		return decision.AttemptQuota, err.Error()
+	case errors.Is(err, decision.ErrBudget):
+		return decision.AttemptBudget, err.Error()
+	case errors.Is(err, decision.ErrMisconfigured):
+		return decision.AttemptMisconfigured, err.Error()
 	case errors.Is(err, decision.ErrUnavailable):
 		return decision.AttemptUnavailable, err.Error()
 	case errors.Is(err, decision.ErrUnsupported):
 		return decision.AttemptUnsupported, err.Error()
 	case errors.Is(err, decision.ErrAuth):
 		return decision.AttemptAuth, err.Error()
-	case errors.Is(err, decision.ErrQuota):
-		return decision.AttemptQuota, err.Error()
-	case errors.Is(err, decision.ErrMisconfigured):
-		return decision.AttemptMisconfigured, err.Error()
 	case errors.Is(err, decision.ErrInvalidRequest):
 		return decision.AttemptRejected, err.Error()
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded):
@@ -560,6 +566,24 @@ func (o runOut[T]) value() (T, bool) {
 func (o runOut[T]) abstained() bool {
 	for _, r := range o.results {
 		if r.outcome == decision.AttemptAbstained {
+			return true
+		}
+	}
+	return false
+}
+
+// refused reports whether a started leg ended in a refusal this engine does not
+// absorb (see halts): an exhausted allowance or spending cap, or a misconfigured
+// endpoint. An abstention elsewhere in the call must not swallow it: a backup that
+// an abstention started (OnAbstain) and that was out of budget would otherwise read
+// as "nobody decided", which a product answers with its paid main-LLM path. A Hedged
+// primary that stands on its own abstention is not affected by its backup.
+func (o runOut[T]) refused(e *Engine) bool {
+	if o.primaryStands {
+		return false
+	}
+	for _, r := range o.results {
+		if e.halts(r.outcome) {
 			return true
 		}
 	}

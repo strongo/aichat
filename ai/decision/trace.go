@@ -45,6 +45,11 @@ const (
 	// not hand the call to a backup unless configured to (compose.OnQuota): a
 	// paid backup would silently take over a metered caller's traffic.
 	AttemptQuota = "quota"
+	// AttemptBudget: a spending cap the caller set on an engine (compose.NewBudget)
+	// is used up, so the engine was not called (ErrBudget). Like AttemptQuota it
+	// is neither a fault of the engine nor transient, and a chain stops at it by
+	// default instead of handing the call to the next, possibly paid, provider.
+	AttemptBudget = "budget"
 	// AttemptMisconfigured: the engine's endpoint answered in a way that means
 	// the CONFIGURATION is wrong (an unknown product, a base URL that does not
 	// speak the protocol; ErrMisconfigured). A person has to fix it, so it is
@@ -79,6 +84,15 @@ var (
 	// rate limit (429 "rate_limited") is NOT a quota: it is transient and counts
 	// as an engine-health failure.
 	ErrQuota = errors.New("decision: allowance exhausted")
+	// ErrBudget is matched by an error that says a spending cap the CALLER set on
+	// an engine is used up (compose.NewBudget): the engine was not called. It is the
+	// guard for the one case a provider's own errors cannot cover: an engine that
+	// answers a transient error (a rate limit it does not tell from a spent
+	// account) while a paid backup behind it takes every call. Like ErrQuota it is
+	// not the engine's fault (a breaker ignores it), not transient, and not handed
+	// to a backup unless compose.OnQuota says so; a Chain stops at it by default
+	// (Chain.StopOnQuota). It is recorded as AttemptBudget.
+	ErrBudget = errors.New("decision: budget exhausted")
 	// ErrMisconfigured is matched by an engine error that says the endpoint is
 	// configured wrongly (for example a base URL that does not speak the
 	// protocol, or an unknown product). A breaker ignores it and Fallback does

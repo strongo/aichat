@@ -27,7 +27,8 @@ import (
 // Decision.Actionable are true for a calibrated selection (selected, several),
 // an explicitly accepted uncalibrated decision (accepted), a deterministic
 // decision (deterministic) and a policy-less chain's floor acceptance (floor),
-// and for nothing else.
+// and for nothing else. Decision.Actionable additionally requires that this
+// package's judges stamped the verdict: it is not read from the wire.
 //
 // Use NarrowingPolicy or DurablePolicy, or build a value and Validate it. The
 // zero value is invalid (it would select everything): Validate rejects it, and
@@ -58,8 +59,8 @@ type SelectionPolicy struct {
 	MaxPicks int `json:"maxPicks,omitempty"`
 
 	// AcceptUncalibratedAt is the explicit opt-in to acting on an UNCALIBRATED
-	// decision (an LLM emulator's self-reported confidence, a deterministic
-	// rule): a Decision whose Module and Intent confidences are both at or above
+	// decision (an LLM emulator's self-reported confidence; a deterministic rule
+	// is NOT governed by it, see Deterministic): a Decision whose Module and Intent confidences are both at or above
 	// it is accepted (OutcomeAccepted, actionable); anything lower is unscored.
 	// 0 (the zero value) means never: an uncalibrated decision is then only a
 	// non-actionable proposal. It applies to decisions only; an uncalibrated
@@ -229,8 +230,8 @@ type Selection struct {
 	// outcome, or of a truncation: not_calibrated, no_scores, none_of_these,
 	// low_confidence, narrow_gap, nothing_above_floor, only_potential,
 	// truncated_to_max_picks, invalid_policy, accepted_uncalibrated, deterministic_rule,
-	// side_effect_uncalibrated, interaction_low_confidence, decision_not_scored,
-	// decision_not_top, bad_scores.
+	// side_effect_uncalibrated, interaction_low_confidence, interaction_narrow_gap,
+	// interaction_not_top, decision_not_scored, decision_not_top, bad_scores.
 	Reason string `json:"reason,omitempty"`
 }
 
@@ -271,6 +272,12 @@ const (
 	// ReasonInteractionLowConfidence: an opted-in uncalibrated side-effectful
 	// interaction whose InteractionConfidence is 0 (not reported) or below the bar.
 	ReasonInteractionLowConfidence = "interaction_low_confidence"
+	// ReasonInteractionNarrowGap: a calibrated side-effectful interaction whose
+	// InteractionScores lead the runner-up by less than the (durable) gap.
+	ReasonInteractionNarrowGap = "interaction_narrow_gap"
+	// ReasonInteractionNotTop: a calibrated side-effectful interaction whose own
+	// InteractionScores contradict it (OutcomeInvalid under a policy).
+	ReasonInteractionNotTop = "interaction_not_top"
 	// ReasonDecisionNotScored: a calibrated decision whose own module/intent is not
 	// among its Scores (OutcomeInvalid).
 	ReasonDecisionNotScored = "decision_not_scored"
@@ -413,14 +420,23 @@ func answerOf(d Decision) Answer {
 //     its Scores, or scores below another option, contradicts itself and is
 //     OutcomeInvalid (not actionable; reasons decision_not_scored,
 //     decision_not_top, bad_scores).
-//   - Any other decision (uncalibrated, or calibrated but without Scores) is
-//     OutcomeAccepted when AcceptUncalibratedAt is set and both its Module and
-//     Intent confidences reach it (the module confidence is exempt for a
-//     module-optional interaction, as in Chain), and OutcomeUnscored, which is not
-//     actionable, otherwise. A side-effectful interaction (SideEffectful) is further
-//     refused unless AcceptUncalibratedSideEffects opts in and its
-//     InteractionConfidence is above 0 and reaches the larger of
-//     AcceptUncalibratedAt and DurableMinConfidence.
+//   - A side-effectful interaction (SideEffectful) on a calibrated decision is
+//     further gated, because the calibrated flag of a remote engine is only a
+//     claim: InteractionScores must back it (the interaction is their top option,
+//     clear of the runner-up) AND InteractionConfidence must be above 0 and reach
+//     the larger of the policy's MinConfidence and DurableMinConfidence. A
+//     decision whose InteractionScores contradict its Interaction is OutcomeInvalid
+//     (interaction_not_top); one that falls short of the bar is OutcomeUncertain
+//     (interaction_low_confidence, interaction_narrow_gap). A calibrated claim with
+//     no InteractionScores counts as a self-report, below.
+//   - Any other decision (uncalibrated, calibrated but without Scores, or a
+//     calibrated side-effectful claim nothing backs) is OutcomeAccepted when
+//     AcceptUncalibratedAt is set and both its Module and Intent confidences reach
+//     it (the module confidence is exempt for a module-optional interaction, as in
+//     Chain), and OutcomeUnscored, which is not actionable, otherwise. A
+//     side-effectful interaction is further refused unless
+//     AcceptUncalibratedSideEffects opts in and its InteractionConfidence is above
+//     0 and reaches the larger of AcceptUncalibratedAt and DurableMinConfidence.
 //
 // An invalid policy selects nothing.
 func (p SelectionPolicy) EvaluateDecision(d Decision) Selection {
@@ -431,7 +447,20 @@ func (p SelectionPolicy) EvaluateDecision(d Decision) Selection {
 		return Selection{Outcome: OutcomeDeterministic, Reason: ReasonDeterministic, Picks: []string{decisionKey(d)}}
 	}
 	if d.Calibrated && len(d.Scores) > 0 {
-		return p.evaluateOwn(d)
+		sel := p.evaluateOwn(d)
+		if sel.Outcome != OutcomeSelected || !SideEffectful(d.Interaction) {
+			return sel
+		}
+		switch d.interactionBacking() {
+		case backingContradicted:
+			return Selection{Outcome: OutcomeInvalid, Reason: ReasonInteractionNotTop}
+		case backingScores:
+			if reason := p.interactionRefusal(d); reason != "" {
+				return Selection{Outcome: OutcomeUncertain, Reason: reason}
+			}
+			return sel
+		}
+		// Nothing backs the calibrated claim: it is only as strong as a self-report.
 	}
 	sel := Selection{Outcome: OutcomeUnscored, Reason: ReasonNotCalibrated}
 	if d.Calibrated {
@@ -447,6 +476,74 @@ func (p SelectionPolicy) EvaluateDecision(d Decision) Selection {
 	sel.Outcome, sel.Reason = OutcomeAccepted, ReasonAcceptedUncalibrated
 	sel.Picks = []string{decisionKey(d)}
 	return sel
+}
+
+// JudgeDecision is EvaluateDecision, plus the verdict stamped on the returned
+// decision: Decision.Outcome is set and Decision.Actionable reports it. It is the
+// judge Chain and compose.WithPolicy use, and the only way outside a Chain to make
+// a decision actionable: the policy has to accept it. A provider that returns a
+// decision never judges it itself; whatever Outcome it writes is ignored.
+func (p SelectionPolicy) JudgeDecision(d Decision) (Decision, Selection) {
+	sel := p.EvaluateDecision(d)
+	return d.stamped(sel.Outcome), sel
+}
+
+// interactionBacking says what stands behind a calibrated claim about a
+// side-effectful interaction.
+type interactionBacking int
+
+const (
+	// backingNone: no InteractionScores, or the decision is not calibrated (an
+	// uncalibrated engine's scores are proposals): the claim is a self-report.
+	backingNone interactionBacking = iota
+	// backingScores: calibrated, with InteractionScores that make Interaction their
+	// top option.
+	backingScores
+	// backingContradicted: calibrated, with InteractionScores in which another
+	// option beats Interaction, or that do not list it.
+	backingContradicted
+)
+
+func (d Decision) interactionBacking() interactionBacking {
+	if !d.Calibrated || len(d.InteractionScores) == 0 {
+		return backingNone
+	}
+	own, ok := d.InteractionScores[string(d.Interaction)]
+	if !ok {
+		return backingContradicted
+	}
+	for _, pr := range d.InteractionScores {
+		if pr > own {
+			return backingContradicted
+		}
+	}
+	return backingScores
+}
+
+// interactionRefusal is why a side-effectful decision's interaction is not
+// accepted at the policy's bar ("" when it is): InteractionConfidence above 0 and
+// at least the larger of MinConfidence and DurableMinConfidence; contradicting
+// InteractionScores; and, when InteractionScores back the claim, an interaction
+// that leads its runner-up by less than the larger of MinGap and DurableMinGap. A
+// policy-less Chain calls it with the durable policy raised to its floor. The
+// caller has already decided the interaction is side-effectful and the decision
+// is not deterministic.
+func (p SelectionPolicy) interactionRefusal(d Decision) string {
+	if bar := max(p.MinConfidence, DurableMinConfidence); d.InteractionConfidence <= 0 || d.InteractionConfidence < bar {
+		return ReasonInteractionLowConfidence
+	}
+	switch d.interactionBacking() {
+	case backingContradicted:
+		return ReasonInteractionNotTop
+	case backingScores:
+		gap, own := max(p.MinGap, DurableMinGap), d.InteractionScores[string(d.Interaction)]
+		for id, pr := range d.InteractionScores {
+			if id != string(d.Interaction) && own-pr < gap {
+				return ReasonInteractionNarrowGap
+			}
+		}
+	}
+	return ""
 }
 
 // uncalibratedRefusal is why an uncalibrated decision is not accepted ("" when it

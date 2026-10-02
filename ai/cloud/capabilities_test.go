@@ -318,13 +318,29 @@ func TestCloud_AServerCannotMakeADecisionDeterministicOrPreJudgeItActionable(t *
 			t.Fatalf("%s: durable acted on a server's claim: %+v", claim, got)
 		}
 	}
-	// A refusal from the server is kept (it only lowers what the caller does), and
-	// a calibrated answer keeps its flag.
-	if d := remote(t, `{`+remoteBase+`,"outcome":"uncertain"}`); d.Outcome != decision.OutcomeUncertain {
-		t.Fatalf("%+v", d)
+	// A refusal from the server is advisory input and is not kept: the local policy
+	// judges (see TestCloud_AServerRefusalIsAdvisoryAndTheLocalPolicyJudges), and a
+	// calibrated answer keeps its flag.
+	for _, o := range []string{"uncertain", "none", "unscored", "invalid"} {
+		if d := remote(t, `{`+remoteBase+`,"outcome":"`+o+`"}`); d.Outcome != "" || d.Actionable() {
+			t.Fatalf("%s: %+v", o, d)
+		}
 	}
 	if d := remote(t, `{`+remoteBase+`,"calibrated":true,"scores":{"m/i":0.97,"m/j":0.03}}`); d.Provenance() != decision.ProvenanceCalibrated || d.Outcome != "" {
 		t.Fatalf("%+v", d)
+	}
+}
+
+// m3: one rule. A server's "uncertain" over calibrated scores is advisory: under a
+// chain policy the local verdict stands (selected here), and the trace shows the
+// local verdict only.
+func TestCloud_AServerRefusalIsAdvisoryAndTheLocalPolicyJudges(t *testing.T) {
+	body := `{"decided":true,"decision":{` + remoteBase + `,"calibrated":true,"scores":{"m/i":0.97,"m/j":0.03},"outcome":"uncertain"}}`
+	c := decisionServer(t, body)
+	pol := decision.NarrowingPolicy()
+	got, ok, tr := decision.Chain{Providers: []decision.Provider{c.Decider()}, Policy: &pol}.Decide(context.Background(), decideReq())
+	if !ok || got.Outcome != decision.OutcomeSelected || !got.Actionable() || tr.Outcome != decision.OutcomeSelected {
+		t.Fatalf("ok=%v d=%+v tr=%+v", ok, got, tr)
 	}
 }
 
@@ -336,5 +352,32 @@ func TestCloud_ALateCallIsAnsweredByTheRecordedVerdict(t *testing.T) {
 	c.rememberAbsent()
 	if err := c.routeVerdict(context.Background(), 404); !errors.Is(err, decision.ErrUnsupported) || srv.count(cloudproto.PathUsage) != 0 {
 		t.Fatalf("err=%v usage=%d", err, srv.count(cloudproto.PathUsage))
+	}
+}
+
+// S1, the review probe: a server answers a module-less undo with calibrated:true,
+// no scores and no confidence. A chain, with or without a policy, must not hand
+// that to a client that would execute the undo; an interaction confidence with the
+// interaction's own scores is what a calibrated side-effectful claim needs.
+func TestCloud_ACalibratedClaimAloneNeverMakesASideEffectfulInteractionActionable(t *testing.T) {
+	dur, nar := decision.DurablePolicy(), decision.NarrowingPolicy()
+	chains := map[string]decision.Chain{"no policy": {}, "durable": {Policy: &dur}, "narrowing": {Policy: &nar}, "accept any": {MinConfidence: -1}}
+	for _, in := range []string{"undo", "confirmation", "rejection", "correction", "cancellation"} {
+		c := decisionServer(t, `{"decided":true,"decision":{"module":{"value":"","confidence":0},"intent":{"value":"","confidence":0},"interaction":"`+in+`","calibrated":true}}`)
+		for name, chain := range chains {
+			chain.Providers = []decision.Provider{c.Decider()}
+			if d, ok, tr := chain.Decide(context.Background(), decideReq()); ok || d.Actionable() {
+				t.Fatalf("%s %s: ok=%v %+v %+v", name, in, ok, d, tr)
+			}
+		}
+	}
+	// With the interaction's scores and a positive confidence the claim is backed.
+	body := `{"decided":true,"decision":{` + remoteBase + `,"interaction":"confirmation","interactionConfidence":0.96,` +
+		`"interactionScores":{"confirmation":0.96,"command":0.04},"calibrated":true,"scores":{"m/i":0.97,"m/j":0.03}}}`
+	body = strings.Replace(body, `,"interaction":"command"`, "", 1)
+	c := decisionServer(t, body)
+	got, ok, _ := decision.Chain{Providers: []decision.Provider{c.Decider()}, Policy: &nar}.Decide(context.Background(), decideReq())
+	if !ok || !got.Actionable() || got.Outcome != decision.OutcomeSelected {
+		t.Fatalf("ok=%v %+v", ok, got)
 	}
 }

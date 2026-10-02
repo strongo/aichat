@@ -40,6 +40,12 @@ func New(name string, rules ...Rule) *Provider {
 // Name implements decision.Provider.
 func (p *Provider) Name() string { return p.name }
 
+// IsDeterministic implements decision.DeterministicProvider: every answer is
+// declared deterministic, so aiconfig can insist that rules run before engines.
+func (p *Provider) IsDeterministic() bool { return true }
+
+var _ decision.DeterministicProvider = (*Provider)(nil)
+
 // DecisionTimeout implements the optional interface decision.Chain honours.
 func (p *Provider) DecisionTimeout() time.Duration { return decisionTimeout }
 

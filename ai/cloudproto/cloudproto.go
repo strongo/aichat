@@ -36,12 +36,18 @@
 // the engine out of service at least that long (capped at 10 minutes).
 //
 // A decision from ai/decision is a claim, not a verdict. The client trusts a
-// server's calibrated flag and scores, but never lets a response make a decision
-// actionable or deterministic: any actionable "outcome" in the body is dropped
-// (only a refusal such as "uncertain" is kept), and protocol version 1 has no wire
-// form for "deterministic" (that class is declared in-process by a rule table,
-// decision.Deterministic, through a field no JSON can set), so a server answer is
-// at most calibrated and otherwise self-reported. Unknown fields are ignored.
+// server's calibrated flag and scores for what they are, but never lets a response
+// make a decision actionable or deterministic: the "outcome" in the body is
+// ignored entirely (cleared), a server refusal such as "uncertain" included. It is
+// advisory input at most: the client's own chain policy judges the answer, so a
+// server "uncertain" over calibrated scores may still be selected locally. Protocol
+// version 1 has no wire form for "deterministic" (that class is declared
+// in-process by a rule table, decision.Deterministic, through a field no JSON can
+// set), so a server answer is at most calibrated and otherwise self-reported. For a
+// side-effectful interaction (confirmation, rejection, correction, cancellation,
+// undo) a calibrated flag counts only with "interactionScores" (the probabilities
+// of the interaction choice) and a positive "interactionConfidence"; without them
+// the answer is treated as a self-report. Unknown fields are ignored.
 //
 // GET ai/usage answers with a UsageResponse: a client takes a 2xx JSON object as
 // "this base URL speaks the protocol" only when it has that shape (a non-empty

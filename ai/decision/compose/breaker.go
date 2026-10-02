@@ -116,8 +116,8 @@ func WithBreakerOnChange(f func(engine string, from, to BreakerState)) BreakerOp
 // error, and a rate limit or overload. These do NOT count: a request the engine
 // rejected as invalid or an authentication failure (decision.ErrInvalidRequest,
 // decision.ErrAuth: the caller's fault, which must not take a healthy engine out
-// of service for everyone), an exhausted allowance (decision.ErrQuota), a
-// misconfigured endpoint (decision.ErrMisconfigured), an unsupported operation,
+// of service for everyone), an exhausted allowance (decision.ErrQuota) or a spent
+// budget (decision.ErrBudget), a misconfigured endpoint (decision.ErrMisconfigured), an unsupported operation,
 // an abstention, an invalid answer, and a cancellation by the caller or by a race
 // winner.
 //
@@ -259,7 +259,7 @@ func judge(ctx context.Context, err error) verdict {
 	case err == nil:
 		return verdictSuccess
 	case errors.Is(err, decision.ErrUnsupported), errors.Is(err, decision.ErrInvalidRequest), errors.Is(err, decision.ErrAuth),
-		errors.Is(err, decision.ErrQuota), errors.Is(err, decision.ErrMisconfigured):
+		errors.Is(err, decision.ErrQuota), errors.Is(err, decision.ErrBudget), errors.Is(err, decision.ErrMisconfigured):
 		return verdictNeutral
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded):
 		return verdictFailure

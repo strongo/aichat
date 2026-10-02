@@ -520,7 +520,7 @@ func TestProviders_ChainCarriesProvidersPolicyAndStopSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := p.Chain()
-	if len(c.Providers) != 1 || c.Policy == nil || c.Policy.Name != "narrowing" || c.StopOnQuota != decision.StopOff || c.StopOnMisconfigured != decision.StopOn {
+	if len(c.Providers) != 1 || c.Policy == nil || c.Policy.Name != "narrowing" || c.StopOnQuota != decision.FallThrough || c.StopOnMisconfigured != decision.StopChain {
 		t.Fatalf("%+v", c)
 	}
 }

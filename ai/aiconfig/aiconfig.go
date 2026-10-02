@@ -3,6 +3,18 @@
 // your own key, connecting directly to the provider, never via the cloud),
 // and which deciders run before/instead of the cloud's decision service.
 //
+// # Cost control for the decision chain
+//
+// A decision chain can bill a paid engine on every turn without anyone noticing:
+// TypeSafe's 429 cannot be told from an exhausted account, so a "fallback" engine
+// whose primary is a spent Jev account sends every call to its paid backup.
+// Decision.BackupBudget (compose.NewBudget) caps that backup per window, a spent
+// cap ends the chain loudly (Decision.StopOnQuota, default on), and a product MUST
+// then check decision.Trace.StoppedBy before escalating to its paid main LLM.
+// For anonymous or public traffic run the calibrated engine alone (no paid backup)
+// or with a budgeted backup. Rules (Deps.ExtraDecision) always run first, so a stop
+// at an engine never skips them.
+//
 // This package has no cloud endpoint of its own: the product supplies its
 // cloud boundary's base URL (Deps.CloudBaseURL, or Config.Cloud.BaseURL to
 // override it), and BYOK connects straight to the chosen provider.
@@ -10,9 +22,11 @@ package aiconfig
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
@@ -86,19 +100,41 @@ type Decision struct {
 	// (decision.SelectionPolicy.Validate): an invalid combination is a Build
 	// error. It needs Policy to name the base.
 	PolicyValues *PolicyValues `yaml:"policyValues" json:"policyValues"`
+	// BackupBudget caps how many calls the BACKUP engine (the second engine of
+	// strategy "fallback" or "hedged") may take per window; see BackupBudget.
+	// It closes a hole that no engine's own errors can: when the primary fails in a
+	// way that looks transient (a TypeSafe 429 is always treated as a rate limit, so
+	// an exhausted account looks like one), a fallback hands EVERY call to the
+	// backup, and a paid backup (an LLM decider) has no other bound. With a budget,
+	// the call after the cap fails with decision.ErrBudget and the chain stops
+	// (StopOnQuota), loudly. For anonymous or public traffic run the calibrated
+	// engine alone with no paid backup, or with a budgeted one. Unset: no cap.
+	BackupBudget *BackupBudget `yaml:"backupBudget" json:"backupBudget"`
 	// StopOnQuota (default true) makes the decision chain (Providers.Chain) stop,
 	// instead of calling the next provider, when a provider reports an exhausted
-	// allowance (decision.ErrQuota): allowance exhaustion must be loud and must not
-	// silently bill a paid provider behind it, which matters for any anonymous or
-	// metered demo. Set false to opt out, naming the decision; an engine
-	// strategy's fallbackOn "quota" is the narrower opt-in that fails over inside
-	// one engine. The decision.Trace says it stopped (StoppedBy, Err).
+	// allowance (decision.ErrQuota) or a spent budget (decision.ErrBudget):
+	// exhaustion must be loud and must not silently bill a paid provider behind it,
+	// which matters for any anonymous or metered demo. Set false to opt out, naming
+	// the decision. A stopped chain returns ok=false with Trace.StoppedBy and
+	// Trace.Err: the product MUST check StoppedBy before escalating to its paid main
+	// LLM. Combining it explicitly with fallbackOn "quota" (which fails over inside
+	// one engine instead) is a Build error: pick one. A stop skips every later
+	// provider, so rules (Deps.ExtraDecision) run first.
 	StopOnQuota *bool `yaml:"stopOnQuota" json:"stopOnQuota"`
 	// StopOnMisconfigured (default true) is the same for a misconfigured engine
 	// (decision.ErrMisconfigured: an unknown product, a base URL that does not speak
 	// the protocol): a person has to fix it, so it is never absorbed by the next
 	// provider.
 	StopOnMisconfigured *bool `yaml:"stopOnMisconfigured" json:"stopOnMisconfigured"`
+}
+
+// BackupBudget configures compose.NewBudget around the backup engine.
+type BackupBudget struct {
+	// MaxCalls is the most calls the backup may take per Per window; above 0.
+	MaxCalls int `yaml:"maxCalls" json:"maxCalls"`
+	// Per is the window as a Go duration such as "1h". Empty or "0": the cap never
+	// resets for the life of the process.
+	Per string `yaml:"per" json:"per"`
 }
 
 // PolicyValues are optional numeric overrides of a named selection policy; see
@@ -156,6 +192,10 @@ type Config struct {
 	Decision Decision `yaml:"decision" json:"decision"`
 	BYOK     BYOK     `yaml:"byok" json:"byok"`
 	Cloud    Cloud    `yaml:"cloud" json:"cloud"`
+
+	// envErrs are environment values ApplyEnv could not read (a malformed boolean
+	// or number); Build reports them, so a typo in a stop switch is loud.
+	envErrs []error
 }
 
 // Default BYOK endpoints, used when BYOK.Endpoint is empty. Not cloud
@@ -191,6 +231,14 @@ const (
 	EnvDecisionStrategy   = "AI_DECISION_STRATEGY"
 	EnvDecisionHedgeAfter = "AI_DECISION_HEDGE_AFTER"
 	EnvDecisionPolicy     = "AI_DECISION_POLICY"
+	// EnvDecisionStopOnQuota and EnvDecisionStopOnMisconfigured are booleans
+	// ("true"/"false"); anything else is a Build error.
+	EnvDecisionStopOnQuota         = "AI_DECISION_STOP_ON_QUOTA"
+	EnvDecisionStopOnMisconfigured = "AI_DECISION_STOP_ON_MISCONFIGURED"
+	// EnvDecisionBackupBudgetMaxCalls (an integer) and EnvDecisionBackupBudgetPer (a
+	// Go duration) set Decision.BackupBudget; either alone creates it.
+	EnvDecisionBackupBudgetMaxCalls = "AI_DECISION_BACKUP_BUDGET_MAX_CALLS"
+	EnvDecisionBackupBudgetPer      = "AI_DECISION_BACKUP_BUDGET_PER"
 )
 
 func defaults() Config {
@@ -255,6 +303,7 @@ func (c *Config) ApplyEnv(getenv func(string) string, prefix string) {
 	if v := get(EnvDecisionPolicy); v != "" {
 		c.Decision.Policy = v
 	}
+	c.applyStopAndBudgetEnv(get)
 	if v := get(EnvBYOKProtocol); v != "" {
 		c.BYOK.Protocol = v
 	}
@@ -269,6 +318,42 @@ func (c *Config) ApplyEnv(getenv func(string) string, prefix string) {
 	}
 	if v := get(EnvCloudBaseURL); v != "" {
 		c.Cloud.BaseURL = v
+	}
+}
+
+// applyStopAndBudgetEnv reads the stop switches and the backup budget. A value it
+// cannot parse is remembered for Build to report and leaves the field alone.
+func (c *Config) applyStopAndBudgetEnv(get func(string) string) {
+	boolEnv := func(name string, dst **bool) {
+		v := get(name)
+		if v == "" {
+			return
+		}
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			c.envErrs = append(c.envErrs, fmt.Errorf("aiconfig: %s=%q is not a boolean", name, v))
+			return
+		}
+		*dst = &b
+	}
+	boolEnv(EnvDecisionStopOnQuota, &c.Decision.StopOnQuota)
+	boolEnv(EnvDecisionStopOnMisconfigured, &c.Decision.StopOnMisconfigured)
+	budget := func() *BackupBudget {
+		if c.Decision.BackupBudget == nil {
+			c.Decision.BackupBudget = &BackupBudget{}
+		}
+		return c.Decision.BackupBudget
+	}
+	if v := get(EnvDecisionBackupBudgetMaxCalls); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			c.envErrs = append(c.envErrs, fmt.Errorf("aiconfig: %s=%q is not an integer", EnvDecisionBackupBudgetMaxCalls, v))
+		} else {
+			budget().MaxCalls = n
+		}
+	}
+	if v := get(EnvDecisionBackupBudgetPer); v != "" {
+		budget().Per = v
 	}
 }
 
@@ -336,15 +421,18 @@ type Providers struct {
 	Policy *decision.SelectionPolicy
 	// StopOnQuota and StopOnMisconfigured are Config.Decision.StopOnQuota and
 	// StopOnMisconfigured as the decision.Chain settings (zero: stop).
-	StopOnQuota, StopOnMisconfigured decision.Stop
+	StopOnQuota, StopOnMisconfigured decision.StopPolicy
 }
 
 // Chain is the decision chain Build configured: Decision in order, the Policy,
 // and the stop settings. The product's own rules (Deps.ExtraDecision) come first
 // and are deterministic: under any Policy, including "durable", a rule match is
 // accepted (decision.OutcomeDeterministic) and the engines behind it are not
-// called. MinConfidence, Timeout and KeepNonSelected keep their defaults; set
-// them on the returned value.
+// called. They must stay first: a chain that stops at an exhausted allowance or
+// budget never reaches a provider placed after the one that stopped it. The
+// result of Decide with ok=false is NOT always "nobody decided": check
+// Trace.StoppedBy before escalating to a paid main LLM. MinConfidence, Timeout and
+// KeepNonSelected keep their defaults; set them on the returned value.
 func (p Providers) Chain() decision.Chain {
 	return decision.Chain{Providers: p.Decision, Policy: p.Policy, StopOnQuota: p.StopOnQuota, StopOnMisconfigured: p.StopOnMisconfigured}
 }
@@ -361,8 +449,12 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 	if deps.HTTPClient == nil {
 		deps.HTTPClient = http.DefaultClient
 	}
+	cfg.envErrs = nil
 	cfg.ApplyEnv(deps.Getenv, deps.EnvPrefix)
 	fillDefaults(&cfg)
+	if err := errors.Join(cfg.envErrs...); err != nil {
+		return Providers{}, err
+	}
 
 	switch cfg.Decision.Provider {
 	case "", "auto", "cloud", "disabled":
@@ -432,6 +524,9 @@ func Build(cfg Config, deps Deps) (Providers, error) {
 	out.Decision = append(out.Decision, deps.ExtraDecision...)
 
 	if out.Policy, err = policyFromConfig(cfg.Decision); err != nil {
+		return Providers{}, err
+	}
+	if err := checkStopConfig(cfg.Decision); err != nil {
 		return Providers{}, err
 	}
 	out.StopOnQuota, out.StopOnMisconfigured = stopFromConfig(cfg.Decision.StopOnQuota), stopFromConfig(cfg.Decision.StopOnMisconfigured)

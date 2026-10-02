@@ -89,6 +89,7 @@ func TestDecide_FullTaxonomyFoldsIntoADecision(t *testing.T) {
 		Intent:                decision.Scored{Value: "show", Confidence: 0.82},
 		Interaction:           decision.InteractionQuestion,
 		InteractionConfidence: 0.9,
+		InteractionScores:     map[string]float64{"question": 0.9, "command": 0.1},
 		Reference:             &decision.Reference{Kind: "happening"},
 		RequiredScopes:        []string{"calendar"},
 		RequiredData:          []string{"relevant_happenings"},
@@ -236,6 +237,18 @@ func TestDecide_SideEffectfulInteractionsNeedTheDurableBar(t *testing.T) {
 			dec, ok, err := newClient(t, &fakeDoer{body: high}).Decide(context.Background(), decideRequest())
 			if err != nil || !ok || dec.Interaction != top || dec.InteractionConfidence != 0.97 {
 				t.Fatalf("dec=%+v ok=%v err=%v", dec, ok, err)
+			}
+			// The interaction Choice's probabilities travel with it: they are the
+			// evidence the side-effect gate wants of a calibrated claim, so a policy
+			// accepts the engine's own answer.
+			if want := map[string]float64{string(top): 0.97, "command": 0.03}; !reflect.DeepEqual(dec.InteractionScores, want) {
+				t.Fatalf("interaction scores = %v", dec.InteractionScores)
+			}
+			if sel := decision.NarrowingPolicy().EvaluateDecision(dec); sel.Outcome != decision.OutcomeSelected {
+				t.Fatalf("%+v", sel)
+			}
+			if _, ok, _ := (decision.Chain{Providers: []decision.Provider{newClient(t, &fakeDoer{body: high})}}).Decide(context.Background(), decideRequest()); !ok {
+				t.Fatal("a policy-less chain must accept the engine's own backed answer")
 			}
 		})
 	}

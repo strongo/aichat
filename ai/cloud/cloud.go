@@ -355,20 +355,19 @@ func (c *Client) decide(ctx context.Context, req decision.Request) (decision.Dec
 }
 
 // remoteDecision is what a server's decision is trusted for. A server cannot
-// make a decision deterministic: that class lives in an unexported field no JSON
-// can set (decision.Deterministic), and an outcome of "deterministic" in the body
-// is not honoured. Nor can it pre-judge an answer actionable: the Outcome of a
-// remote decision is kept only when it is a refusal (uncertain, none, unscored,
-// invalid), which only ever lowers what a caller does; every actionable claim is
-// dropped, and the caller's own Chain or engine policy judges the answer. A server
-// that wants a calibrated answer treated as one says Calibrated (with Scores); one
-// that answers by exact rules is, for this client, a self-reported engine, and the
-// product keeps its own rules in front of it (ai/decision/rules) when it needs a
-// deterministic class. Protocol version 1 has no wire form for "deterministic".
+// make a decision deterministic or actionable: those live in unexported fields no
+// JSON can set (decision.Deterministic, the stamped verdict), and the "outcome" in
+// the body is not trusted either way. It is cleared, so a trace never shows a
+// verdict nobody here reached: a server refusal (an "uncertain" with calibrated
+// scores) is advisory input, and the caller's own Chain or engine policy judges
+// the answer (decision.Chain, compose.WithPolicy, decision.Chain.Rejudge). A server
+// that wants a calibrated answer treated as one says Calibrated (with Scores, and
+// InteractionScores for a side-effectful interaction); one that answers by exact
+// rules is, for this client, a self-reported engine, and the product keeps its own
+// rules in front of it (ai/decision/rules) when it needs a deterministic class.
+// Protocol version 1 has no wire form for "deterministic".
 func remoteDecision(d decision.Decision) decision.Decision {
-	if d.Outcome.Actionable() {
-		d.Outcome = ""
-	}
+	d.Outcome = ""
 	return d
 }
 

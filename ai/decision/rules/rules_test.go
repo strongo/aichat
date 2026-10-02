@@ -206,3 +206,10 @@ func TestProvider_MatchesAreDeterministicAndActionableUnderADurablePolicy(t *tes
 		t.Fatal("matched")
 	}
 }
+
+func TestProvider_IsDeterministic(t *testing.T) {
+	var p decision.DeterministicProvider = New("rules")
+	if !p.IsDeterministic() {
+		t.Fatal("a rule table is deterministic")
+	}
+}

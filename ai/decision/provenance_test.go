@@ -179,11 +179,11 @@ func TestChain_WithoutAPolicyStampsAnExplicitOutcome(t *testing.T) {
 	if _, ok, _ := (Chain{Providers: []Provider{llm(0.05)}}).Decide(context.Background(), req()); ok {
 		t.Fatal("below the floor")
 	}
-	// An engine's own actionable verdict (an engine built with a policy) is kept.
-	e := decided("calendar", "show", 0.9)
-	e.Outcome = OutcomeSelected
+	// An engine's own positive verdict (an engine built with a policy) is not kept:
+	// the chain judges, and stamps its floor.
+	e := decided("calendar", "show", 0.9).stamped(OutcomeSelected)
 	d, ok, _ = Chain{Providers: []Provider{&countingProvider{name: "jev", d: e, ok: true}}}.Decide(context.Background(), req())
-	if !ok || d.Outcome != OutcomeSelected {
+	if !ok || d.Outcome != OutcomeFloor || !d.Actionable() {
 		t.Fatalf("ok=%v d=%+v", ok, d)
 	}
 	// A deterministic answer says so.
@@ -303,31 +303,40 @@ func TestChain_CalibratedAbstentionDoesNotFallToAWeakerGate(t *testing.T) {
 	}
 	for name, c := range map[string]Chain{"floor": {}, "accept any": {MinConfidence: -1}} {
 		c.Providers = []Provider{yes}
-		if _, ok, tr := c.Decide(context.Background(), req()); ok || tr.Attempts[0].Outcome != AttemptLowConfidence || tr.Attempts[0].Detail != "interaction=0.00" {
+		if _, ok, tr := c.Decide(context.Background(), req()); ok || tr.Attempts[0].Outcome != AttemptLowConfidence || tr.Attempts[0].Detail != "interaction=0.00 (interaction_low_confidence)" {
 			t.Fatalf("%s: ok=%v tr=%+v", name, ok, tr)
 		}
 	}
-	// With an interaction confidence at the floor it is accepted, below it not.
-	for ic, want := range map[float64]bool{0.8: true, 0.5: false} {
+	// The bar is the durable one (0.90) whatever the floor: 0.95 passes, 0.8 does not.
+	for ic, want := range map[float64]bool{0.95: true, 0.9: true, 0.8: false, 0.5: false} {
 		d := Decision{Interaction: InteractionConfirmation, InteractionConfidence: ic}
 		got, ok, _ := Chain{Providers: []Provider{&countingProvider{name: "llm", d: d, ok: true}}}.Decide(context.Background(), req())
 		if ok != want || (ok && got.Outcome != OutcomeFloor) {
 			t.Fatalf("interaction %v: ok=%v %+v", ic, ok, got)
 		}
 	}
-	// Accept-any with a stated interaction confidence passes; calibrated and
-	// module-ful decisions are not subject to this gate.
+	// "Accept any" lifts the module/intent floor, never the side-effect bar.
 	d = Decision{Interaction: InteractionConfirmation, InteractionConfidence: 0.1}
+	if _, ok, _ := (Chain{Providers: []Provider{&countingProvider{name: "x", d: d, ok: true}}, MinConfidence: -1}).Decide(context.Background(), req()); ok {
+		t.Fatal("accept-any must not accept a side-effectful interaction at 0.1")
+	}
+	d.InteractionConfidence = 0.95
 	if _, ok, _ := (Chain{Providers: []Provider{&countingProvider{name: "x", d: d, ok: true}}, MinConfidence: -1}).Decide(context.Background(), req()); !ok {
-		t.Fatal("accept-any with an interaction confidence")
+		t.Fatal("accept-any with a confident interaction")
 	}
-	d = Decision{Interaction: InteractionConfirmation, Calibrated: true}
-	if _, ok, _ := (Chain{Providers: []Provider{&countingProvider{name: "x", d: d, ok: true}}}).Decide(context.Background(), req()); !ok {
-		t.Fatal("a calibrated decision is gated by its own engine")
+	// A floor above the durable bar raises it.
+	d.InteractionConfidence = 0.95
+	if _, ok, _ := (Chain{Providers: []Provider{&countingProvider{name: "x", d: d, ok: true}}, MinConfidence: 0.97}).Decide(context.Background(), req()); ok {
+		t.Fatal("a 0.97 floor applies to the interaction too")
 	}
+	// A module-ful side-effectful decision needs the interaction bar on top of its own.
 	d = uncalibrated(InteractionCancellation, "calendar", 0.9, 0)
+	if _, ok, _ := (Chain{Providers: []Provider{&countingProvider{name: "x", d: d, ok: true}}}).Decide(context.Background(), req()); ok {
+		t.Fatal("a module-ful cancellation at interaction confidence 0")
+	}
+	d = uncalibrated(InteractionCancellation, "calendar", 0.9, 0.95)
 	if _, ok, _ := (Chain{Providers: []Provider{&countingProvider{name: "x", d: d, ok: true}}}).Decide(context.Background(), req()); !ok {
-		t.Fatal("a module-ful decision keeps its module/intent bar")
+		t.Fatal("a module-ful cancellation at a confident interaction")
 	}
 }
 
@@ -427,7 +436,7 @@ func TestChain_StopsAtQuotaAndMisconfigurationByDefault(t *testing.T) {
 		{"misconfigured", errorsJoin(ErrMisconfigured), AttemptMisconfigured, ErrMisconfigured},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			for name, c := range map[string]Chain{"default": {}, "explicit on": {StopOnQuota: StopOn, StopOnMisconfigured: StopOn}} {
+			for name, c := range map[string]Chain{"default": {}, "explicit on": {StopOnQuota: StopChain, StopOnMisconfigured: StopChain}} {
 				paid := llm(0.9)
 				c.Providers = []Provider{&countingProvider{name: "jev", err: tc.err}, paid}
 				d, ok, tr := c.Decide(context.Background(), req())
@@ -445,17 +454,17 @@ func TestChain_StopsAtQuotaAndMisconfigurationByDefault(t *testing.T) {
 
 func errorsJoin(sentinel error) error { return errors.Join(errors.New("jev said so"), sentinel) }
 
-func TestChain_StopOffLetsTheNextProviderAnswerAndEachSwitchIsIndependent(t *testing.T) {
+func TestChain_FallThroughLetsTheNextProviderAnswerAndEachSwitchIsIndependent(t *testing.T) {
 	quota, mis := errorsJoin(ErrQuota), errorsJoin(ErrMisconfigured)
 	cases := []struct {
 		c       Chain
 		err     error
 		wantRun bool
 	}{
-		{Chain{StopOnQuota: StopOff}, quota, true},
-		{Chain{StopOnQuota: StopOff}, mis, false},
-		{Chain{StopOnMisconfigured: StopOff}, mis, true},
-		{Chain{StopOnMisconfigured: StopOff}, quota, false},
+		{Chain{StopOnQuota: FallThrough}, quota, true},
+		{Chain{StopOnQuota: FallThrough}, mis, false},
+		{Chain{StopOnMisconfigured: FallThrough}, mis, true},
+		{Chain{StopOnMisconfigured: FallThrough}, quota, false},
 	}
 	for i, tc := range cases {
 		paid := llm(0.9)
@@ -482,8 +491,8 @@ func TestTrace_Err(t *testing.T) {
 	if err := tr.Err(); !errors.Is(err, ErrMisconfigured) || !strings.Contains(err.Error(), "b") || !strings.Contains(err.Error(), "wrong base URL") {
 		t.Fatalf("%v", err)
 	}
-	var s Stop
-	if !s.on() || !StopOn.on() || StopOff.on() {
-		t.Fatal("the zero Stop is ON")
+	var s StopPolicy
+	if !s.stops() || !StopChain.stops() || FallThrough.stops() {
+		t.Fatal("the zero StopPolicy stops")
 	}
 }
