@@ -45,7 +45,7 @@ func TestCloudTerminalRefusalsNeverRetryOrFailOver(t *testing.T) {
 		kind   error
 	}{
 		{"model class", http.StatusForbidden, ai.ErrCodeInvalid, `{"v":1,"reason":"model_class"}`, decision.ErrPolicyRefusal},
-		{"question context", http.StatusConflict, ai.ErrCodeContextChanged, `{"v":1,"reason":"question_context_changed"}`, decision.ErrPolicyRefusal},
+		{"question context", http.StatusConflict, ai.ErrCodeContextChanged, "", decision.ErrPolicyRefusal},
 		{"quota", http.StatusTooManyRequests, ai.ErrCodeQuota, `{"v":1,"reason":"quota"}`, decision.ErrQuota},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -65,17 +65,20 @@ func TestCloudTerminalRefusalsNeverRetryOrFailOver(t *testing.T) {
 				}
 			}
 			var ae *ai.Error
-			if !errors.As(chatErr, &ae) || ae.IsRetryable() || string(ae.Details) != tc.limit || srv.count(cloudproto.PathChat) != 1 {
+			if !errors.As(chatErr, &ae) {
+				t.Fatalf("chat error has no *ai.Error: %v", chatErr)
+			}
+			if ae.IsRetryable() || string(ae.Details) != tc.limit || srv.count(cloudproto.PathChat) != 1 {
 				t.Fatalf("chat err=%v details=%s hits=%d", chatErr, ae.Details, srv.count(cloudproto.PathChat))
 			}
 			backup := newProtoServer(t, nil)
 			fallback := compose.Fallback(c.Decider(), backup.client().Decider())
 			_, _, rep, err := fallback.DecideTraced(context.Background(), decideReq())
-			if !errors.Is(err, tc.kind) || !errors.As(err, &ae) || string(ae.Details) != tc.limit || rep.FallbackFired || srv.count(cloudproto.PathDecision) != 1 || backup.count(cloudproto.PathDecision) != 0 {
+			if !errors.Is(err, tc.kind) || !errors.As(err, &ae) || ae == nil || string(ae.Details) != tc.limit || rep.FallbackFired || srv.count(cloudproto.PathDecision) != 1 || backup.count(cloudproto.PathDecision) != 0 {
 				t.Fatalf("decision err=%v rep=%+v hits=%d backup=%d", err, rep, srv.count(cloudproto.PathDecision), backup.count(cloudproto.PathDecision))
 			}
 			_, scoreRep, err := fallback.ScoreTraced(context.Background(), libraryScoreRequest())
-			if !errors.Is(err, tc.kind) || !errors.As(err, &ae) || string(ae.Details) != tc.limit || scoreRep.FallbackFired || srv.count(cloudproto.PathScore) != 1 || backup.count(cloudproto.PathScore) != 0 {
+			if !errors.Is(err, tc.kind) || !errors.As(err, &ae) || ae == nil || string(ae.Details) != tc.limit || scoreRep.FallbackFired || srv.count(cloudproto.PathScore) != 1 || backup.count(cloudproto.PathScore) != 0 {
 				t.Fatalf("score err=%v rep=%+v hits=%d backup=%d", err, scoreRep, srv.count(cloudproto.PathScore), backup.count(cloudproto.PathScore))
 			}
 			if tc.kind == decision.ErrPolicyRefusal {
