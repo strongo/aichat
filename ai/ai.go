@@ -325,12 +325,13 @@ type Allowance struct {
 
 // Error codes shared by all adapters and the cloud protocol.
 const (
-	ErrCodeAuth        = "auth"         // missing/invalid credentials
-	ErrCodeQuota       = "quota"        // allowance exhausted
-	ErrCodeRateLimited = "rate_limited" // retry later
-	ErrCodeUpstream    = "upstream"     // provider failure
-	ErrCodeInvalid     = "invalid"      // bad request
-	ErrCodeCanceled    = "canceled"
+	ErrCodeAuth           = "auth"         // missing/invalid credentials
+	ErrCodeQuota          = "quota"        // allowance exhausted
+	ErrCodeRateLimited    = "rate_limited" // retry later
+	ErrCodeUpstream       = "upstream"     // provider failure
+	ErrCodeInvalid        = "invalid"      // bad request
+	ErrCodeCanceled       = "canceled"
+	ErrCodeContextChanged = "question_context_changed" // a live question changed payer or product
 )
 
 // Error is a provider error normalised for display and fallback decisions.
@@ -344,6 +345,9 @@ type Error struct {
 	// in a JSON error body, whichever is longer. A circuit breaker keeps the
 	// engine out of service at least this long (see RetryDelay).
 	RetryAfterMs int64 `json:"retryAfterMs,omitempty"`
+	// Details preserves a protocol response's outer refusal metadata without
+	// imposing any consuming product's schema on this shared error type.
+	Details json.RawMessage `json:"-"`
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }

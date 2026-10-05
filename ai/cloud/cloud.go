@@ -42,6 +42,10 @@ type Config struct {
 	// and is sent as the X-AI-Product header and ai.ChatRequest.Product /
 	// decision.Request.Product.
 	Product string
+	// Account and Project are optional, server-verified payer hints. A client
+	// must create a separate Client for each immutable selection.
+	Account string
+	Project string
 	// ClientContext is included in both chat and decision requests unless
 	// the caller provides more specific context for a particular turn.
 	ClientContext *ai.ClientContext
@@ -402,10 +406,12 @@ func (e *engineError) IsRetryable() bool { return e.err.IsRetryable() && e.err.R
 // transient fault (rate limit, 5xx, transport).
 func engineKind(status int, e *ai.Error) error {
 	switch {
-	case e.Code == ai.ErrCodeAuth || status == http.StatusUnauthorized || status == http.StatusForbidden:
-		return decision.ErrAuth
 	case e.Code == ai.ErrCodeQuota:
 		return decision.ErrQuota
+	case e.Code == ai.ErrCodeContextChanged || (status == http.StatusForbidden && len(e.Details) > 0 && e.Code == ai.ErrCodeInvalid):
+		return decision.ErrInvalidRequest
+	case e.Code == ai.ErrCodeAuth || status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return decision.ErrAuth
 	case status == http.StatusNotFound || status == http.StatusMethodNotAllowed:
 		// Not "route not implemented" (score handles that before this): an unknown
 		// product, or a base URL that does not speak the protocol.
@@ -778,6 +784,12 @@ func (c *Client) newRequestMethod(ctx context.Context, method, path string, payl
 		httpReq.Header.Set("Content-Type", "application/json")
 	}
 	httpReq.Header.Set(cloudproto.HeaderProduct, c.cfg.Product)
+	if c.cfg.Account != "" {
+		httpReq.Header.Set(cloudproto.HeaderAccount, c.cfg.Account)
+	}
+	if c.cfg.Project != "" {
+		httpReq.Header.Set(cloudproto.HeaderProject, c.cfg.Project)
+	}
 	httpReq.Header.Set(cloudproto.HeaderProtocol, strconv.Itoa(cloudproto.ProtocolVersion))
 	token, err := c.cfg.Token(ctx)
 	if err != nil {
@@ -793,7 +805,7 @@ func (c *Client) newRequestMethod(ctx context.Context, method, path string, payl
 }
 
 func decodeHTTPError(resp *http.Response) error {
-	b, _ := io.ReadAll(resp.Body)
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	return decodeHTTPErrorBody(resp, b)
 }
 
@@ -812,6 +824,7 @@ func decodeErrorBody(resp *http.Response, b []byte) *ai.Error {
 	var er cloudproto.ErrorResponse
 	if err := json.Unmarshal(b, &er); err == nil && er.Error.Code != "" {
 		e := er.Error
+		e.Details = append(json.RawMessage(nil), er.Limit...)
 		// The HTTP status is authoritative for retryability even when the
 		// JSON body's own "retryable" was left false/omitted: a 429/5xx is
 		// generally worth retrying before the first byte, regardless of
