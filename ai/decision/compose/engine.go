@@ -25,7 +25,7 @@ const (
 // breaker, an unsupported operation, an invalid answer, a request or credentials
 // the engine refused) always start it. An exhausted allowance (OnQuota) and a
 // misconfigured endpoint never do, unless OnQuota asks for the former. A spent
-// budget (decision.ErrBudget, see NewBudget) never starts a backup either, and
+// budget (decision.ErrBudget, see NewBudget) or server policy refusal never starts a backup either, and
 // OnQuota does not change that. In Hedged and Race these conditions also end the
 // call when they come from a leg that is already running (see Engine.halts).
 type Trigger uint
@@ -264,11 +264,12 @@ func (e *Engine) triggers(outcome string) bool {
 		return false // the caller gave up: nothing to fail over to
 	case decision.AttemptQuota:
 		return e.cfg.also&OnQuota != 0
-	case decision.AttemptBudget, decision.AttemptMisconfigured:
+	case decision.AttemptBudget, decision.AttemptMisconfigured, decision.AttemptPolicyRefusal:
 		// A spent budget is a cap the caller set to keep a leg from being billed: a
 		// backup never takes over for it, whatever OnQuota says (OnQuota is only about
 		// the allowance of an engine the backup stands in for). A misconfigured
-		// endpoint must be fixed, and a backup would hide it.
+		// endpoint must be fixed, and a backup would hide it. A server policy
+		// refusal likewise must stay attached to the selected payer and model.
 		return false
 	default: // error, timeout, unavailable, unsupported, invalid, rejected, auth
 		return true
@@ -284,7 +285,7 @@ func (e *Engine) halts(outcome string) bool {
 	switch outcome {
 	case decision.AttemptQuota:
 		return e.cfg.also&OnQuota == 0
-	case decision.AttemptBudget, decision.AttemptMisconfigured:
+	case decision.AttemptBudget, decision.AttemptMisconfigured, decision.AttemptPolicyRefusal:
 		return true
 	}
 	return false
@@ -515,6 +516,8 @@ func classify(err, cause error) (outcome, detail string) {
 	// The conditions that must stay loud come first: an engine error that joins
 	// several legs' errors must not have them hidden behind a quieter one.
 	switch {
+	case errors.Is(err, decision.ErrPolicyRefusal):
+		return decision.AttemptPolicyRefusal, err.Error()
 	case errors.Is(err, decision.ErrQuota):
 		return decision.AttemptQuota, err.Error()
 	case errors.Is(err, decision.ErrBudget):

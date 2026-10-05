@@ -56,6 +56,9 @@ const (
 	// loud: a breaker ignores it and a combinator does not hide it behind a
 	// backup.
 	AttemptMisconfigured = "misconfigured"
+	// AttemptPolicyRefusal: the hosted service refused this payer, model, or
+	// question context. Switching engines would evade the server's decision.
+	AttemptPolicyRefusal = "policy_refusal"
 )
 
 var (
@@ -99,6 +102,9 @@ var (
 	// not start its backup for it: it must be seen and fixed, not absorbed by an
 	// uncalibrated backup forever.
 	ErrMisconfigured = errors.New("decision: engine misconfigured")
+	// ErrPolicyRefusal is a terminal server policy refusal. It must not be
+	// retried or handed to another decision engine.
+	ErrPolicyRefusal = errors.New("decision: server policy refusal")
 )
 
 // MaxRetryDelay caps any retry delay an engine asks for, so a bad header cannot

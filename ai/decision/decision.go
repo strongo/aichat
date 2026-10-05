@@ -498,7 +498,7 @@ type Trace struct {
 	Outcome    Outcome    `json:"outcome,omitempty"`
 	Model      string     `json:"model,omitempty"`
 	// StoppedBy is set when the chain stopped early instead of trying its next
-	// provider: AttemptQuota (an exhausted allowance) or AttemptMisconfigured (an
+	// provider: AttemptQuota (an exhausted allowance), AttemptPolicyRefusal, or AttemptMisconfigured (an
 	// endpoint a person has to fix). The decision is then ok=false, like any chain
 	// that decided nothing, but the product MUST NOT read it as "nobody decided,
 	// use the paid main-LLM path" without choosing to: Err returns the error.
@@ -506,7 +506,7 @@ type Trace struct {
 }
 
 // Err returns the error a chain that stopped early (Trace.StoppedBy) stands for:
-// it matches (errors.Is) ErrQuota, ErrBudget or ErrMisconfigured and names the
+// it matches (errors.Is) ErrQuota, ErrBudget, ErrPolicyRefusal or ErrMisconfigured and names the
 // provider that said so. It is nil for a trace that was not stopped. The message is
 // the provider's own error text, as the attempt's detail has it, so the condition
 // is stated once.
@@ -519,6 +519,8 @@ func (t Trace) Err() error {
 		sentinel = ErrBudget
 	case AttemptMisconfigured:
 		sentinel = ErrMisconfigured
+	case AttemptPolicyRefusal:
+		sentinel = ErrPolicyRefusal
 	default:
 		return nil
 	}
@@ -698,6 +700,8 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 		// primary was unavailable and whose backup was out of budget) must not
 		// have the loud one hidden behind the quiet one.
 		switch {
+		case err != nil && errors.Is(err, ErrPolicyRefusal):
+			a.Outcome, a.Detail = AttemptPolicyRefusal, err.Error()
 		case err != nil && errors.Is(err, ErrQuota):
 			a.Outcome, a.Detail = AttemptQuota, err.Error()
 		case err != nil && errors.Is(err, ErrBudget):
@@ -720,7 +724,7 @@ func (c Chain) Decide(ctx context.Context, req Request) (Decision, bool, Trace) 
 			d, a = c.judge(d, a, req, minConf)
 		}
 		decided := a.Outcome == AttemptDecided
-		stop := ((a.Outcome == AttemptQuota || a.Outcome == AttemptBudget) && c.StopOnQuota.stops()) || (a.Outcome == AttemptMisconfigured && c.StopOnMisconfigured.stops())
+		stop := a.Outcome == AttemptPolicyRefusal || ((a.Outcome == AttemptQuota || a.Outcome == AttemptBudget) && c.StopOnQuota.stops()) || (a.Outcome == AttemptMisconfigured && c.StopOnMisconfigured.stops())
 		if rep == nil {
 			tr.Attempts = append(tr.Attempts, a)
 		} else {

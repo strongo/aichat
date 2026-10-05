@@ -98,6 +98,8 @@ const (
 	PathInteraction = "ai/interactions"
 
 	HeaderProduct = "X-AI-Product"
+	HeaderAccount = "X-AI-Account"
+	HeaderProject = "X-AI-Project"
 	// HeaderProtocol carries the protocol version the client speaks (the value is
 	// ProtocolVersion, as a decimal string).
 	HeaderProtocol = "X-AI-Protocol"
@@ -168,7 +170,8 @@ type UsageResponse struct {
 
 // ErrorResponse is the JSON body of a non-2xx response.
 type ErrorResponse struct {
-	Error ai.Error `json:"error"`
+	Error ai.Error        `json:"error"`
+	Limit json.RawMessage `json:"limit,omitempty"`
 }
 
 // WriteEvent writes one event in SSE framing. Callers flush after each call.
