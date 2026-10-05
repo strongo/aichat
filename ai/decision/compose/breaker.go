@@ -264,7 +264,7 @@ func judge(ctx context.Context, err error) verdict {
 	switch {
 	case err == nil:
 		return verdictSuccess
-	case errors.Is(err, decision.ErrUnsupported), errors.Is(err, decision.ErrInvalidRequest), errors.Is(err, decision.ErrAuth),
+	case errors.Is(err, decision.ErrUnsupported), errors.Is(err, decision.ErrInvalidRequest), errors.Is(err, decision.ErrPolicyRefusal), errors.Is(err, decision.ErrAuth),
 		errors.Is(err, decision.ErrQuota), errors.Is(err, decision.ErrBudget), errors.Is(err, decision.ErrMisconfigured):
 		return verdictNeutral
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded):
