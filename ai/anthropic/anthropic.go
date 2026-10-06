@@ -298,10 +298,12 @@ func anthropicToolChoice(choice string) *toolChoiceWire {
 }
 
 type usagePayload struct {
-	InputTokens              int64 `json:"input_tokens"`
-	OutputTokens             int64 `json:"output_tokens"`
-	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	// Pointers retain presence: an omitted output_tokens is not an explicit
+	// zero for a guarded call's terminal accounting proof.
+	InputTokens              *int64 `json:"input_tokens"`
+	OutputTokens             *int64 `json:"output_tokens"`
+	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens"`
 }
 
 type sseEvent struct {
@@ -462,13 +464,13 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			yieldFatal(yield, toAIError(ctx, doErr))
 			return
 		}
-		streamResponse(ctx, yield, resp, model, wantStructured)
+		streamResponse(ctx, yield, resp, model, wantStructured, false)
 	}
 }
 
 // streamResponse is shared by ordinary and prepared sends so they emit the
 // same normalized events and preserve the legacy SSE interpretation.
-func streamResponse(ctx context.Context, yield func(ai.Event, error) bool, resp *http.Response, model string, wantStructured bool) {
+func streamResponse(ctx context.Context, yield func(ai.Event, error) bool, resp *http.Response, model string, wantStructured, requireCompleteUsage bool) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if !yield(ai.Event{Type: ai.EventStarted, Provider: "anthropic", Model: model}, nil) {
@@ -485,6 +487,8 @@ func streamResponse(ctx context.Context, yield func(ai.Event, error) bool, resp 
 	sc.Split(sse.ScanLines)
 	var eventName string
 	sawStop := false
+	sawInitialInput := false
+	sawTerminalOutput := false
 	stopReasonWire := ""
 	// toolCalls tracks tool_use blocks by index for EventToolCall
 	// assembly (id/name at content_block_start, arguments concatenated
@@ -520,8 +524,20 @@ func streamResponse(ctx context.Context, yield func(ai.Event, error) bool, resp 
 			if typ == "" {
 				typ = eventName
 			}
+			if requireCompleteUsage && sawStop {
+				yieldFatal(yield, incompletePreparedUsage())
+				return
+			}
 			switch typ {
 			case "message_start":
+				if requireCompleteUsage {
+					if sawInitialInput || se.Message == nil || se.Message.Usage == nil || se.Message.Usage.InputTokens == nil ||
+						!validNonnegativeUsage(se.Message.Usage) {
+						yieldFatal(yield, incompletePreparedUsage())
+						return
+					}
+					sawInitialInput = true
+				}
 				if se.Message != nil && se.Message.Usage != nil {
 					usage = mergeUsage(usage, toUsage(se.Message.Usage))
 				}
@@ -580,9 +596,22 @@ func streamResponse(ctx context.Context, yield func(ai.Event, error) bool, resp 
 				// Nothing to do: tool_use calls are emitted together,
 				// after message_stop, in stream order.
 			case "message_delta":
+				if requireCompleteUsage {
+					if !sawInitialInput || (se.Usage != nil && !validNonnegativeUsage(se.Usage)) {
+						yieldFatal(yield, incompletePreparedUsage())
+						return
+					}
+					// The last message_delta must actually observe output_tokens;
+					// usage:{} and an absent usage object cannot stand for zero.
+					sawTerminalOutput = se.Usage != nil && se.Usage.OutputTokens != nil
+				}
 				if se.Usage != nil {
-					usage = mergeUsage(usage, toUsage(se.Usage))
-					if !yield(ai.Event{Type: ai.EventUsage, Usage: usage}, nil) {
+					if requireCompleteUsage {
+						usage = mergeGuardedUsage(usage, se.Usage)
+					} else {
+						usage = mergeUsage(usage, toUsage(se.Usage))
+					}
+					if !requireCompleteUsage && !yield(ai.Event{Type: ai.EventUsage, Usage: usage}, nil) {
 						return
 					}
 				}
@@ -594,6 +623,10 @@ func streamResponse(ctx context.Context, yield func(ai.Event, error) bool, resp 
 					return
 				}
 			case "message_stop":
+				if requireCompleteUsage && (!sawInitialInput || !sawTerminalOutput) {
+					yieldFatal(yield, incompletePreparedUsage())
+					return
+				}
 				sawStop = true
 			case "ping":
 				// keepalive; no-op.
@@ -614,6 +647,11 @@ func streamResponse(ctx context.Context, yield func(ai.Event, error) bool, resp 
 	if !sawStop {
 		yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "anthropic: stream truncated (no message_stop)"})
 		return
+	}
+	if requireCompleteUsage {
+		if !yield(ai.Event{Type: ai.EventUsage, Usage: usage}, nil) {
+			return
+		}
 	}
 
 	if wantStructured && textBuf.Len() > 0 {
@@ -731,11 +769,49 @@ func mergeUsage(prev, next *ai.Usage) *ai.Usage {
 
 func toUsage(u *usagePayload) *ai.Usage {
 	return &ai.Usage{
-		InputTokens:      u.InputTokens,
-		OutputTokens:     u.OutputTokens,
-		CacheReadTokens:  u.CacheReadInputTokens,
-		CacheWriteTokens: u.CacheCreationInputTokens,
+		InputTokens:      usageCount(u.InputTokens),
+		OutputTokens:     usageCount(u.OutputTokens),
+		CacheReadTokens:  usageCount(u.CacheReadInputTokens),
+		CacheWriteTokens: usageCount(u.CacheCreationInputTokens),
 	}
+}
+
+func usageCount(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+func validNonnegativeUsage(u *usagePayload) bool {
+	return (u.InputTokens == nil || *u.InputTokens >= 0) &&
+		(u.OutputTokens == nil || *u.OutputTokens >= 0) &&
+		(u.CacheReadInputTokens == nil || *u.CacheReadInputTokens >= 0) &&
+		(u.CacheCreationInputTokens == nil || *u.CacheCreationInputTokens >= 0)
+}
+
+// mergeGuardedUsage distinguishes present zero from an omitted field. The
+// final provider observation supersedes an earlier provisional count. A
+// guarded message_delta is accepted only after message_start initialized prev.
+func mergeGuardedUsage(prev *ai.Usage, next *usagePayload) *ai.Usage {
+	merged := *prev
+	if next.InputTokens != nil {
+		merged.InputTokens = *next.InputTokens
+	}
+	if next.OutputTokens != nil {
+		merged.OutputTokens = *next.OutputTokens
+	}
+	if next.CacheReadInputTokens != nil {
+		merged.CacheReadTokens = *next.CacheReadInputTokens
+	}
+	if next.CacheCreationInputTokens != nil {
+		merged.CacheWriteTokens = *next.CacheCreationInputTokens
+	}
+	return &merged
+}
+
+func incompletePreparedUsage() *ai.Error {
+	return &ai.Error{Code: ai.ErrCodeUpstream, Message: "anthropic: incomplete guarded terminal usage"}
 }
 
 // toolResultBlock renders one ai.ToolResult as a tool_result content block.

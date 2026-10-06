@@ -380,3 +380,163 @@ func TestPreparedFailuresNeverResend(t *testing.T) {
 		t.Fatalf("in-transport cancellation err=%v sends=%d", err, sends.Load())
 	}
 }
+
+func TestPreparedRequiresObservedTerminalUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name, start, deltas string
+		complete            bool
+		output              int64
+	}{
+		{"complete", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, true, 2},
+		{"explicit zero output", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":0}}`, true, 0},
+		{"terminal zero overrides initial count", `{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":9}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":0}}`, true, 0},
+		{"no start", "", `{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"delta before start", `{"type":"message_delta","usage":{"output_tokens":2}}` + "\n\nevent: message_start\ndata: " +
+			`{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"missing initial usage", `{"type":"message_start","message":{}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"missing initial message", `{"type":"message_start"}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"empty initial usage", `{"type":"message_start","message":{"usage":{}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"negative input", `{"type":"message_start","message":{"usage":{"input_tokens":-1}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"negative initial output", `{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":-1}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"negative cache read", `{"type":"message_start","message":{"usage":{"input_tokens":3,"cache_read_input_tokens":-1}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"negative cache write", `{"type":"message_start","message":{"usage":{"input_tokens":3,"cache_creation_input_tokens":-1}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"no message delta", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			"", false, 0},
+		{"early stop then late usage", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_stop"}` + "\n\nevent: message_delta\ndata: " +
+				`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"duplicate start", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_start","message":{"usage":{"input_tokens":3}}}`, false, 0},
+		{"accounting after stop", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}` + "\n\nevent: message_stop\ndata: " +
+				`{"type":"message_stop"}` + "\n\nevent: message_delta\ndata: " +
+				`{"type":"message_delta","usage":{"output_tokens":4}}`, false, 0},
+		{"delta without usage", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta"}`, false, 0},
+		{"empty terminal usage", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{}}`, false, 0},
+		{"terminal missing output", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"input_tokens":3}}`, false, 0},
+		{"negative output", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":-1}}`, false, 0},
+		{"negative delta input", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"input_tokens":-1,"output_tokens":2}}`, false, 0},
+		{"negative terminal cache write", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2,"cache_creation_input_tokens":-1}}`, false, 0},
+		{"later empty delta", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}` + "\n\n" +
+				"event: message_delta\ndata: " + `{"type":"message_delta","usage":{}}`, false, 0},
+		{"malformed initial count", `{"type":"message_start","message":{"usage":{"input_tokens":"3"}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":2}}`, false, 0},
+		{"malformed terminal count", `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`,
+			`{"type":"message_delta","usage":{"output_tokens":"2"}}`, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sends atomic.Int32
+			stream := ""
+			if tc.start != "" {
+				stream += "event: message_start\ndata: " + tc.start + "\n\n"
+			}
+			if tc.deltas != "" {
+				stream += "event: message_delta\ndata: " + tc.deltas + "\n\n"
+			}
+			stream += "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+			provider, _ := preparedProvider(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				sends.Add(1)
+				return preparedResponse(req, http.StatusOK, stream), nil
+			}))
+			prepared, err := provider.PrepareGuarded(preparedRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			completed, usageEvents := 0, 0
+			var finalErr error
+			var finalUsage *ai.Usage
+			for event, eventErr := range prepared.Stream(context.Background()) {
+				if event.Type == ai.EventCompleted {
+					completed++
+					finalUsage = event.Usage
+				}
+				if event.Type == ai.EventUsage {
+					usageEvents++
+				}
+				if eventErr != nil {
+					finalErr = eventErr
+				}
+			}
+			if sends.Load() != 1 {
+				t.Fatalf("sends=%d", sends.Load())
+			}
+			if tc.complete {
+				if finalErr != nil || completed != 1 || usageEvents != 1 || finalUsage == nil ||
+					finalUsage.InputTokens != 3 || finalUsage.OutputTokens != tc.output {
+					t.Fatalf("complete err=%v completed=%d usageEvents=%d usage=%+v", finalErr, completed, usageEvents, finalUsage)
+				}
+			} else if finalErr == nil || completed != 0 || usageEvents != 0 {
+				t.Fatalf("incomplete err=%v completed=%d usageEvents=%d", finalErr, completed, usageEvents)
+			}
+		})
+	}
+}
+
+func TestPreparedTerminalPresentZerosReplaceEarlierCounts(t *testing.T) {
+	stream := "event: message_start\ndata: " +
+		`{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":7,"cache_read_input_tokens":5,"cache_creation_input_tokens":4}}}` +
+		"\n\nevent: message_delta\ndata: " +
+		`{"type":"message_delta","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}` +
+		"\n\nevent: message_stop\ndata: " + `{"type":"message_stop"}` + "\n\n"
+	var sends atomic.Int32
+	provider, _ := preparedProvider(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		sends.Add(1)
+		return preparedResponse(req, http.StatusOK, stream), nil
+	}))
+	prepared, err := provider.PrepareGuarded(preparedRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, usage, err := ai.Collect(prepared.Stream(context.Background()))
+	if err != nil || sends.Load() != 1 || usage == nil ||
+		usage.InputTokens != 0 || usage.OutputTokens != 0 ||
+		usage.CacheReadTokens != 0 || usage.CacheWriteTokens != 0 {
+		t.Fatalf("final zero usage=%+v err=%v sends=%d", usage, err, sends.Load())
+	}
+}
+
+func TestPreparedConsumerStopsAtVerifiedUsage(t *testing.T) {
+	var sends atomic.Int32
+	provider, _ := preparedProvider(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		sends.Add(1)
+		return preparedResponse(req, http.StatusOK, preparedSSE), nil
+	}))
+	prepared, err := provider.PrepareGuarded(preparedRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawUsage, sawCompletion := false, false
+	for event, eventErr := range prepared.Stream(context.Background()) {
+		if eventErr != nil {
+			t.Fatal(eventErr)
+		}
+		if event.Type == ai.EventCompleted {
+			sawCompletion = true
+		}
+		if event.Type == ai.EventUsage {
+			sawUsage = true
+			break
+		}
+	}
+	if !sawUsage || sawCompletion || sends.Load() != 1 {
+		t.Fatalf("usage=%v completion=%v sends=%d", sawUsage, sawCompletion, sends.Load())
+	}
+}

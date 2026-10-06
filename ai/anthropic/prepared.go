@@ -167,7 +167,7 @@ func (r *PreparedChat) Stream(ctx context.Context) iter.Seq2[ai.Event, error] {
 			yieldFatal(yield, toAIError(ctx, err))
 			return
 		}
-		streamResponse(ctx, yield, resp, state.info.Model, false)
+		streamResponse(ctx, yield, resp, state.info.Model, false, true)
 	}
 }
 
