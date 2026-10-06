@@ -56,6 +56,9 @@ var errGuardedAttemptExhausted = errors.New("openaicompat: guarded outbound atte
 // Provider implements ai.LLMProvider over the Chat Completions API.
 type Provider struct {
 	cfg Config
+	// Prepared-body encoding is kept on the provider so a guarded preparation
+	// can be fault-tested without weakening its marshal-error refusal.
+	marshalPrepared func(chatRequestBody) ([]byte, error)
 
 	// noReasoningEffortMu guards noReasoningEffort.
 	noReasoningEffortMu sync.Mutex
@@ -94,7 +97,7 @@ func New(cfg Config) *Provider {
 			cfg.Headers = headers
 		}
 	}
-	return &Provider{cfg: cfg}
+	return &Provider{cfg: cfg, marshalPrepared: func(body chatRequestBody) ([]byte, error) { return json.Marshal(body) }}
 }
 
 // Name implements ai.LLMProvider.
@@ -337,111 +340,116 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			yieldFatal(yield, toAIError(ctx, doErr))
 			return
 		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if !yield(ai.Event{Type: ai.EventStarted, Provider: p.Name(), Model: model}, nil) {
-			return
-		}
-
-		var structuredBuf strings.Builder
-		sc := bufio.NewScanner(resp.Body)
-		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		sc.Split(sse.ScanLines)
-		var usage *ai.Usage
-		sawDone := false
-		finishReason := ""
-		asm := newToolCallAssembler()
-		for sc.Scan() {
-			line := sc.Text()
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data == "[DONE]" {
-				sawDone = true
-				break
-			}
-			if data == "" {
-				continue
-			}
-			var chunk chatChunk
-			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: fmt.Sprintf("openaicompat: bad chunk: %v", err)})
-				return
-			}
-			if chunk.Error != nil {
-				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: chunk.Error.Message})
-				return
-			}
-			if chunk.Usage != nil {
-				u := &ai.Usage{
-					InputTokens:  chunk.Usage.PromptTokens,
-					OutputTokens: chunk.Usage.CompletionTokens,
-				}
-				if chunk.Usage.PromptTokensDetails != nil {
-					u.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
-				}
-				if chunk.Usage.CompletionTokensDetails != nil {
-					u.ReasoningTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
-				}
-				usage = u
-				if !yield(ai.Event{Type: ai.EventUsage, Usage: usage}, nil) {
-					return
-				}
-			}
-			for _, c := range chunk.Choices {
-				if c.Delta.Content != "" {
-					if wantStructured {
-						structuredBuf.WriteString(c.Delta.Content)
-					}
-					if !yield(ai.Event{Type: ai.EventTextDelta, Text: c.Delta.Content}, nil) {
-						return
-					}
-				}
-				for _, tc := range c.Delta.ToolCalls {
-					asm.addDelta(tc)
-				}
-				if c.FinishReason != "" {
-					finishReason = c.FinishReason
-				}
-				if c.FinishReason == "length" && wantStructured {
-					yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "openaicompat: response truncated at max_completion_tokens before a complete structured JSON object was produced"})
-					return
-				}
-			}
-		}
-		if err := sc.Err(); err != nil {
-			yieldFatal(yield, toAIError(ctx, err))
-			return
-		}
-		if !sawDone {
-			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "openaicompat: stream truncated (no [DONE] marker)"})
-			return
-		}
-
-		if wantStructured && structuredBuf.Len() > 0 {
-			raw := extractJSON(structuredBuf.String())
-			if !yield(ai.Event{Type: ai.EventStructured, Structured: json.RawMessage(raw)}, nil) {
-				return
-			}
-		}
-
-		for _, call := range asm.calls() {
-			c := call
-			if !yield(ai.Event{Type: ai.EventToolCall, ToolCall: &c}, nil) {
-				return
-			}
-		}
-
-		stopReason := ai.StopReasonEnd
-		switch finishReason {
-		case "tool_calls":
-			stopReason = ai.StopReasonToolCalls
-		case "length":
-			stopReason = ai.StopReasonLength
-		}
-		yield(ai.Event{Type: ai.EventCompleted, Usage: usage, StopReason: stopReason}, nil)
+		streamResponse(ctx, yield, resp, p.Name(), model, wantStructured)
 	}
+}
+
+// streamResponse decodes the shared Chat Completions SSE event contract.
+func streamResponse(ctx context.Context, yield func(ai.Event, error) bool, resp *http.Response, providerName, model string, wantStructured bool) {
+	defer func() { _ = resp.Body.Close() }()
+
+	if !yield(ai.Event{Type: ai.EventStarted, Provider: providerName, Model: model}, nil) {
+		return
+	}
+
+	var structuredBuf strings.Builder
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	sc.Split(sse.ScanLines)
+	var usage *ai.Usage
+	sawDone := false
+	finishReason := ""
+	asm := newToolCallAssembler()
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			sawDone = true
+			break
+		}
+		if data == "" {
+			continue
+		}
+		var chunk chatChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: fmt.Sprintf("openaicompat: bad chunk: %v", err)})
+			return
+		}
+		if chunk.Error != nil {
+			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: chunk.Error.Message})
+			return
+		}
+		if chunk.Usage != nil {
+			u := &ai.Usage{
+				InputTokens:  chunk.Usage.PromptTokens,
+				OutputTokens: chunk.Usage.CompletionTokens,
+			}
+			if chunk.Usage.PromptTokensDetails != nil {
+				u.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			}
+			if chunk.Usage.CompletionTokensDetails != nil {
+				u.ReasoningTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
+			}
+			usage = u
+			if !yield(ai.Event{Type: ai.EventUsage, Usage: usage}, nil) {
+				return
+			}
+		}
+		for _, c := range chunk.Choices {
+			if c.Delta.Content != "" {
+				if wantStructured {
+					structuredBuf.WriteString(c.Delta.Content)
+				}
+				if !yield(ai.Event{Type: ai.EventTextDelta, Text: c.Delta.Content}, nil) {
+					return
+				}
+			}
+			for _, tc := range c.Delta.ToolCalls {
+				asm.addDelta(tc)
+			}
+			if c.FinishReason != "" {
+				finishReason = c.FinishReason
+			}
+			if c.FinishReason == "length" && wantStructured {
+				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "openaicompat: response truncated at max_completion_tokens before a complete structured JSON object was produced"})
+				return
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		yieldFatal(yield, toAIError(ctx, err))
+		return
+	}
+	if !sawDone {
+		yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "openaicompat: stream truncated (no [DONE] marker)"})
+		return
+	}
+
+	if wantStructured && structuredBuf.Len() > 0 {
+		raw := extractJSON(structuredBuf.String())
+		if !yield(ai.Event{Type: ai.EventStructured, Structured: json.RawMessage(raw)}, nil) {
+			return
+		}
+	}
+
+	for _, call := range asm.calls() {
+		c := call
+		if !yield(ai.Event{Type: ai.EventToolCall, ToolCall: &c}, nil) {
+			return
+		}
+	}
+
+	stopReason := ai.StopReasonEnd
+	switch finishReason {
+	case "tool_calls":
+		stopReason = ai.StopReasonToolCalls
+	case "length":
+		stopReason = ai.StopReasonLength
+	}
+	yield(ai.Event{Type: ai.EventCompleted, Usage: usage, StopReason: stopReason}, nil)
 }
 
 // toolCallAssembler accumulates streamed delta.tool_calls chunks (id/name
