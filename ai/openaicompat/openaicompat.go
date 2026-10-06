@@ -25,12 +25,33 @@ import (
 // Config configures a Provider. BaseURL and APIKey are required; Model is the
 // default used when a ChatRequest leaves Model empty or ai.ModelAuto.
 type Config struct {
-	BaseURL    string
-	APIKey     string
-	Model      string
-	Headers    map[string]string
-	HTTPClient *http.Client
+	BaseURL          string
+	APIKey           string
+	Model            string
+	Headers          map[string]string
+	HTTPClient       *http.Client
+	OutputTokenField OutputTokenField
+	Guarded          *GuardedPolicy
 }
+
+// OutputTokenField selects the Chat Completions request field for MaxTokens.
+// The zero value preserves the legacy max_completion_tokens wire format.
+type OutputTokenField string
+
+const (
+	OutputTokenFieldMaxCompletionTokens OutputTokenField = "max_completion_tokens"
+	OutputTokenFieldMaxTokens           OutputTokenField = "max_tokens"
+)
+
+// GuardedPolicy is an explicit opt-in for application-level outbound control.
+// This release supports exactly one outbound attempt per Stream. It does not
+// bound sends hidden inside a custom HTTP transport or provider billing.
+type GuardedPolicy struct {
+	MaxOutputTokens     int
+	MaxOutboundAttempts int
+}
+
+var errGuardedAttemptExhausted = errors.New("openaicompat: guarded outbound attempt exhausted")
 
 // Provider implements ai.LLMProvider over the Chat Completions API.
 type Provider struct {
@@ -59,6 +80,19 @@ func New(cfg Config) *Provider {
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = http.DefaultClient
+	}
+	if cfg.Guarded != nil {
+		policy := *cfg.Guarded
+		cfg.Guarded = &policy
+		client := *cfg.HTTPClient
+		cfg.HTTPClient = &client
+		if cfg.Headers != nil {
+			headers := make(map[string]string, len(cfg.Headers))
+			for k, v := range cfg.Headers {
+				headers[k] = v
+			}
+			cfg.Headers = headers
+		}
 	}
 	return &Provider{cfg: cfg}
 }
@@ -128,6 +162,7 @@ type chatRequestBody struct {
 	Stream              bool            `json:"stream"`
 	StreamOptions       *streamOptions  `json:"stream_options,omitempty"`
 	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
+	MaxTokens           int             `json:"max_tokens,omitempty"`
 	ResponseFormat      *responseFormat `json:"response_format,omitempty"`
 	Tools               []toolDef       `json:"tools,omitempty"`
 	// ToolChoice is either a bare string ("auto"|"none"|"required") or a
@@ -186,17 +221,43 @@ type apiErrorBody struct {
 // succeeded.
 func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.Event, error] {
 	return func(yield func(ai.Event, error) bool) {
+		guard := p.cfg.Guarded
+		if guard != nil && ctx.Err() != nil {
+			yieldFatal(yield, toAIError(ctx, ctx.Err()))
+			return
+		}
+		if guard != nil && (guard.MaxOutboundAttempts != 1 || guard.MaxOutputTokens <= 0 || req.MaxTokens <= 0 || req.MaxTokens > guard.MaxOutputTokens) {
+			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeInvalid, Message: "openaicompat: invalid guarded output or attempt limit"})
+			return
+		}
+		field := p.cfg.OutputTokenField
+		if field != "" && field != OutputTokenFieldMaxCompletionTokens && field != OutputTokenFieldMaxTokens {
+			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeInvalid, Message: "openaicompat: invalid output token field"})
+			return
+		}
+		client := p.cfg.HTTPClient
+		if guard != nil {
+			// Clone per Stream: the caller and concurrent streams keep their own
+			// client settings, while every guarded redirect stops before resend.
+			copy := *client
+			copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+			client = &copy
+		}
 		model := req.Model
 		if model == "" || model == ai.ModelAuto {
 			model = p.cfg.Model
 		}
 
 		body := chatRequestBody{
-			Model:               model,
-			Messages:            buildMessages(req),
-			Stream:              true,
-			StreamOptions:       &streamOptions{IncludeUsage: true},
-			MaxCompletionTokens: req.MaxTokens,
+			Model:         model,
+			Messages:      buildMessages(req),
+			Stream:        true,
+			StreamOptions: &streamOptions{IncludeUsage: true},
+		}
+		if field == OutputTokenFieldMaxTokens {
+			body.MaxTokens = req.MaxTokens
+		} else {
+			body.MaxCompletionTokens = req.MaxTokens
 		}
 		wantStructured := len(req.ResponseSchema) > 0
 		if wantStructured {
@@ -234,12 +295,23 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			return
 		}
 
+		attemptsUsed := 0
 		send := func(payload []byte) (*http.Response, error) {
 			var resp *http.Response
 			attempt := 0
-			doErr := retry.Do(ctx, retry.Config{}, func(ctx context.Context) error {
+			retryConfig := retry.Config{}
+			if guard != nil {
+				retryConfig.MaxAttempts = guard.MaxOutboundAttempts
+			}
+			doErr := retry.Do(ctx, retryConfig, func(ctx context.Context) error {
+				if guard != nil {
+					if attemptsUsed >= guard.MaxOutboundAttempts {
+						return errGuardedAttemptExhausted
+					}
+					attemptsUsed++
+				}
 				attempt++
-				r, e := p.doRequest(ctx, payload, attempt >= retry.DefaultMaxAttempts)
+				r, e := p.doRequestWithClient(ctx, client, payload, guard != nil || attempt >= retry.DefaultMaxAttempts)
 				resp = r
 				return e
 			})
@@ -249,13 +321,16 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 		resp, doErr := send(payload)
 		if doErr != nil && sentReasoningEffort && isUnsupportedReasoningEffortError(doErr) {
 			// M1 (r1 review): some OpenAI-compatible endpoints 400 on an
-			// unrecognised reasoning_effort instead of ignoring it. Retry
-			// ONCE, before any byte of a response was seen, without it --
-			// and remember not to send it again on this Provider instance.
+			// unrecognised reasoning_effort instead of ignoring it. Remember
+			// this model's compatibility. The legacy path retries without the
+			// field; a guarded call has already spent its one attempt.
 			p.markReasoningEffortUnsupported(model)
 			body.ReasoningEffort = ""
 			if retryPayload, merr := json.Marshal(body); merr == nil {
-				resp, doErr = send(retryPayload)
+				retryResp, retryErr := send(retryPayload)
+				if !errors.Is(retryErr, errGuardedAttemptExhausted) {
+					resp, doErr = retryResp, retryErr
+				}
 			}
 		}
 		if doErr != nil {
@@ -531,6 +606,10 @@ func (p *Provider) markReasoningEffortUnsupported(model string) {
 // that wait would only add latency to a request that's about to fail out to
 // the caller regardless (m3).
 func (p *Provider) doRequest(ctx context.Context, payload []byte, lastAttempt bool) (*http.Response, error) {
+	return p.doRequestWithClient(ctx, p.cfg.HTTPClient, payload, lastAttempt)
+}
+
+func (p *Provider) doRequestWithClient(ctx context.Context, client *http.Client, payload []byte, lastAttempt bool) (*http.Response, error) {
 	url := strings.TrimSuffix(p.cfg.BaseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
@@ -544,7 +623,7 @@ func (p *Provider) doRequest(ctx context.Context, payload []byte, lastAttempt bo
 	for k, v := range p.cfg.Headers {
 		httpReq.Header.Set(k, v)
 	}
-	resp, err := p.cfg.HTTPClient.Do(httpReq)
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, &ai.Error{Code: ai.ErrCodeCanceled, Message: err.Error()}
