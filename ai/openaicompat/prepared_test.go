@@ -33,6 +33,28 @@ func preparedTestResponse(r *http.Request, status int, body string) *http.Respon
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}
 }
 
+func TestSharedPreparedContractPreservesConcreteAPI(t *testing.T) {
+	provider := preparedTestProvider(guardedRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return preparedTestResponse(r, http.StatusOK, guardedSSE), nil
+	}), OutputTokenFieldMaxTokens)
+	concrete, err := provider.PrepareGuarded(preparedTestRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if concrete.PreparedInfo().Protocol != concrete.Info().Protocol ||
+		concrete.PreparedInfo().OutputTokenField != string(concrete.Info().OutputTokenField) {
+		t.Fatal("shared metadata differs from existing concrete Info")
+	}
+	var generic ai.GuardedChatPreparer = provider
+	call, err := generic.PrepareGuardedChat(preparedTestRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.PreparedInfo().Protocol != "chat-completions" {
+		t.Fatalf("shared preparation info=%+v", call.PreparedInfo())
+	}
+}
+
 func TestPrepareGuardedFrozenWireAndInfo(t *testing.T) {
 	for _, tc := range []struct {
 		name, field string

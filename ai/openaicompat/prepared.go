@@ -34,6 +34,22 @@ type PreparedChat struct {
 	state *preparedChatState
 }
 
+// PreparedInfo is the additive provider-neutral view of the concrete Info.
+func (r *PreparedChat) PreparedInfo() ai.PreparedChatInfo {
+	info := r.Info()
+	return ai.PreparedChatInfo{
+		WireRevision: info.WireRevision, Protocol: info.Protocol, Model: info.Model,
+		BodySHA256: info.BodySHA256, OutputTokenField: string(info.OutputTokenField),
+		MaxOutputTokens: info.MaxOutputTokens,
+	}
+}
+
+// PrepareGuardedChat preserves PrepareGuarded's concrete return signature for
+// existing callers while offering the common prepared-call interface.
+func (p *Provider) PrepareGuardedChat(req ai.ChatRequest) (ai.PreparedChatCall, error) {
+	return p.PrepareGuarded(req)
+}
+
 type preparedChatState struct {
 	info     PreparedChatInfo
 	payload  []byte

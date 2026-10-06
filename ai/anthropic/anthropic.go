@@ -34,11 +34,25 @@ type Config struct {
 	Model      string
 	Headers    map[string]string
 	HTTPClient *http.Client
+	// Guarded opts into text-only, one-attempt preparation. It has no effect
+	// on ordinary Stream calls.
+	Guarded *GuardedPolicy
+}
+
+// GuardedPolicy is server-owned configuration, never a client request field.
+// TextModels names exact IDs separately from the adapter's exact support gate.
+type GuardedPolicy struct {
+	MaxOutputTokens     int
+	MaxOutboundAttempts int
+	TextModels          map[string]bool
 }
 
 // Provider implements ai.LLMProvider over the Anthropic Messages API.
 type Provider struct {
 	cfg Config
+	// Fault-injectable encoding keeps the guarded marshal refusal testable
+	// without broadening the supported text-only input shape.
+	marshalPrepared func(messagesRequestBody) ([]byte, error)
 }
 
 // New builds a Provider. It panics if BaseURL is empty.
@@ -49,7 +63,22 @@ func New(cfg Config) *Provider {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = http.DefaultClient
 	}
-	return &Provider{cfg: cfg}
+	if cfg.Guarded != nil {
+		if cfg.Headers != nil {
+			headers := make(map[string]string, len(cfg.Headers))
+			for k, v := range cfg.Headers {
+				headers[k] = v
+			}
+			cfg.Headers = headers
+		}
+		guard := *cfg.Guarded
+		guard.TextModels = make(map[string]bool, len(cfg.Guarded.TextModels))
+		for model, supported := range cfg.Guarded.TextModels {
+			guard.TextModels[model] = supported
+		}
+		cfg.Guarded = &guard
+	}
+	return &Provider{cfg: cfg, marshalPrepared: func(body messagesRequestBody) ([]byte, error) { return json.Marshal(body) }}
 }
 
 // Name implements ai.LLMProvider.
@@ -433,215 +462,221 @@ func (p *Provider) Stream(ctx context.Context, req ai.ChatRequest) iter.Seq2[ai.
 			yieldFatal(yield, toAIError(ctx, doErr))
 			return
 		}
-		defer func() { _ = resp.Body.Close() }()
+		streamResponse(ctx, yield, resp, model, wantStructured)
+	}
+}
 
-		if !yield(ai.Event{Type: ai.EventStarted, Provider: p.Name(), Model: model}, nil) {
-			return
-		}
+// streamResponse is shared by ordinary and prepared sends so they emit the
+// same normalized events and preserve the legacy SSE interpretation.
+func streamResponse(ctx context.Context, yield func(ai.Event, error) bool, resp *http.Response, model string, wantStructured bool) {
+	defer func() { _ = resp.Body.Close() }()
 
-		// Only accumulate the full text when a structured result must be
-		// parsed from it; otherwise don't buffer the whole response (see
-		// ai.LLMProvider doc: "must not buffer the full response").
-		var textBuf strings.Builder
-		var usage *ai.Usage
-		sc := bufio.NewScanner(resp.Body)
-		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		sc.Split(sse.ScanLines)
-		var eventName string
-		sawStop := false
-		stopReasonWire := ""
-		// toolCalls tracks tool_use blocks by index for EventToolCall
-		// assembly (id/name at content_block_start, arguments concatenated
-		// across input_json_delta chunks).
-		toolCalls := map[int]*ai.ToolCall{}
-		var toolOrder []int
-		// blocks/blockOrder capture EVERY content block (text,
-		// thinking/redacted_thinking, tool_use) verbatim and in stream
-		// order, for Event.ProviderState (REQ: anthropic-thinking-block-
-		// replay, B2): the entire assistant content array, byte-faithful,
-		// so a later request replays it exactly rather than rebuilding it
-		// from Text/ToolCalls (which would drop interleaved thinking).
-		// thinking_delta/signature_delta are captured here but never
-		// emitted as EventTextDelta.
-		blocks := map[int]*providerStateBlock{}
-		var blockOrder []int
-		for sc.Scan() {
-			line := sc.Text()
-			switch {
-			case strings.HasPrefix(line, "event:"):
-				eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			case strings.HasPrefix(line, "data:"):
-				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				if data == "" {
-					continue
+	if !yield(ai.Event{Type: ai.EventStarted, Provider: "anthropic", Model: model}, nil) {
+		return
+	}
+
+	// Only accumulate the full text when a structured result must be
+	// parsed from it; otherwise don't buffer the whole response (see
+	// ai.LLMProvider doc: "must not buffer the full response").
+	var textBuf strings.Builder
+	var usage *ai.Usage
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	sc.Split(sse.ScanLines)
+	var eventName string
+	sawStop := false
+	stopReasonWire := ""
+	// toolCalls tracks tool_use blocks by index for EventToolCall
+	// assembly (id/name at content_block_start, arguments concatenated
+	// across input_json_delta chunks).
+	toolCalls := map[int]*ai.ToolCall{}
+	var toolOrder []int
+	// blocks/blockOrder capture EVERY content block (text,
+	// thinking/redacted_thinking, tool_use) verbatim and in stream
+	// order, for Event.ProviderState (REQ: anthropic-thinking-block-
+	// replay, B2): the entire assistant content array, byte-faithful,
+	// so a later request replays it exactly rather than rebuilding it
+	// from Text/ToolCalls (which would drop interleaved thinking).
+	// thinking_delta/signature_delta are captured here but never
+	// emitted as EventTextDelta.
+	blocks := map[int]*providerStateBlock{}
+	var blockOrder []int
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		case strings.HasPrefix(line, "data:"):
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "" {
+				continue
+			}
+			var se sseEvent
+			if err := json.Unmarshal([]byte(data), &se); err != nil {
+				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: fmt.Sprintf("anthropic: bad event %q: %v", eventName, err)})
+				return
+			}
+			typ := se.Type
+			if typ == "" {
+				typ = eventName
+			}
+			switch typ {
+			case "message_start":
+				if se.Message != nil && se.Message.Usage != nil {
+					usage = mergeUsage(usage, toUsage(se.Message.Usage))
 				}
-				var se sseEvent
-				if err := json.Unmarshal([]byte(data), &se); err != nil {
-					yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: fmt.Sprintf("anthropic: bad event %q: %v", eventName, err)})
-					return
-				}
-				typ := se.Type
-				if typ == "" {
-					typ = eventName
-				}
-				switch typ {
-				case "message_start":
-					if se.Message != nil && se.Message.Usage != nil {
-						usage = mergeUsage(usage, toUsage(se.Message.Usage))
+			case "content_block_start":
+				if se.Index != nil && se.ContentBlock != nil {
+					idx := *se.Index
+					blocks[idx] = &providerStateBlock{Type: se.ContentBlock.Type}
+					blockOrder = append(blockOrder, idx)
+					switch se.ContentBlock.Type {
+					case "tool_use":
+						toolCalls[idx] = &ai.ToolCall{ID: se.ContentBlock.ID, Name: se.ContentBlock.Name}
+						toolOrder = append(toolOrder, idx)
+						blocks[idx].ID = se.ContentBlock.ID
+						blocks[idx].Name = se.ContentBlock.Name
+					case "redacted_thinking":
+						blocks[idx].Data = se.ContentBlock.Data
 					}
-				case "content_block_start":
-					if se.Index != nil && se.ContentBlock != nil {
-						idx := *se.Index
-						blocks[idx] = &providerStateBlock{Type: se.ContentBlock.Type}
-						blockOrder = append(blockOrder, idx)
-						switch se.ContentBlock.Type {
-						case "tool_use":
-							toolCalls[idx] = &ai.ToolCall{ID: se.ContentBlock.ID, Name: se.ContentBlock.Name}
-							toolOrder = append(toolOrder, idx)
-							blocks[idx].ID = se.ContentBlock.ID
-							blocks[idx].Name = se.ContentBlock.Name
-						case "redacted_thinking":
-							blocks[idx].Data = se.ContentBlock.Data
-						}
+				}
+			case "content_block_delta":
+				if se.Delta == nil {
+					break
+				}
+				idx := 0
+				if se.Index != nil {
+					idx = *se.Index
+				}
+				switch se.Delta.Type {
+				case "text_delta":
+					if blk, ok := blocks[idx]; ok {
+						blk.Text += se.Delta.Text
 					}
-				case "content_block_delta":
-					if se.Delta == nil {
+					if se.Delta.Text == "" {
 						break
 					}
-					idx := 0
-					if se.Index != nil {
-						idx = *se.Index
+					if wantStructured {
+						textBuf.WriteString(se.Delta.Text)
 					}
-					switch se.Delta.Type {
-					case "text_delta":
-						if blk, ok := blocks[idx]; ok {
-							blk.Text += se.Delta.Text
-						}
-						if se.Delta.Text == "" {
-							break
-						}
-						if wantStructured {
-							textBuf.WriteString(se.Delta.Text)
-						}
-						if !yield(ai.Event{Type: ai.EventTextDelta, Text: se.Delta.Text}, nil) {
-							return
-						}
-					case "input_json_delta":
-						if call, ok := toolCalls[idx]; ok && se.Delta.PartialJSON != "" {
-							call.Arguments = append(call.Arguments, se.Delta.PartialJSON...)
-						}
-					case "thinking_delta":
-						// Never emitted as text; captured for replay.
-						if blk, ok := blocks[idx]; ok {
-							blk.Thinking += se.Delta.Thinking
-						}
-					case "signature_delta":
-						if blk, ok := blocks[idx]; ok {
-							blk.Signature += se.Delta.Signature
-						}
-					}
-				case "content_block_stop":
-					// Nothing to do: tool_use calls are emitted together,
-					// after message_stop, in stream order.
-				case "message_delta":
-					if se.Usage != nil {
-						usage = mergeUsage(usage, toUsage(se.Usage))
-						if !yield(ai.Event{Type: ai.EventUsage, Usage: usage}, nil) {
-							return
-						}
-					}
-					if se.Delta != nil && se.Delta.StopReason != "" {
-						stopReasonWire = se.Delta.StopReason
-					}
-					if stopReasonWire == "max_tokens" && wantStructured {
-						yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "anthropic: response truncated at max_tokens before a complete structured JSON object was produced"})
+					if !yield(ai.Event{Type: ai.EventTextDelta, Text: se.Delta.Text}, nil) {
 						return
 					}
-				case "message_stop":
-					sawStop = true
-				case "ping":
-					// keepalive; no-op.
-				case "error":
-					msg := "anthropic error"
-					if se.Error != nil {
-						msg = se.Error.Message
+				case "input_json_delta":
+					if call, ok := toolCalls[idx]; ok && se.Delta.PartialJSON != "" {
+						call.Arguments = append(call.Arguments, se.Delta.PartialJSON...)
 					}
-					yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: msg})
+				case "thinking_delta":
+					// Never emitted as text; captured for replay.
+					if blk, ok := blocks[idx]; ok {
+						blk.Thinking += se.Delta.Thinking
+					}
+				case "signature_delta":
+					if blk, ok := blocks[idx]; ok {
+						blk.Signature += se.Delta.Signature
+					}
+				}
+			case "content_block_stop":
+				// Nothing to do: tool_use calls are emitted together,
+				// after message_stop, in stream order.
+			case "message_delta":
+				if se.Usage != nil {
+					usage = mergeUsage(usage, toUsage(se.Usage))
+					if !yield(ai.Event{Type: ai.EventUsage, Usage: usage}, nil) {
+						return
+					}
+				}
+				if se.Delta != nil && se.Delta.StopReason != "" {
+					stopReasonWire = se.Delta.StopReason
+				}
+				if stopReasonWire == "max_tokens" && wantStructured {
+					yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "anthropic: response truncated at max_tokens before a complete structured JSON object was produced"})
 					return
 				}
-			}
-		}
-		if err := sc.Err(); err != nil {
-			yieldFatal(yield, toAIError(ctx, err))
-			return
-		}
-		if !sawStop {
-			yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "anthropic: stream truncated (no message_stop)"})
-			return
-		}
-
-		if wantStructured && textBuf.Len() > 0 {
-			raw := extractJSON(textBuf.String())
-			if !yield(ai.Event{Type: ai.EventStructured, Structured: json.RawMessage(raw)}, nil) {
+			case "message_stop":
+				sawStop = true
+			case "ping":
+				// keepalive; no-op.
+			case "error":
+				msg := "anthropic error"
+				if se.Error != nil {
+					msg = se.Error.Message
+				}
+				yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: msg})
 				return
 			}
 		}
-
-		for _, idx := range toolOrder {
-			call := *toolCalls[idx]
-			if call.ID == "" {
-				// m2: a malformed/absent id from the provider must not
-				// reach callers as "" -- Handler dispatch and
-				// ToolResult.CallID pairing both key off it.
-				call.ID = fmt.Sprintf("call_%d", idx)
-				if blk, ok := blocks[idx]; ok {
-					blk.ID = call.ID // keep ProviderState's tool_use.id consistent
-				}
-			}
-			if !yield(ai.Event{Type: ai.EventToolCall, ToolCall: &call}, nil) {
-				return
-			}
-		}
-
-		stopReason := ai.StopReasonEnd
-		switch stopReasonWire {
-		case "tool_use":
-			stopReason = ai.StopReasonToolCalls
-		case "max_tokens":
-			stopReason = ai.StopReasonLength
-		case "refusal":
-			stopReason = ai.StopReasonRefusal
-		case "pause_turn":
-			stopReason = ai.StopReasonPauseTurn
-		}
-		var providerState json.RawMessage
-		if len(blockOrder) > 0 {
-			ordered := make([]providerStateBlock, 0, len(blockOrder))
-			for _, idx := range blockOrder {
-				blk := *blocks[idx]
-				if call, ok := toolCalls[idx]; ok {
-					// X1 (r2 review): a no-argument tool call streams zero
-					// input_json_delta chunks, leaving call.Arguments empty.
-					// A tool_use content block always carries "input" on
-					// the wire (Anthropic requires the key even for an
-					// empty object) -- capture it as "{}" here, not "",
-					// so providerStateBlock's omitempty on Input doesn't
-					// drop the key entirely and the replay below doesn't
-					// need to special-case it either.
-					input := call.Arguments
-					if len(input) == 0 {
-						input = json.RawMessage("{}")
-					}
-					blk.Input = input
-				}
-				ordered = append(ordered, blk)
-			}
-			if b, err := json.Marshal(ordered); err == nil {
-				providerState = b
-			}
-		}
-		yield(ai.Event{Type: ai.EventCompleted, Usage: usage, StopReason: stopReason, ProviderState: providerState}, nil)
 	}
+	if err := sc.Err(); err != nil {
+		yieldFatal(yield, toAIError(ctx, err))
+		return
+	}
+	if !sawStop {
+		yieldFatal(yield, &ai.Error{Code: ai.ErrCodeUpstream, Message: "anthropic: stream truncated (no message_stop)"})
+		return
+	}
+
+	if wantStructured && textBuf.Len() > 0 {
+		raw := extractJSON(textBuf.String())
+		if !yield(ai.Event{Type: ai.EventStructured, Structured: json.RawMessage(raw)}, nil) {
+			return
+		}
+	}
+
+	for _, idx := range toolOrder {
+		call := *toolCalls[idx]
+		if call.ID == "" {
+			// m2: a malformed/absent id from the provider must not
+			// reach callers as "" -- Handler dispatch and
+			// ToolResult.CallID pairing both key off it.
+			call.ID = fmt.Sprintf("call_%d", idx)
+			if blk, ok := blocks[idx]; ok {
+				blk.ID = call.ID // keep ProviderState's tool_use.id consistent
+			}
+		}
+		if !yield(ai.Event{Type: ai.EventToolCall, ToolCall: &call}, nil) {
+			return
+		}
+	}
+
+	stopReason := ai.StopReasonEnd
+	switch stopReasonWire {
+	case "tool_use":
+		stopReason = ai.StopReasonToolCalls
+	case "max_tokens":
+		stopReason = ai.StopReasonLength
+	case "refusal":
+		stopReason = ai.StopReasonRefusal
+	case "pause_turn":
+		stopReason = ai.StopReasonPauseTurn
+	}
+	var providerState json.RawMessage
+	if len(blockOrder) > 0 {
+		ordered := make([]providerStateBlock, 0, len(blockOrder))
+		for _, idx := range blockOrder {
+			blk := *blocks[idx]
+			if call, ok := toolCalls[idx]; ok {
+				// X1 (r2 review): a no-argument tool call streams zero
+				// input_json_delta chunks, leaving call.Arguments empty.
+				// A tool_use content block always carries "input" on
+				// the wire (Anthropic requires the key even for an
+				// empty object) -- capture it as "{}" here, not "",
+				// so providerStateBlock's omitempty on Input doesn't
+				// drop the key entirely and the replay below doesn't
+				// need to special-case it either.
+				input := call.Arguments
+				if len(input) == 0 {
+					input = json.RawMessage("{}")
+				}
+				blk.Input = input
+			}
+			ordered = append(ordered, blk)
+		}
+		if b, err := json.Marshal(ordered); err == nil {
+			providerState = b
+		}
+	}
+	yield(ai.Event{Type: ai.EventCompleted, Usage: usage, StopReason: stopReason, ProviderState: providerState}, nil)
 }
 
 // yieldFatal yields the single fatal-pair event the LLMProvider contract
