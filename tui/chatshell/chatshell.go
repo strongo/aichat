@@ -152,6 +152,12 @@ func WithSidePanel(p SidePanel) Option {
 	}
 }
 
+// WithStatusBarVisibility controls whether the status segment reserves rows.
+// The provider can retain operational feedback while hiding optional hints.
+func WithStatusBarVisibility(visible func() bool) Option {
+	return func(m *Model) { m.statusBarVisibility = visible }
+}
+
 // WithGlobalKeys sets a product key hook checked before chatshell's own key
 // handling (see GlobalKeysFunc).
 func WithGlobalKeys(fn GlobalKeysFunc) Option {
@@ -281,15 +287,37 @@ type Model struct {
 	// sidePanel, when set (WithSidePanel), replaces sidebar for the whole
 	// sidebar zone: visibility, split percent and rendering all route
 	// through it instead of the sidebar field above.
-	sidePanel            SidePanel
-	sidePanelVisible     bool
-	sidePanelChatPercent int
-	globalKeys           GlobalKeysFunc
-	topBarFn             func(width int) string
-	statusBarFn          func(width int) string
-	topBarProvider       TopBarProvider
-	hintsProvider        HintsProvider
-	overlays             []Overlay
+	workspaceLayout              bool
+	workspaceHelp                func() Overlay
+	workspaceHelpOverlay         Overlay
+	workspaceModalHint           bool
+	overlayMouseX, overlayMouseY int
+	expandedHistoryOffset        int
+	composerActionLabel          string
+	composerAction               func() tea.Cmd
+	composerActionFocused        bool
+	composerReturn               workspaceCursor
+	workspaceGeneration          uint64
+	leftPanel                    SidePanel
+	leftVisible                  bool
+	leftFocused                  bool
+	compactRightPinned           bool
+	selectedStop                 int
+	expanded                     bool
+	expandedStop                 int
+	restoreLeft, restoreRight    bool
+	centerPanel                  SidePanel
+	centerFocused                bool
+	sidePanel                    SidePanel
+	sidePanelVisible             bool
+	sidePanelChatPercent         int
+	globalKeys                   GlobalKeysFunc
+	topBarFn                     func(width int) string
+	statusBarFn                  func(width int) string
+	topBarProvider               TopBarProvider
+	hintsProvider                HintsProvider
+	statusBarVisibility          func() bool
+	overlays                     []Overlay
 
 	commands             []Command
 	commandMenuIndex     int
@@ -721,6 +749,11 @@ func stopForRawIndex(entries []transcript.Entry, idx int) int {
 // transcript on the next zone change or resize, so leaving it stale would
 // silently undo the recomputed focus the next time that happens.
 func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
+	selectedRaw, expandedRaw := -1, -1
+	if m.workspaceLayout {
+		selectedRaw = rawIndexForStop(m.transcript.Entries(), m.selectedStop)
+		expandedRaw = rawIndexForStop(m.transcript.Entries(), m.expandedStop)
+	}
 	var hadFocus bool
 	var oldStop int
 	focusedRawIdx := -1
@@ -739,6 +772,13 @@ func (m *Model) ReplaceBlock(entryID string, b transcript.Block) {
 	}
 
 	m.transcript.ReplaceBlock(entryID, b)
+	if m.workspaceLayout {
+		m.selectedStop = stopForRawIndex(m.transcript.Entries(), selectedRaw)
+		m.expandedStop = stopForRawIndex(m.transcript.Entries(), expandedRaw)
+		if m.expanded && m.expandedStop < 0 {
+			m.RestoreWorkspace()
+		}
+	}
 
 	if m.focusRing.Zone() != focus.ZoneTranscript {
 		return
@@ -799,6 +839,13 @@ func (m *Model) FocusEntry(id string) bool {
 	if stop < 0 {
 		return false
 	}
+	if m.workspaceLayout {
+		m.leftFocused, m.centerFocused = false, false
+		m.centerPanel = nil
+		if m.expanded && stop != m.expandedStop {
+			m.RestoreWorkspace()
+		}
+	}
 	m.focusRing.FocusStop(stop)
 	m.syncFocus()
 	return true
@@ -830,6 +877,13 @@ func (m *Model) SetComposerText(s string) {
 // NOT itself clear m.chips: which chips belong to the new session is the
 // product's call, made via SetChips, not ClearTranscript's.
 func (m *Model) ClearTranscript() {
+	if m.workspaceLayout {
+		m.workspaceGeneration++
+		m.RestoreWorkspace()
+		m.selectedStop = -1
+		m.composerReturn = workspaceCursor{}
+		m.leftFocused, m.centerFocused = false, false
+	}
 	m.cancelStream()
 	m.streamID = ""
 	m.streamCancel = nil
@@ -853,6 +907,9 @@ func (m *Model) ClearTranscript() {
 // centred over the screen.
 func (m *Model) PushOverlay(o Overlay) tea.Cmd {
 	m.overlays = append(m.overlays, o)
+	if m.workspaceLayout {
+		m.syncFocus()
+	}
 	return nil
 }
 
@@ -892,6 +949,9 @@ func (m *Model) PopOverlay() tea.Cmd {
 		return nil
 	}
 	m.overlays = m.overlays[:len(m.overlays)-1]
+	if m.workspaceLayout {
+		m.syncFocus()
+	}
 	return nil
 }
 
@@ -918,6 +978,9 @@ func (m *Model) CloseOverlay(o Overlay) bool {
 	for i, existing := range m.overlays {
 		if id, ok := overlayIdentity(existing); ok && id == target {
 			m.overlays = append(m.overlays[:i], m.overlays[i+1:]...)
+			if m.workspaceLayout {
+				m.syncFocus()
+			}
 			return true
 		}
 	}
@@ -1079,7 +1142,11 @@ func (m *Model) updatePanel(msg tea.Msg) tea.Cmd {
 // — a terminal that never answers simply leaves theme's own guessed
 // default in effect, exactly as before this feature existed.
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, tea.RequestBackgroundColor)
+	var product tea.Cmd
+	if h, ok := m.handler.(interface{ Init() tea.Cmd }); ok {
+		product = h.Init()
+	}
+	return tea.Batch(textarea.Blink, tea.RequestBackgroundColor, product)
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1103,7 +1170,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// sidebar/product messages, ...) takes the normal path below so a
 	// stream can keep completing, busy can keep clearing, etc. while a
 	// dialog is open.
+	if m.workspaceLayout && m.workspaceHelp != nil {
+		if key, ok := msg.(tea.KeyPressMsg); ok && key.String() == "f1" {
+			return m, m.toggleWorkspaceHelp()
+		}
+	}
 	if len(m.overlays) > 0 && isOverlayInputMsg(msg) {
+		if m.workspaceLayout {
+			m.workspaceModalHint = false
+			if key, ok := msg.(tea.KeyPressMsg); ok {
+				switch key.String() {
+				case "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10":
+					m.workspaceModalHint = true
+					return m, nil
+				}
+			}
+		}
 		return m.updateOverlay(msg)
 	}
 
@@ -1196,6 +1278,9 @@ const splitSeparatorWidth = 0
 // wheel event that already arrived is honoured regardless, same as
 // chatshell honours a key press it happens to receive.
 func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	if m.workspaceLayout {
+		return m, m.workspaceWheel(msg)
+	}
 	// cmds may collect nil entries below -- tea.Batch (via its compactCmds
 	// helper) ignores them, so every branch can append unconditionally
 	// instead of each needing its own "if cmd != nil" guard, several of
@@ -1280,11 +1365,23 @@ func isOverlayInputMsg(msg tea.Msg) bool {
 // otherwise handle itself, per the Overlay contract.
 func (m *Model) updateOverlay(msg tea.Msg) (tea.Model, tea.Cmd) {
 	top := len(m.overlays) - 1
+	if click, ok := msg.(tea.MouseClickMsg); ok && m.workspaceLayout {
+		if local, ok := m.overlays[top].(interface{ LocalMouseCoordinates() bool }); ok && local.LocalMouseCoordinates() {
+			click.X -= m.overlayMouseX
+			click.Y -= m.overlayMouseY
+			msg = click
+		}
+	}
 	updated, cmd, done := m.overlays[top].Update(msg)
 	if done {
-		m.overlays = m.overlays[:top]
+		// Update may synchronously push a replacement dialog. Remove only
+		// the originating overlay, retaining anything it pushed above itself.
+		m.overlays = append(m.overlays[:top], m.overlays[top+1:]...)
 	} else {
 		m.overlays[top] = updated
+	}
+	if m.workspaceLayout {
+		m.syncFocus()
 	}
 	return m, cmd
 }
@@ -1437,6 +1534,10 @@ func isCanceled(err error) bool {
 }
 
 func (m *Model) resize() {
+	if m.workspaceLayout {
+		m.resizeWorkspace()
+		return
+	}
 	m.transcript.SetSize(m.chatWidth(), m.historyHeight())
 	composerCols, _ := theme.ComposerFrameSize()
 	m.input.SetWidth(max(1, m.chatWidth()-composerCols))
@@ -1461,6 +1562,10 @@ func (m *Model) splitEnabled() bool { return m.width >= splitMinWidth && m.panel
 // in theme.PanelFrame/Card, which already draw flush to whatever width
 // they're given.
 func (m *Model) chatWidth() int {
+	if m.workspaceLayout {
+		_, w, _ := m.workspaceWidths()
+		return w
+	}
 	if !m.splitEnabled() {
 		return max(1, m.width-1)
 	}
@@ -1501,6 +1606,9 @@ func (m *Model) sidebarWidth() int {
 // transcript's rendered size from ever going stale relative to it; see
 // View's own doc.
 func (m *Model) historyHeight() int {
+	if m.workspaceLayout {
+		return max(1, m.workspaceBodyHeight()-m.workspaceComposerHeight()-m.menuHeight()-m.chipsHeight(m.chatWidth()))
+	}
 	busySpinnerLine := 0
 	if m.busy {
 		busySpinnerLine = 1
@@ -1569,7 +1677,7 @@ func (m *Model) menuHeight() int {
 // bottom edge must be the last screen line (no trailing empty rows);
 // with hints, the hints are the last line(s)."
 func (m *Model) statusBarVisible() bool {
-	return m.hintsProvider != nil || m.statusBarFn != nil || m.status != ""
+	return (m.statusBarVisibility == nil || m.statusBarVisibility()) && (m.hintsProvider != nil || m.statusBarFn != nil || m.status != "")
 }
 
 // statusSegmentHeight is how many rows View()'s status segment occupies:
@@ -1581,6 +1689,10 @@ func (m *Model) statusBarVisible() bool {
 // one, so an active-but-empty status is not "0 rows of chrome" (only a
 // genuinely ABSENT one is).
 func (m *Model) statusSegmentHeight() int {
+	if m.workspaceLayout && m.statusBarVisible() {
+		// Keep history and the editable composer reachable on short terminals.
+		return min(max(1, lipgloss.Height(m.statusBarView())), max(0, m.height-m.topBarHeight()-4))
+	}
 	if !m.statusBarVisible() {
 		return 0
 	}
@@ -1630,6 +1742,11 @@ func (m *Model) statusBarView() string {
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.globalKeys != nil {
 		if cmd, consumed := m.globalKeys(msg); consumed {
+			return m, cmd
+		}
+	}
+	if m.workspaceLayout {
+		if cmd, consumed := m.workspaceKey(msg); consumed {
 			return m, cmd
 		}
 	}
@@ -1709,7 +1826,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.resize()
 		return m, nil
 	case "shift+up":
-		if m.focusRing.Zone() == focus.ZoneInput && strings.TrimSpace(m.input.Value()) != "" {
+		if !m.workspaceLayout && m.focusRing.Zone() == focus.ZoneInput && strings.TrimSpace(m.input.Value()) != "" {
 			break // let the composer handle cursor movement instead
 		}
 		if m.focusRing.ShiftUp(m.transcript.Stops()) {
@@ -1775,6 +1892,19 @@ func (m *Model) tick(d time.Duration, fn func(time.Time) tea.Msg) tea.Cmd {
 type markdownRenderTickMsg struct{ id string }
 
 func (m *Model) syncFocus() {
+	if m.workspaceLayout && len(m.overlays) > 0 {
+		m.input.Blur()
+		m.transcript.Blur()
+		return
+	}
+	if m.workspaceLayout && (m.leftFocused || m.centerFocused) {
+		m.input.Blur()
+		m.transcript.Blur()
+		return
+	}
+	if m.workspaceLayout && m.focusRing.Zone() == focus.ZoneTranscript {
+		m.selectedStop = m.focusRing.Stop()
+	}
 	switch m.focusRing.Zone() {
 	case focus.ZoneTranscript:
 		m.chipFocus = -1
@@ -1794,6 +1924,9 @@ func (m *Model) syncFocus() {
 		m.chipFocus = -1
 		m.transcript.Blur()
 		m.input.Focus()
+	}
+	if m.composerActionFocused {
+		m.input.Blur()
 	}
 }
 
@@ -2014,6 +2147,9 @@ func composerTextAreaStyles(focused bool) textarea.Styles {
 // more robust than hunting down every call site that can change chrome
 // height.
 func (m *Model) View() tea.View {
+	if m.workspaceLayout {
+		return m.workspaceView()
+	}
 	m.resize()
 	inputFocused := m.focusRing.Zone() == focus.ZoneInput
 	m.input.SetStyles(composerTextAreaStyles(inputFocused))
@@ -2102,11 +2238,22 @@ func (m *Model) View() tea.View {
 // renderOverlay composes the top overlay's view centred over base.
 func (m *Model) renderOverlay(base string, o Overlay) string {
 	ow, oh := max(1, m.width*2/3), max(1, m.height*2/3)
+	if m.workspaceLayout {
+		ow, oh = max(1, min(100, m.width-6)), max(1, m.height-6)
+	}
 	overlayView := o.View(ow, oh)
 	// Clamp regardless of what the overlay actually drew: a misbehaving or
 	// content-driven Overlay.View must never blow out the layout past the
 	// box it was asked to render into.
 	clamped := lipgloss.NewStyle().MaxWidth(ow).MaxHeight(oh).Render(overlayView)
+	if m.workspaceLayout {
+		panel := theme.WorkspaceSurface(clamped, ow, min(oh, max(1, lipgloss.Height(clamped))), true)
+		frame := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(theme.MutedColor()).Padding(0, 1).Render(panel)
+		m.overlayMouseX = (m.width-lipgloss.Width(frame))/2 + 4
+		m.overlayMouseY = 1 + (max(1, m.height-2)-lipgloss.Height(frame))/2 + 1
+		body := lipgloss.Place(m.width, max(1, m.height-2), lipgloss.Center, lipgloss.Center, frame, lipgloss.WithWhitespaceChars(" "))
+		return fitWorkspace(m.topBarView()+"\n"+body+"\n"+theme.StatusLine(m.width, "F1 Hotkeys · Esc close dialog"), m.width, m.height)
+	}
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, clamped, lipgloss.WithWhitespaceChars(" "))
 }
 
