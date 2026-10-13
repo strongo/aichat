@@ -3,6 +3,7 @@ package chatshell
 import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/tuigoff/tuigoff/pkg/focus"
+	"github.com/tuigoff/tuigoff/pkg/theme"
 	"strings"
 )
 
@@ -62,12 +63,30 @@ func (m *Model) workspaceComposerActionKey(msg tea.KeyPressMsg) (tea.Cmd, bool) 
 }
 
 func (m *Model) workspaceComposerContent(width, height int) string {
-	if m.composerAction == nil {
+	rows := 0
+	metadata := ""
+	if m.workspaceComposerMetadata != nil {
+		metadata = theme.WorkspaceMetadata(m.workspaceComposerMetadata())
+		rows++
+	}
+	action := ""
+	if m.composerAction != nil {
+		prefix := "  "
+		if m.composerActionFocused {
+			prefix = "› "
+		}
+		action = prefix + m.composerActionLabel + " " + theme.WorkspaceKeyHint("Tab, Enter")
+		rows++
+	}
+	if rows == 0 {
 		return m.input.View()
 	}
-	prefix := "  "
-	if m.composerActionFocused {
-		prefix = "› "
+	text := fitWorkspace(m.input.View(), m.workspaceContentWidth(), max(1, height-rows))
+	if metadata != "" {
+		text = metadata + "\n" + text
 	}
-	return fitWorkspace(m.input.View(), max(1, width-2), max(1, height-1)) + "\n" + prefix + m.composerActionLabel + " [Tab, Enter]"
+	if action != "" {
+		text += "\n" + action
+	}
+	return text
 }

@@ -27,6 +27,7 @@ func WithWorkspace(left SidePanel) Option {
 // FocusComposer transfers exclusive keyboard focus to the persistent composer.
 func (m *Model) FocusComposer() {
 	m.composerActionFocused = false
+	m.workspaceTabFocused = false
 	if m.workspaceLayout && (m.leftFocused || m.centerFocused || m.Zone() != focus.ZoneInput) {
 		m.composerReturn = m.workspaceCursor()
 	}
@@ -38,6 +39,9 @@ func (m *Model) FocusComposer() {
 
 // WorkspaceFocus names the active control, including the two optional panels.
 func (m *Model) WorkspaceFocus() string {
+	if m.workspaceTabFocused {
+		return "session-tabs"
+	}
 	if m.leftFocused {
 		return "explorer"
 	}
@@ -83,6 +87,7 @@ func (m *Model) RestoreWorkspace() {
 
 // SetCenterPanel shows non-chat Explore/API content above the same composer.
 func (m *Model) SetCenterPanel(p SidePanel, focused bool) {
+	m.workspaceTabFocused = false
 	m.RestoreWorkspace()
 	m.centerPanel = p
 	m.leftFocused = false
@@ -103,18 +108,24 @@ func (m *Model) workspaceComposerHeight() int {
 func (m *Model) workspaceWidths() (left, center, right int) {
 	if m.leftVisible && m.leftPanel != nil {
 		left = min(28, max(16, m.width/5))
+		if m.workspaceLeftWidth > 0 {
+			left = max(16, min(m.workspaceLeftWidth, max(16, m.width-30)))
+		}
 	}
 	if m.sidePanelVisible && m.sidePanel != nil {
 		right = min(34, max(18, m.width/4))
+		if m.workspaceRightWidth > 0 {
+			right = max(18, min(m.workspaceRightWidth, max(18, m.width-30)))
+		}
 	}
 	if m.width < 100 {
 		if !m.compactRightPinned && m.Zone() != focus.ZoneSidebar {
 			right = 0
 		}
-		if left > 0 {
+		if left > 0 && m.workspaceLeftWidth == 0 {
 			left = min(24, max(16, m.width/3))
 		}
-		if right > 0 && m.Zone() == focus.ZoneSidebar {
+		if right > 0 && m.Zone() == focus.ZoneSidebar && m.workspaceRightWidth == 0 {
 			right = min(34, max(18, m.width/2))
 		}
 	}
@@ -131,9 +142,19 @@ func (m *Model) workspaceWidths() (left, center, right int) {
 	center = max(1, m.width-left-right)
 	return
 }
+
+// workspaceSurfaceWidth includes the existing marker and spacer, reserving the
+// optional right frame cell once for every center renderer.
+func (m *Model) workspaceSurfaceWidth() int { return max(1, m.chatWidth()-m.workspaceFrameBottom()) }
+func (m *Model) workspaceContentWidth() int {
+	return max(1, m.workspaceSurfaceWidth()-workspaceContentInset)
+}
+
+const workspaceContentInset = 2
+
 func (m *Model) resizeWorkspace() {
-	m.transcript.SetSize(m.chatWidth(), m.historyHeight())
-	m.input.SetWidth(max(1, m.chatWidth()-3))
+	m.transcript.SetSize(m.workspaceSurfaceWidth(), m.historyHeight())
+	m.input.SetWidth(max(1, m.workspaceContentWidth()-1))
 	m.input.SetHeight(max(1, m.workspaceComposerHeight()-2))
 }
 func (m *Model) workspaceKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
@@ -144,6 +165,22 @@ func (m *Model) workspaceKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
 		return cmd, true
 	}
 	switch msg.String() {
+	case "ctrl+shift+left", "shift+ctrl+left", "ctrl+shift+right", "shift+ctrl+right":
+		if !m.workspacePanelControls || (!m.leftFocused && m.Zone() != focus.ZoneSidebar) {
+			return nil, false
+		}
+		l, _, r := m.workspaceWidths()
+		delta := 2
+		if strings.HasSuffix(msg.String(), "left") {
+			delta = -2
+		}
+		if m.leftFocused {
+			m.workspaceLeftWidth = max(16, min(l+delta, max(16, m.width-30-r)))
+		} else {
+			m.workspaceRightWidth = max(18, min(r+delta, max(18, m.width-30-l)))
+		}
+		m.resize()
+		return nil, true
 	case "ctrl+c":
 		// Preserve the shell's cancel/quit handler from every workspace panel.
 		return nil, false
@@ -321,16 +358,16 @@ func (m *Model) workspaceView() tea.View {
 	m.resizeWorkspace()
 	l, c, r := m.workspaceWidths()
 	h := m.workspaceBodyHeight()
-	interactive := len(m.overlays) == 0
+	interactive := len(m.overlays) == 0 && !m.workspaceTabFocused
 	inputFocus := interactive && !m.leftFocused && !m.centerFocused && m.Zone() == focus.ZoneInput
 	m.input.SetStyles(composerTextAreaStyles(false))
 	body := m.transcript.View()
 	if m.centerPanel != nil {
-		body = theme.WorkspaceSurface(m.centerPanel.View(max(1, c-2), m.historyHeight(), interactive && m.centerFocused), c, m.historyHeight(), interactive && m.centerFocused)
+		body = theme.WorkspaceSurface(m.centerPanel.View(m.workspaceContentWidth(), m.historyHeight(), interactive && m.centerFocused), m.workspaceSurfaceWidth(), m.historyHeight(), interactive && m.centerFocused)
 	}
 	if m.expanded {
 		if block := m.transcript.BlockAt(m.expandedStop); block != nil {
-			body = theme.WorkspaceSurface(block.View(max(1, c-2), interactive && m.Zone() == focus.ZoneTranscript && !m.leftFocused && !m.centerFocused), c, m.historyHeight(), interactive && m.Zone() == focus.ZoneTranscript && !m.leftFocused && !m.centerFocused)
+			body = theme.WorkspaceSurface(block.View(m.workspaceContentWidth(), interactive && m.Zone() == focus.ZoneTranscript && !m.leftFocused && !m.centerFocused), m.workspaceSurfaceWidth(), m.historyHeight(), interactive && m.Zone() == focus.ZoneTranscript && !m.leftFocused && !m.centerFocused)
 		}
 	}
 	if m.busy {
@@ -338,7 +375,12 @@ func (m *Model) workspaceView() tea.View {
 	}
 	parts := []string{}
 	if m.workspaceChatHeaderHeight() > 0 {
-		header, _, _ := m.workspaceChatTabRow(c)
+		header := ""
+		if m.workspaceChatTabs != nil && m.workspaceChatHeaderHeight() > 1 || !m.workspaceChatFrame {
+			header, _, _ = m.workspaceChatTabRow(c)
+		} else {
+			header = theme.WorkspaceFrameRule("╭" + strings.Repeat("─", max(0, c-2)) + "╮")
+		}
 		parts = append(parts, header)
 	}
 	parts = append(parts, body)
@@ -350,7 +392,7 @@ func (m *Model) workspaceView() tea.View {
 	}
 	// Constrain the upper content before appending the composer. Large chip or
 	// command menus may scroll/crop, but must never crop the active input away.
-	upper := fitWorkspace(strings.Join(parts, "\n"), c, max(1, h-m.workspaceComposerHeight()-m.workspaceComposerSeparation()))
+	upper := fitWorkspace(strings.Join(parts, "\n"), c, max(1, h-m.workspaceComposerHeight()-m.workspaceComposerSeparation()-m.workspaceFrameBottom()))
 	separator := ""
 	if m.workspaceComposerSeparation() > 0 {
 		bg, _ := theme.NeutralSurfaceColors(inputFocus)
@@ -360,18 +402,25 @@ func (m *Model) workspaceView() tea.View {
 		}
 		separator = strings.Repeat(" ", c) + "\n" + edge + "\n"
 	}
-	center := fitWorkspace(upper+"\n"+separator+theme.WorkspaceSurface(m.workspaceComposerContent(c, m.workspaceComposerHeight()), c, m.workspaceComposerHeight(), inputFocus), c, h)
+	center := fitWorkspace(upper+"\n"+separator+theme.WorkspaceSurface(m.workspaceComposerContent(c, m.workspaceComposerHeight()), m.workspaceSurfaceWidth(), m.workspaceComposerHeight(), inputFocus), c, h-m.workspaceFrameBottom())
+	if m.workspaceChatFrame {
+		markerTop := h - m.workspaceComposerHeight() - m.workspaceFrameBottom()
+		if m.workspaceComposerSeparation() > 0 {
+			markerTop--
+		}
+		center = theme.WorkspaceChatFrame(center, c, h, markerTop, inputFocus)
+	}
 	if h <= m.workspaceComposerHeight() {
-		center = theme.WorkspaceSurface(m.workspaceComposerContent(c, h), c, h, inputFocus)
+		center = theme.WorkspaceSurface(m.workspaceComposerContent(c, h), m.workspaceSurfaceWidth(), h, inputFocus)
 	}
 	columns := []string{}
 	if l > 0 {
-		columns = append(columns, theme.WorkspacePane(workspacePanelTitle(m.leftPanel), m.leftPanel.View(max(1, l-2), max(1, h-1), interactive && m.leftFocused), l, h, interactive && m.leftFocused, true))
+		columns = append(columns, m.workspaceSideView(m.leftPanel, l, h, interactive && m.leftFocused, true))
 	}
 	columns = append(columns, center)
 	if r > 0 {
 		active := interactive && !m.leftFocused && !m.centerFocused && m.Zone() == focus.ZoneSidebar
-		columns = append(columns, theme.WorkspacePane(workspacePanelTitle(m.sidePanel), m.sidePanel.View(max(1, r-2), max(1, h-1), active), r, h, active, false))
+		columns = append(columns, m.workspaceSideView(m.sidePanel, r, h, active, false))
 	}
 	top := m.topBarView()
 	if m.workspaceTopGap() > 0 {
@@ -391,7 +440,7 @@ func (m *Model) workspaceView() tea.View {
 		content = m.renderOverlay(content, m.overlays[n-1])
 		if m.workspaceModalHint {
 			lines := strings.Split(content, "\n")
-			lines[len(lines)-1] = fitWorkspace(theme.StatusLine(m.width, "F1 Hotkeys · Close dialog to return to workspace"), m.width, 1)
+			lines[len(lines)-1] = fitWorkspace(theme.StatusLine(m.width, m.workspaceDialogHint(true)), m.width, 1)
 			content = strings.Join(lines, "\n")
 		}
 	}
@@ -428,6 +477,7 @@ func (m *Model) SetLeftPanel(p SidePanel) {
 
 // FocusLeftPanel reveals the explorer and gives it exclusive keyboard focus.
 func (m *Model) FocusLeftPanel() {
+	m.workspaceTabFocused = false
 	m.leftVisible = m.leftPanel != nil
 	m.leftFocused = m.leftPanel != nil
 	m.centerFocused = false
@@ -441,8 +491,14 @@ func (m *Model) workspaceClick(msg tea.MouseClickMsg) tea.Cmd {
 	}
 	l, c, _ := m.workspaceWidths()
 	top := m.workspaceBodyTop()
-	if msg.Y == top && msg.X >= l && msg.X < l+c && m.workspaceChatHeaderHeight() > 0 {
+	if msg.Y < top {
+		return m.dispatchUnhandled(msg)
+	}
+	if msg.Y == top && msg.X >= l && msg.X < l+c && m.workspaceChatTabs != nil && m.workspaceChatHeaderHeight() > 0 && (!m.workspaceChatFrame || m.workspaceChatHeaderHeight() == 2) {
 		return m.workspaceChatTabClick(msg.X-l, c)
+	}
+	if m.workspaceChatFrame && msg.X >= l && msg.X < l+c && (msg.X == l || msg.X == l+c-1 || msg.Y == top+m.workspaceBodyHeight()-1 || msg.Y < m.workspaceHistoryTop()) {
+		return nil
 	}
 	if !m.busy && len(m.chips) > 0 && msg.X >= l && msg.X < l+c && msg.Y == m.workspaceHistoryTop()+m.historyHeight()+m.menuHeight() {
 		cells, _ := m.chipRow(c)
@@ -452,13 +508,10 @@ func (m *Model) workspaceClick(msg tea.MouseClickMsg) tea.Cmd {
 			}
 		}
 	}
-	if m.composerAction != nil && !m.busy && msg.X >= l+2 && msg.X < l+c && msg.Y == top+m.workspaceBodyHeight()-1 {
+	if m.composerAction != nil && !m.busy && msg.X >= l+2 && msg.X < l+c && msg.Y == top+m.workspaceBodyHeight()-1-m.workspaceFrameBottom() {
 		m.FocusComposer()
 		m.composerActionFocused = false
 		return m.composerAction()
-	}
-	if msg.Y < top {
-		return m.dispatchUnhandled(msg)
 	}
 	if msg.X < l && m.leftPanel != nil {
 		m.FocusLeftPanel()
@@ -469,6 +522,7 @@ func (m *Model) workspaceClick(msg tea.MouseClickMsg) tea.Cmd {
 		return cmd
 	}
 	if msg.X >= l+c && m.sidePanel != nil {
+		m.workspaceTabFocused = false
 		m.leftFocused = false
 		m.centerFocused = false
 		m.focusRing.FocusSidebar()
@@ -487,10 +541,23 @@ func (m *Model) workspaceClick(msg tea.MouseClickMsg) tea.Cmd {
 		m.leftFocused = false
 		m.centerFocused = true
 		m.syncFocus()
-		msg.X = max(0, msg.X-l-2)
+		msg.X = max(0, msg.X-l-workspaceContentInset)
 		msg.Y = max(0, msg.Y-m.workspaceHistoryTop())
 		p, cmd := m.centerPanel.Update(msg)
 		m.centerPanel = p
+		return cmd
+	}
+	if m.expanded && m.workspaceChatFrame {
+		original := msg
+		msg.X = max(0, msg.X-l-workspaceContentInset)
+		msg.Y = max(0, msg.Y-m.workspaceHistoryTop())
+		m.workspaceTabFocused = false
+		m.focusRing.FocusStop(m.expandedStop)
+		m.syncFocus()
+		cmd := m.transcript.UpdateFocused(msg)
+		if handler, ok := m.handler.(MsgHandler); ok {
+			return tea.Batch(cmd, handler.OnMsg(original))
+		}
 		return cmd
 	}
 	return m.dispatchUnhandled(msg)
@@ -498,6 +565,7 @@ func (m *Model) workspaceClick(msg tea.MouseClickMsg) tea.Cmd {
 
 // FocusRightPanel reveals Inspect and gives it exclusive focus.
 func (m *Model) FocusRightPanel() {
+	m.workspaceTabFocused = false
 	m.RestoreWorkspace()
 	m.sidePanelVisible = m.sidePanel != nil
 	m.leftFocused = false
@@ -646,4 +714,20 @@ func (m *Model) ShowTemporaryCenterPanel(p SidePanel, fullWidth ...bool) func() 
 		m.leftVisible, m.sidePanelVisible, m.restoreLeft, m.restoreRight = left, right, restoreLeft, restoreRight
 		m.restoreWorkspaceCursor(cursor)
 	}
+}
+
+func (m *Model) workspaceSideView(panel SidePanel, width, height int, active, left bool) string {
+	rows := max(1, height-1)
+	if active && m.workspacePanelControls {
+		rows = max(1, rows-1)
+	}
+	content := panel.View(max(1, width-2), rows, active)
+	if active && m.workspacePanelControls {
+		hint := theme.WorkspaceKeyHint("Ctrl+Shift+←/→") + " resize"
+		if width < 24 {
+			hint = theme.WorkspaceKeyHint("Ctrl⇧←/→") + " width"
+		}
+		content = fitWorkspace(content, max(1, width-2), rows) + "\n" + ansi.Truncate(hint, max(1, width-2), "")
+	}
+	return theme.WorkspacePane(workspacePanelTitle(panel), content, width, height, active, left)
 }

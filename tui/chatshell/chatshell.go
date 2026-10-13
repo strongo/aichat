@@ -112,6 +112,12 @@ type SidePanel interface {
 // last rendered content rectangle, excluding the frame, padding and marker.
 // Those clicks are ignored before the first render and after a resize until
 // View runs again. Other overlays retain their existing outside-click behavior.
+// WorkspaceBorderlessCard() bool optionally selects a lighter neutral card
+// with one row of vertical and two columns of left padding, omitting the marker and
+// outline. Its View receives the full usable content width; local mouse
+// coordinates exclude padding. The last content column touches the card edge,
+// allowing an embedded scrollbar to sit there. Other dialogs retain their frame.
+
 type Overlay interface {
 	View(width, height int) string
 	Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)
@@ -295,46 +301,54 @@ type Model struct {
 	// sidePanel, when set (WithSidePanel), replaces sidebar for the whole
 	// sidebar zone: visibility, split percent and rendering all route
 	// through it instead of the sidebar field above.
-	workspaceLayout              bool
-	workspaceSpacing             bool
-	inputEpoch                   uint64
-	workspaceTopBarProvider      TopBarProvider
-	workspaceChatTabs            WorkspaceChatTabsProvider
-	workspaceChatActivate        func(int) tea.Cmd
-	workspaceChatClose           func(int) tea.Cmd
-	workspaceChatTabActions      []WorkspaceTabAction
-	workspaceHelp                func() Overlay
-	workspaceHelpOverlay         Overlay
-	workspaceModalHint           bool
-	overlayMouseX, overlayMouseY int
-	overlayMouseBounds           image.Rectangle
-	overlayMouseOwner            uintptr
-	expandedHistoryOffset        int
-	composerActionLabel          string
-	composerAction               func() tea.Cmd
-	composerActionFocused        bool
-	composerReturn               workspaceCursor
-	workspaceGeneration          uint64
-	leftPanel                    SidePanel
-	leftVisible                  bool
-	leftFocused                  bool
-	compactRightPinned           bool
-	selectedStop                 int
-	expanded                     bool
-	expandedStop                 int
-	restoreLeft, restoreRight    bool
-	centerPanel                  SidePanel
-	centerFocused                bool
-	sidePanel                    SidePanel
-	sidePanelVisible             bool
-	sidePanelChatPercent         int
-	globalKeys                   GlobalKeysFunc
-	topBarFn                     func(width int) string
-	statusBarFn                  func(width int) string
-	topBarProvider               TopBarProvider
-	hintsProvider                HintsProvider
-	statusBarVisibility          func() bool
-	overlays                     []Overlay
+	workspaceLayout                         bool
+	workspaceSpacing                        bool
+	workspacePanelControls                  bool
+	workspaceChatFrame                      bool
+	workspaceChromeProvider                 func(int) theme.WorkspaceChrome
+	workspaceComposerMetadata               func() theme.WorkspaceContext
+	workspaceTabFocused                     bool
+	workspaceTabSelection                   int
+	workspaceTabReturn                      workspaceCursor
+	workspaceLeftWidth, workspaceRightWidth int
+	inputEpoch                              uint64
+	workspaceTopBarProvider                 TopBarProvider
+	workspaceChatTabs                       WorkspaceChatTabsProvider
+	workspaceChatActivate                   func(int) tea.Cmd
+	workspaceChatClose                      func(int) tea.Cmd
+	workspaceChatTabActions                 []WorkspaceTabAction
+	workspaceHelp                           func() Overlay
+	workspaceHelpOverlay                    Overlay
+	workspaceModalHint                      bool
+	overlayMouseX, overlayMouseY            int
+	overlayMouseBounds                      image.Rectangle
+	overlayMouseOwner                       uintptr
+	expandedHistoryOffset                   int
+	composerActionLabel                     string
+	composerAction                          func() tea.Cmd
+	composerActionFocused                   bool
+	composerReturn                          workspaceCursor
+	workspaceGeneration                     uint64
+	leftPanel                               SidePanel
+	leftVisible                             bool
+	leftFocused                             bool
+	compactRightPinned                      bool
+	selectedStop                            int
+	expanded                                bool
+	expandedStop                            int
+	restoreLeft, restoreRight               bool
+	centerPanel                             SidePanel
+	centerFocused                           bool
+	sidePanel                               SidePanel
+	sidePanelVisible                        bool
+	sidePanelChatPercent                    int
+	globalKeys                              GlobalKeysFunc
+	topBarFn                                func(width int) string
+	statusBarFn                             func(width int) string
+	topBarProvider                          TopBarProvider
+	hintsProvider                           HintsProvider
+	statusBarVisibility                     func() bool
+	overlays                                []Overlay
 
 	commands             []Command
 	commandMenuIndex     int
@@ -857,6 +871,7 @@ func (m *Model) FocusEntry(id string) bool {
 		return false
 	}
 	if m.workspaceLayout {
+		m.workspaceTabFocused = false
 		m.leftFocused, m.centerFocused = false, false
 		m.centerPanel = nil
 		if m.expanded && stop != m.expandedStop {
@@ -896,6 +911,7 @@ func (m *Model) SetComposerText(s string) {
 func (m *Model) ClearTranscript() {
 	if m.workspaceLayout {
 		m.workspaceGeneration++
+		m.workspaceTabFocused = false
 		m.RestoreWorkspace()
 		m.selectedStop = -1
 		m.composerReturn = workspaceCursor{}
@@ -1640,7 +1656,7 @@ func (m *Model) sidebarWidth() int {
 // View's own doc.
 func (m *Model) historyHeight() int {
 	if m.workspaceLayout {
-		return max(1, m.workspaceBodyHeight()-m.workspaceComposerHeight()-m.workspaceComposerSeparation()-m.workspaceChatHeaderHeight()-m.menuHeight()-m.chipsHeight(m.chatWidth()))
+		return max(1, m.workspaceBodyHeight()-m.workspaceComposerHeight()-m.workspaceComposerSeparation()-m.workspaceChatHeaderHeight()-m.workspaceFrameBottom()-m.menuHeight()-m.chipsHeight(m.chatWidth()))
 	}
 	busySpinnerLine := 0
 	if m.busy {
@@ -1930,7 +1946,7 @@ func (m *Model) syncFocus() {
 		m.transcript.Blur()
 		return
 	}
-	if m.workspaceLayout && (m.leftFocused || m.centerFocused) {
+	if m.workspaceLayout && (m.leftFocused || m.centerFocused || m.workspaceTabFocused) {
 		m.input.Blur()
 		m.transcript.Blur()
 		return
@@ -2084,6 +2100,8 @@ func (m *Model) commandMenuMatches() []Command {
 // render more than one.
 func (m *Model) topBarView() string {
 	switch {
+	case m.workspaceLayout && m.workspaceChromeProvider != nil:
+		return theme.WorkspaceChromeBar(m.width, m.workspaceChromeProvider(m.width))
 	case m.workspaceLayout && m.workspaceTopBarProvider != nil:
 		title, context, items := m.workspaceTopBarProvider(m.width)
 		return theme.WorkspaceTopBar(m.width, title, context, items)
@@ -2274,8 +2292,13 @@ func (m *Model) View() tea.View {
 // renderOverlay composes the top overlay's view centred over base.
 func (m *Model) renderOverlay(base string, o Overlay) string {
 	ow, oh := max(1, m.width*2/3), max(1, m.height*2/3)
+	quietCard := false
 	if m.workspaceLayout {
 		ow, oh = max(1, min(100, m.width-6)), max(1, m.height-6)
+		if appearance, ok := o.(interface{ WorkspaceBorderlessCard() bool }); ok && appearance.WorkspaceBorderlessCard() {
+			quietCard = true
+			ow, oh = max(1, min(102, m.width-8)), max(1, m.height-8)
+		}
 	}
 	overlayView := o.View(ow, oh)
 	// Clamp regardless of what the overlay actually drew: a misbehaving or
@@ -2283,20 +2306,28 @@ func (m *Model) renderOverlay(base string, o Overlay) string {
 	// box it was asked to render into.
 	clamped := lipgloss.NewStyle().MaxWidth(ow).MaxHeight(oh).Render(overlayView)
 	if m.workspaceLayout {
-		panel := theme.WorkspaceSurface(clamped, ow, min(oh, max(1, lipgloss.Height(clamped))), true)
-		frame := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(theme.MutedColor()).Padding(0, 1).Render(panel)
-		m.overlayMouseX = (m.width-lipgloss.Width(frame))/2 + 4
-		m.overlayMouseY = 1 + (max(1, m.height-2)-lipgloss.Height(frame))/2 + 1
+		panelHeight := min(oh, max(1, lipgloss.Height(clamped)))
+		panel := theme.WorkspaceSurface(clamped, ow, panelHeight, true)
+		frameStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(theme.MutedColor()).Padding(0, 1)
+		insetX, insetY, contentWidth := 4, 1, max(0, ow-2)
+		if quietCard {
+			bg, fg := theme.NeutralSurfaceColors(true)
+			panel = theme.PaintOver(fitWorkspace(clamped, ow, panelHeight), bg, fg)
+			frameStyle = lipgloss.NewStyle().Background(bg).Foreground(fg).Padding(1, 0, 1, 2)
+			insetX, insetY, contentWidth = 2, 1, ow
+		}
+		frame := frameStyle.Render(panel)
+		m.overlayMouseX = (m.width-lipgloss.Width(frame))/2 + insetX
+		m.overlayMouseY = 1 + (max(1, m.height-2)-lipgloss.Height(frame))/2 + insetY
 		top := m.topBarView()
-		// WorkspaceSurface reserves two columns for its focus marker/spacer;
-		// the frame adds a border and padding. Place does not crop an oversized
-		// frame, so intersect its actual content rectangle with the final view.
-		x := max(0, (m.width-lipgloss.Width(frame))/2) + 4
-		y := lipgloss.Height(top) + max(0, (max(1, m.height-2)-lipgloss.Height(frame))/2) + 1
-		m.overlayMouseBounds = image.Rect(x, y, x+max(0, lipgloss.Width(panel)-2), y+lipgloss.Height(panel)).Intersect(image.Rect(0, 0, max(0, m.width), max(0, m.height)))
+		// Intersect the actual content rectangle with the final view. The opt-in
+		// quiet card has only padding; legacy dialogs keep their frame and marker.
+		x := max(0, (m.width-lipgloss.Width(frame))/2) + insetX
+		y := lipgloss.Height(top) + max(0, (max(1, m.height-2)-lipgloss.Height(frame))/2) + insetY
+		m.overlayMouseBounds = image.Rect(x, y, x+contentWidth, y+panelHeight).Intersect(image.Rect(0, 0, max(0, m.width), max(0, m.height)))
 		m.overlayMouseOwner, _ = overlayIdentity(o)
 		body := lipgloss.Place(m.width, max(1, m.height-2), lipgloss.Center, lipgloss.Center, frame, lipgloss.WithWhitespaceChars(" "))
-		return fitWorkspace(top+"\n"+body+"\n"+theme.StatusLine(m.width, "F1 Hotkeys · Esc close dialog"), m.width, m.height)
+		return fitWorkspace(top+"\n"+body+"\n"+theme.StatusLine(m.width, m.workspaceDialogHint(false)), m.width, m.height)
 	}
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, clamped, lipgloss.WithWhitespaceChars(" "))
 }
