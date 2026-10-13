@@ -3,6 +3,7 @@ package chatshell
 import (
 	"context"
 	"errors"
+	"image"
 	"image/color"
 	"iter"
 	"reflect"
@@ -104,6 +105,13 @@ type SidePanel interface {
 // re-wrapped) value Update last returned. A product using the async-safe
 // overlay pattern (see PopOverlay/CloseOverlay) MUST hold and pass the same
 // *T it originally gave PushOverlay.
+//
+// In the workspace layout, LocalMouseCoordinates() bool opts into content-local
+// MouseClickMsg coordinates. An overlay may additionally implement
+// BoundedMouseInput() bool and return true to receive clicks only inside the
+// last rendered content rectangle, excluding the frame, padding and marker.
+// Those clicks are ignored before the first render and after a resize until
+// View runs again. Other overlays retain their existing outside-click behavior.
 type Overlay interface {
 	View(width, height int) string
 	Update(msg tea.Msg) (o Overlay, cmd tea.Cmd, done bool)
@@ -292,6 +300,8 @@ type Model struct {
 	workspaceHelpOverlay         Overlay
 	workspaceModalHint           bool
 	overlayMouseX, overlayMouseY int
+	overlayMouseBounds           image.Rectangle
+	overlayMouseOwner            uintptr
 	expandedHistoryOffset        int
 	composerActionLabel          string
 	composerAction               func() tea.Cmd
@@ -907,6 +917,7 @@ func (m *Model) ClearTranscript() {
 // centred over the screen.
 func (m *Model) PushOverlay(o Overlay) tea.Cmd {
 	m.overlays = append(m.overlays, o)
+	m.overlayMouseBounds = image.Rectangle{}
 	if m.workspaceLayout {
 		m.syncFocus()
 	}
@@ -1155,6 +1166,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// also forwarded to an active SidePanel so it can lay itself out.
 	if wsz, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width, m.height = wsz.Width, wsz.Height
+		m.overlayMouseBounds = image.Rectangle{}
 		m.resize()
 		cmds := []tea.Cmd{m.transcript.Update(msg)}
 		if m.sidePanel != nil {
@@ -1367,8 +1379,17 @@ func (m *Model) updateOverlay(msg tea.Msg) (tea.Model, tea.Cmd) {
 	top := len(m.overlays) - 1
 	if click, ok := msg.(tea.MouseClickMsg); ok && m.workspaceLayout {
 		if local, ok := m.overlays[top].(interface{ LocalMouseCoordinates() bool }); ok && local.LocalMouseCoordinates() {
-			click.X -= m.overlayMouseX
-			click.Y -= m.overlayMouseY
+			if bounded, ok := m.overlays[top].(interface{ BoundedMouseInput() bool }); ok && bounded.BoundedMouseInput() {
+				owner, _ := overlayIdentity(m.overlays[top])
+				if owner != m.overlayMouseOwner || !image.Pt(click.X, click.Y).In(m.overlayMouseBounds) {
+					return m, nil
+				}
+				click.X -= m.overlayMouseBounds.Min.X
+				click.Y -= m.overlayMouseBounds.Min.Y
+			} else {
+				click.X -= m.overlayMouseX
+				click.Y -= m.overlayMouseY
+			}
 			msg = click
 		}
 	}
@@ -2251,8 +2272,16 @@ func (m *Model) renderOverlay(base string, o Overlay) string {
 		frame := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(theme.MutedColor()).Padding(0, 1).Render(panel)
 		m.overlayMouseX = (m.width-lipgloss.Width(frame))/2 + 4
 		m.overlayMouseY = 1 + (max(1, m.height-2)-lipgloss.Height(frame))/2 + 1
+		top := m.topBarView()
+		// WorkspaceSurface reserves two columns for its focus marker/spacer;
+		// the frame adds a border and padding. Place does not crop an oversized
+		// frame, so intersect its actual content rectangle with the final view.
+		x := max(0, (m.width-lipgloss.Width(frame))/2) + 4
+		y := lipgloss.Height(top) + max(0, (max(1, m.height-2)-lipgloss.Height(frame))/2) + 1
+		m.overlayMouseBounds = image.Rect(x, y, x+max(0, lipgloss.Width(panel)-2), y+lipgloss.Height(panel)).Intersect(image.Rect(0, 0, max(0, m.width), max(0, m.height)))
+		m.overlayMouseOwner, _ = overlayIdentity(o)
 		body := lipgloss.Place(m.width, max(1, m.height-2), lipgloss.Center, lipgloss.Center, frame, lipgloss.WithWhitespaceChars(" "))
-		return fitWorkspace(m.topBarView()+"\n"+body+"\n"+theme.StatusLine(m.width, "F1 Hotkeys · Esc close dialog"), m.width, m.height)
+		return fitWorkspace(top+"\n"+body+"\n"+theme.StatusLine(m.width, "F1 Hotkeys · Esc close dialog"), m.width, m.height)
 	}
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, clamped, lipgloss.WithWhitespaceChars(" "))
 }
