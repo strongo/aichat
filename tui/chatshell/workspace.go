@@ -95,9 +95,11 @@ func (m *Model) SetCenterPanel(p SidePanel, focused bool) {
 // ShowTranscript reveals the chat history without creating a second program.
 func (m *Model) ShowTranscript() { m.centerPanel = nil; m.FocusComposer() }
 func (m *Model) workspaceBodyHeight() int {
-	return max(1, m.height-m.topBarHeight()-m.statusSegmentHeight())
+	return max(1, m.height-m.workspaceBodyTop()-m.statusSegmentHeight())
 }
-func (m *Model) workspaceComposerHeight() int { return min(5, max(3, m.workspaceBodyHeight()/4)) }
+func (m *Model) workspaceComposerHeight() int {
+	return min(m.workspaceBodyHeight(), min(5, max(3, m.workspaceBodyHeight()/4)))
+}
 func (m *Model) workspaceWidths() (left, center, right int) {
 	if m.leftVisible && m.leftPanel != nil {
 		left = min(28, max(16, m.width/5))
@@ -135,6 +137,9 @@ func (m *Model) resizeWorkspace() {
 	m.input.SetHeight(max(1, m.workspaceComposerHeight()-2))
 }
 func (m *Model) workspaceKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
+	if cmd, handled := m.workspaceChatTabKey(msg); handled {
+		return cmd, true
+	}
 	if cmd, handled := m.workspaceComposerActionKey(msg); handled {
 		return cmd, true
 	}
@@ -331,7 +336,12 @@ func (m *Model) workspaceView() tea.View {
 	if m.busy {
 		body = fitWorkspace(body+"\n"+m.spinner.View()+" thinking…", c, m.historyHeight())
 	}
-	parts := []string{body}
+	parts := []string{}
+	if m.workspaceChatHeaderHeight() > 0 {
+		header, _, _ := m.workspaceChatTabRow(c)
+		parts = append(parts, header)
+	}
+	parts = append(parts, body)
 	if menu := m.commandMenuView(); menu != "" {
 		parts = append(parts, menu)
 	}
@@ -340,18 +350,39 @@ func (m *Model) workspaceView() tea.View {
 	}
 	// Constrain the upper content before appending the composer. Large chip or
 	// command menus may scroll/crop, but must never crop the active input away.
-	upper := fitWorkspace(strings.Join(parts, "\n"), c, max(1, h-m.workspaceComposerHeight()))
-	center := fitWorkspace(upper+"\n"+theme.WorkspaceSurface(m.workspaceComposerContent(c, m.workspaceComposerHeight()), c, m.workspaceComposerHeight(), inputFocus), c, h)
+	upper := fitWorkspace(strings.Join(parts, "\n"), c, max(1, h-m.workspaceComposerHeight()-m.workspaceComposerSeparation()))
+	separator := ""
+	if m.workspaceComposerSeparation() > 0 {
+		bg, _ := theme.NeutralSurfaceColors(inputFocus)
+		edge := strings.Repeat(" ", c)
+		if theme.HalfBlockEdgesActive() {
+			edge = theme.HalfBlockEdge(c, bg, true)
+		}
+		separator = strings.Repeat(" ", c) + "\n" + edge + "\n"
+	}
+	center := fitWorkspace(upper+"\n"+separator+theme.WorkspaceSurface(m.workspaceComposerContent(c, m.workspaceComposerHeight()), c, m.workspaceComposerHeight(), inputFocus), c, h)
+	if h <= m.workspaceComposerHeight() {
+		center = theme.WorkspaceSurface(m.workspaceComposerContent(c, h), c, h, inputFocus)
+	}
 	columns := []string{}
 	if l > 0 {
-		columns = append(columns, theme.WorkspacePane(m.leftPanel.Title(), m.leftPanel.View(max(1, l-2), max(1, h-1), interactive && m.leftFocused), l, h, interactive && m.leftFocused, true))
+		columns = append(columns, theme.WorkspacePane(workspacePanelTitle(m.leftPanel), m.leftPanel.View(max(1, l-2), max(1, h-1), interactive && m.leftFocused), l, h, interactive && m.leftFocused, true))
 	}
 	columns = append(columns, center)
 	if r > 0 {
 		active := interactive && !m.leftFocused && !m.centerFocused && m.Zone() == focus.ZoneSidebar
-		columns = append(columns, theme.WorkspacePane(m.sidePanel.Title(), m.sidePanel.View(max(1, r-2), max(1, h-1), active), r, h, active, false))
+		columns = append(columns, theme.WorkspacePane(workspacePanelTitle(m.sidePanel), m.sidePanel.View(max(1, r-2), max(1, h-1), active), r, h, active, false))
 	}
-	content := m.topBarView() + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, columns...)
+	top := m.topBarView()
+	if m.workspaceTopGap() > 0 {
+		bg, _ := theme.WorkspaceTopColors()
+		edge := strings.Repeat("─", max(1, m.width))
+		if theme.HalfBlockEdgesActive() {
+			edge = theme.HalfBlockEdge(m.width, bg, false)
+		}
+		top += "\n" + edge
+	}
+	content := top + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, columns...)
 	if rows := m.statusSegmentHeight(); rows > 0 {
 		content += "\n" + fitWorkspace(m.statusBarView(), m.width, rows)
 	}
@@ -409,8 +440,11 @@ func (m *Model) workspaceClick(msg tea.MouseClickMsg) tea.Cmd {
 		return nil
 	}
 	l, c, _ := m.workspaceWidths()
-	top := m.topBarHeight()
-	if !m.busy && len(m.chips) > 0 && msg.X >= l && msg.X < l+c && msg.Y == top+m.historyHeight()+m.menuHeight() {
+	top := m.workspaceBodyTop()
+	if msg.Y == top && msg.X >= l && msg.X < l+c && m.workspaceChatHeaderHeight() > 0 {
+		return m.workspaceChatTabClick(msg.X-l, c)
+	}
+	if !m.busy && len(m.chips) > 0 && msg.X >= l && msg.X < l+c && msg.Y == m.workspaceHistoryTop()+m.historyHeight()+m.menuHeight() {
 		cells, _ := m.chipRow(c)
 		for _, cell := range cells {
 			if msg.X-l == cell.x {
@@ -445,7 +479,7 @@ func (m *Model) workspaceClick(msg tea.MouseClickMsg) tea.Cmd {
 		m.sidePanel = p
 		return cmd
 	}
-	if msg.Y >= top+m.historyHeight()+m.menuHeight()+m.chipsHeight(c) {
+	if msg.Y >= m.workspaceHistoryTop()+m.historyHeight()+m.menuHeight()+m.chipsHeight(c) {
 		m.FocusComposer()
 		return nil
 	}
@@ -454,7 +488,7 @@ func (m *Model) workspaceClick(msg tea.MouseClickMsg) tea.Cmd {
 		m.centerFocused = true
 		m.syncFocus()
 		msg.X = max(0, msg.X-l-2)
-		msg.Y = max(0, msg.Y-top)
+		msg.Y = max(0, msg.Y-m.workspaceHistoryTop())
 		p, cmd := m.centerPanel.Update(msg)
 		m.centerPanel = p
 		return cmd
