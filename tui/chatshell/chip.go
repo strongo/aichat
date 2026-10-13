@@ -532,6 +532,9 @@ func (m *Model) chipsTopY() int {
 // before this case existed (mouse clicks had no chatshell-specific
 // handling and fell to the default branch of Update's switch).
 func (m *Model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	if m.workspaceLayout {
+		return m, m.workspaceClick(msg)
+	}
 	if cmd, ok := m.chipCloseClick(msg); ok {
 		return m, cmd
 	}
