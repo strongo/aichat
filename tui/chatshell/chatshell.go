@@ -296,6 +296,13 @@ type Model struct {
 	// sidebar zone: visibility, split percent and rendering all route
 	// through it instead of the sidebar field above.
 	workspaceLayout              bool
+	workspaceSpacing             bool
+	inputEpoch                   uint64
+	workspaceTopBarProvider      TopBarProvider
+	workspaceChatTabs            WorkspaceChatTabsProvider
+	workspaceChatActivate        func(int) tea.Cmd
+	workspaceChatClose           func(int) tea.Cmd
+	workspaceChatTabActions      []WorkspaceTabAction
 	workspaceHelp                func() Overlay
 	workspaceHelpOverlay         Overlay
 	workspaceModalHint           bool
@@ -1161,6 +1168,11 @@ func (m *Model) Init() tea.Cmd {
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if isOverlayInputMsg(msg) {
+		if _, release := msg.(tea.KeyReleaseMsg); !release {
+			m.inputEpoch++
+		}
+	}
 	// A WindowSizeMsg always resizes the shell, even with an overlay open
 	// (the overlay renders over the freshly resized screen next), and is
 	// also forwarded to an active SidePanel so it can lay itself out.
@@ -1628,7 +1640,7 @@ func (m *Model) sidebarWidth() int {
 // View's own doc.
 func (m *Model) historyHeight() int {
 	if m.workspaceLayout {
-		return max(1, m.workspaceBodyHeight()-m.workspaceComposerHeight()-m.menuHeight()-m.chipsHeight(m.chatWidth()))
+		return max(1, m.workspaceBodyHeight()-m.workspaceComposerHeight()-m.workspaceComposerSeparation()-m.workspaceChatHeaderHeight()-m.menuHeight()-m.chipsHeight(m.chatWidth()))
 	}
 	busySpinnerLine := 0
 	if m.busy {
@@ -2072,6 +2084,9 @@ func (m *Model) commandMenuMatches() []Command {
 // render more than one.
 func (m *Model) topBarView() string {
 	switch {
+	case m.workspaceLayout && m.workspaceTopBarProvider != nil:
+		title, context, items := m.workspaceTopBarProvider(m.width)
+		return theme.WorkspaceTopBar(m.width, title, context, items)
 	case m.topBarProvider != nil:
 		title, context, items := m.topBarProvider(m.width)
 		return theme.TopBar(m.width, title, context, items)
