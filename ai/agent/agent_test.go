@@ -88,14 +88,14 @@ func drain(t *testing.T, seq iter.Seq2[ai.Event, error]) (events []ai.Event, fat
 
 func TestLoop_TwoStepToolUse(t *testing.T) {
 	provider := &fakeProvider{steps: [][]ai.Event{
-		toolCallStep("let me check", ai.ToolCall{ID: "call_1", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 1"}`)}),
+		toolCallStep("let me check", ai.ToolCall{ID: "call_1", Name: "run_tugql", Arguments: json.RawMessage(`{"sql":"select 1"}`)}),
 		toolCallStep("the answer is 1"),
 	}}
 	var handlerCalls int
 	loop := &Loop{
 		Provider: provider,
 		Handlers: map[string]Handler{
-			"run_dtql": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+			"run_tugql": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
 				handlerCalls++
 				if call.ID != "call_1" {
 					t.Errorf("call.ID = %q", call.ID)

@@ -551,7 +551,7 @@ func TestStream_ToolCallsAssembledFromInputJSONDeltasTwoParallel(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		sseWrite(w, "message_start", `{"type":"message_start","message":{"model":"claude-haiku-4-5-20251001","usage":{"input_tokens":10}}}`)
-		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_a","name":"run_dtql"}}`)
+		sseWrite(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_a","name":"run_tugql"}}`)
 		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"sql\":"}}`)
 		sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"select 1\"}"}}`)
 		sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
@@ -567,7 +567,7 @@ func TestStream_ToolCallsAssembledFromInputJSONDeltasTwoParallel(t *testing.T) {
 	req := ai.ChatRequest{
 		Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
 		Tools: []ai.Tool{
-			{Name: "run_dtql", Schema: json.RawMessage(`{"type":"object"}`)},
+			{Name: "run_tugql", Schema: json.RawMessage(`{"type":"object"}`)},
 			{Name: "find_bookmarks", Schema: json.RawMessage(`{"type":"object"}`)},
 		},
 		ToolChoice: ai.ToolChoiceAuto,
@@ -590,7 +590,7 @@ func TestStream_ToolCallsAssembledFromInputJSONDeltasTwoParallel(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("got %d tool calls, want 2: %+v", len(calls), calls)
 	}
-	if calls[0].ID != "call_a" || calls[0].Name != "run_dtql" || string(calls[0].Arguments) != `{"sql":"select 1"}` {
+	if calls[0].ID != "call_a" || calls[0].Name != "run_tugql" || string(calls[0].Arguments) != `{"sql":"select 1"}` {
 		t.Errorf("call[0] = %+v", calls[0])
 	}
 	if calls[1].ID != "call_b" || calls[1].Name != "find_bookmarks" || string(calls[1].Arguments) != `{"q":"x"}` {
@@ -602,7 +602,7 @@ func TestStream_ToolCallsAssembledFromInputJSONDeltasTwoParallel(t *testing.T) {
 	if gotBody.ToolChoice == nil || gotBody.ToolChoice.Type != "auto" {
 		t.Errorf("tool_choice = %+v, want auto", gotBody.ToolChoice)
 	}
-	if len(gotBody.Tools) != 2 || gotBody.Tools[0].Name != "run_dtql" {
+	if len(gotBody.Tools) != 2 || gotBody.Tools[0].Name != "run_tugql" {
 		t.Errorf("tools = %+v", gotBody.Tools)
 	}
 }
@@ -627,7 +627,7 @@ func TestStream_ToolResultMessagesMergedAndReasoningSetsThinkingBudget(t *testin
 		Messages: []ai.Message{
 			{Role: ai.RoleUser, Text: "hi"},
 			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{
-				{ID: "call_a", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 1"}`)},
+				{ID: "call_a", Name: "run_tugql", Arguments: json.RawMessage(`{"sql":"select 1"}`)},
 				{ID: "call_b", Name: "find_bookmarks", Arguments: json.RawMessage(`{}`)},
 			}},
 			// Two consecutive RoleTool source messages must merge into ONE
@@ -1205,7 +1205,7 @@ func TestBuildMessages_EmptyAssistantTurnDroppedNotSentAsEmptyTextBlock(t *testi
 func TestBuildMessages_ReplayedEmptyTextBlockDropped(t *testing.T) {
 	ps, _ := json.Marshal([]map[string]any{
 		{"type": "text", "text": ""},
-		{"type": "tool_use", "id": "call_1", "name": "run_dtql", "input": map[string]any{}},
+		{"type": "tool_use", "id": "call_1", "name": "run_tugql", "input": map[string]any{}},
 	})
 	req := ai.ChatRequest{
 		Messages: []ai.Message{
@@ -1244,24 +1244,24 @@ func TestBuildMessages_ReplayedEmptyTextBlockDropped(t *testing.T) {
 func TestBuildMessages_ProviderStateReplayScopedToCurrentLoopOnly(t *testing.T) {
 	earlierPS, _ := json.Marshal([]map[string]any{
 		{"type": "thinking", "thinking": "earlier reasoning", "signature": "sig-old"},
-		{"type": "tool_use", "id": "call_old", "name": "run_dtql", "input": map[string]any{"sql": "select 0"}},
+		{"type": "tool_use", "id": "call_old", "name": "run_tugql", "input": map[string]any{"sql": "select 0"}},
 	})
 	currentPS, _ := json.Marshal([]map[string]any{
 		{"type": "thinking", "thinking": "current reasoning", "signature": "sig-new"},
-		{"type": "tool_use", "id": "call_new", "name": "run_dtql", "input": map[string]any{"sql": "select 1"}},
+		{"type": "tool_use", "id": "call_new", "name": "run_tugql", "input": map[string]any{"sql": "select 1"}},
 	})
 	req := ai.ChatRequest{
 		Context: []ai.ContextBlock{{Kind: ai.ContextDynamic, Text: "it is Tuesday"}},
 		Messages: []ai.Message{
 			// Earlier loop, already resolved.
 			{Role: ai.RoleUser, Text: "first question"},
-			{Role: ai.RoleAssistant, Text: "let me check", ToolCalls: []ai.ToolCall{{ID: "call_old", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 0"}`)}}, ProviderState: earlierPS},
+			{Role: ai.RoleAssistant, Text: "let me check", ToolCalls: []ai.ToolCall{{ID: "call_old", Name: "run_tugql", Arguments: json.RawMessage(`{"sql":"select 0"}`)}}, ProviderState: earlierPS},
 			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_old", Content: "0 rows"}}},
 			{Role: ai.RoleAssistant, Text: "no rows found"},
 			// Current loop: the last genuine user text message, then an
 			// in-progress tool call carrying a ProviderState.
 			{Role: ai.RoleUser, Text: "second question"},
-			{Role: ai.RoleAssistant, Text: "checking again", ToolCalls: []ai.ToolCall{{ID: "call_new", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 1"}`)}}, ProviderState: currentPS},
+			{Role: ai.RoleAssistant, Text: "checking again", ToolCalls: []ai.ToolCall{{ID: "call_new", Name: "run_tugql", Arguments: json.RawMessage(`{"sql":"select 1"}`)}}, ProviderState: currentPS},
 		},
 	}
 	msgs := buildMessages(req)
@@ -1321,7 +1321,7 @@ func TestBuildMessages_DynamicContextStaysOnUserMessageAcrossToolTurns(t *testin
 		Context: []ai.ContextBlock{{Kind: ai.ContextDynamic, Text: "it is Tuesday"}},
 		Messages: []ai.Message{
 			{Role: ai.RoleUser, Text: "how many rows?"},
-			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "run_dtql", Arguments: json.RawMessage(`{}`)}}},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "run_tugql", Arguments: json.RawMessage(`{}`)}}},
 			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_1", Content: "3 rows"}}},
 		},
 	}
