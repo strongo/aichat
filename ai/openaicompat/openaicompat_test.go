@@ -604,7 +604,7 @@ func TestStream_ToolCallsAssembledFromMultiChunkParallelDeltas(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		// Two parallel calls (index 0 and 1); id/name arrive on the first
 		// chunk for each index, arguments arrive concatenated across chunks.
-		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"run_dtql","arguments":""}}]}}]}`)
+		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"run_tugql","arguments":""}}]}}]}`)
 		sseWrite(w, `{"model":"gpt-5","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"find_bookmarks","arguments":""}}]}}]}`)
 		sseWrite(w, mustChunk(t, 0, `{"sql":`))
 		sseWrite(w, mustChunk(t, 0, `"select 1"}`))
@@ -618,7 +618,7 @@ func TestStream_ToolCallsAssembledFromMultiChunkParallelDeltas(t *testing.T) {
 	req := ai.ChatRequest{
 		Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}},
 		Tools: []ai.Tool{
-			{Name: "run_dtql", Description: "run a query", Schema: json.RawMessage(`{"type":"object"}`)},
+			{Name: "run_tugql", Description: "run a query", Schema: json.RawMessage(`{"type":"object"}`)},
 			{Name: "find_bookmarks", Schema: json.RawMessage(`{"type":"object"}`)},
 		},
 		ToolChoice: ai.ToolChoiceAuto,
@@ -641,7 +641,7 @@ func TestStream_ToolCallsAssembledFromMultiChunkParallelDeltas(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("got %d tool calls, want 2: %+v", len(calls), calls)
 	}
-	if calls[0].ID != "call_a" || calls[0].Name != "run_dtql" || string(calls[0].Arguments) != `{"sql":"select 1"}` {
+	if calls[0].ID != "call_a" || calls[0].Name != "run_tugql" || string(calls[0].Arguments) != `{"sql":"select 1"}` {
 		t.Errorf("call[0] = %+v", calls[0])
 	}
 	if calls[1].ID != "call_b" || calls[1].Name != "find_bookmarks" || string(calls[1].Arguments) != `{"q":"x"}` {
@@ -653,7 +653,7 @@ func TestStream_ToolCallsAssembledFromMultiChunkParallelDeltas(t *testing.T) {
 	if gotBody.ToolChoice != "auto" {
 		t.Errorf("tool_choice = %v, want auto", gotBody.ToolChoice)
 	}
-	if len(gotBody.Tools) != 2 || gotBody.Tools[0].Function.Name != "run_dtql" {
+	if len(gotBody.Tools) != 2 || gotBody.Tools[0].Function.Name != "run_tugql" {
 		t.Errorf("tools = %+v", gotBody.Tools)
 	}
 }
@@ -677,7 +677,7 @@ func TestStream_ToolMessagesRoundTripInRequestBody(t *testing.T) {
 		Reasoning: ai.ReasoningHigh,
 		Messages: []ai.Message{
 			{Role: ai.RoleUser, Text: "hi"},
-			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_a", Name: "run_dtql", Arguments: json.RawMessage(`{"sql":"select 1"}`)}}},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_a", Name: "run_tugql", Arguments: json.RawMessage(`{"sql":"select 1"}`)}}},
 			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_a", Content: "1 row"}}},
 		},
 	}
@@ -690,7 +690,7 @@ func TestStream_ToolMessagesRoundTripInRequestBody(t *testing.T) {
 		t.Fatalf("got %d messages, want 3: %+v", len(gotBody.Messages), gotBody.Messages)
 	}
 	asst := gotBody.Messages[1]
-	if asst.Role != "assistant" || len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "call_a" || asst.ToolCalls[0].Function.Name != "run_dtql" {
+	if asst.Role != "assistant" || len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "call_a" || asst.ToolCalls[0].Function.Name != "run_tugql" {
 		t.Errorf("assistant message = %+v", asst)
 	}
 	toolMsg := gotBody.Messages[2]
@@ -711,7 +711,7 @@ func TestBuildMessages_DynamicContextStaysOnUserMessageAcrossToolTurns(t *testin
 		Context: []ai.ContextBlock{{Kind: ai.ContextDynamic, Text: "it is Tuesday"}},
 		Messages: []ai.Message{
 			{Role: ai.RoleUser, Text: "how many rows?"},
-			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "run_dtql", Arguments: json.RawMessage(`{}`)}}},
+			{Role: ai.RoleAssistant, ToolCalls: []ai.ToolCall{{ID: "call_1", Name: "run_tugql", Arguments: json.RawMessage(`{}`)}}},
 			{Role: ai.RoleTool, ToolResults: []ai.ToolResult{{CallID: "call_1", Content: "3 rows"}}},
 		},
 	}

@@ -48,7 +48,7 @@ func TestLoop_AnthropicThinkingBlockReplayedBeforeToolUse(t *testing.T) {
 			sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"data first."}}`)
 			sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc123"}}`)
 			sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
-			sseWrite(w, "content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"run_dtql"}}`)
+			sseWrite(w, "content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"run_tugql"}}`)
 			sseWrite(w, "content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"sql\":\"select 1\"}"}}`)
 			sseWrite(w, "content_block_stop", `{"type":"content_block_stop","index":1}`)
 			sseWrite(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}`)
@@ -67,7 +67,7 @@ func TestLoop_AnthropicThinkingBlockReplayedBeforeToolUse(t *testing.T) {
 	loop := &Loop{
 		Provider: provider,
 		Handlers: map[string]Handler{
-			"run_dtql": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
+			"run_tugql": func(ctx context.Context, call ai.ToolCall) (ai.ToolResult, error) {
 				return ai.ToolResult{CallID: call.ID, Content: "1 row"}, nil
 			},
 		},
@@ -76,7 +76,7 @@ func TestLoop_AnthropicThinkingBlockReplayedBeforeToolUse(t *testing.T) {
 	_, err := drain(t, loop.Run(context.Background(), ai.ChatRequest{
 		Reasoning: ai.ReasoningMedium,
 		Messages:  []ai.Message{{Role: ai.RoleUser, Text: "how many?"}},
-		Tools:     []ai.Tool{{Name: "run_dtql", Schema: json.RawMessage(`{"type":"object"}`)}},
+		Tools:     []ai.Tool{{Name: "run_tugql", Schema: json.RawMessage(`{"type":"object"}`)}},
 	}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
