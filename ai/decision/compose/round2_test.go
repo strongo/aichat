@@ -92,7 +92,9 @@ func superseded(t *testing.T, b *Breaker) {
 	go func() { _, _, err := b.Decide(ctx, request()); done <- err }()
 	waitFor(t, func() bool { return f.calls.Load() > before }, "call to start")
 	cancel(ErrSuperseded)
-	_ = <-done
+	if err := <-done; err != nil && !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestBreaker_SlowRunIsResetByAnInTimeCallAndOpensAtTheThreshold(t *testing.T) {
