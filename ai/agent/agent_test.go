@@ -708,7 +708,10 @@ func TestLoop_ConsumerStopsAtFirstToolResultEvent(t *testing.T) {
 		},
 	}
 	var sawToolResult bool
-	for ev := range loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}) {
+	for ev, err := range loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		if ev.Type == ai.EventToolResult {
 			sawToolResult = true
 			break
@@ -746,7 +749,10 @@ func TestLoop_YieldFalseDuringUnansweredSynthesisStopsRun(t *testing.T) {
 		},
 	}
 	var toolResults int
-	for ev := range loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}) {
+	for ev, err := range loop.Run(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "go"}}}) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		if ev.Type == ai.EventToolResult {
 			toolResults++
 			if toolResults == 2 {

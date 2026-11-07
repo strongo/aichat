@@ -170,7 +170,10 @@ func TestCollect_EarlyBreak(t *testing.T) {
 	// over the same generator (the pattern Collect relies on for the
 	// contract) stops promptly, since interactive consumers rely on this.
 	n := 0
-	for range s {
+	for _, err := range s {
+		if err != nil {
+			t.Fatal(err)
+		}
 		n++
 		if n == 2 {
 			break

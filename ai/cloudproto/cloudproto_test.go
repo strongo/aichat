@@ -167,7 +167,10 @@ func TestReadEvents_EarlyConsumerBreak(t *testing.T) {
 		"event: text.delta\ndata: {\"type\":\"text.delta\",\"text\":\"b\"}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
 	n := 0
-	for range ReadEvents(strings.NewReader(raw)) {
+	for _, err := range ReadEvents(strings.NewReader(raw)) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		n++
 		if n == 2 {
 			break
