@@ -907,7 +907,10 @@ func TestStream_ConsumerStopsAtStarted(t *testing.T) {
 	defer srv.Close()
 	p := New(Config{BaseURL: srv.URL, Model: "m"})
 	n := 0
-	for range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+	for _, err := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		n++
 		break
 	}
@@ -926,7 +929,10 @@ func TestStream_ConsumerStopsAtTextDelta(t *testing.T) {
 	defer srv.Close()
 	p := New(Config{BaseURL: srv.URL, Model: "m"})
 	n := 0
-	for ev := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		n++
 		if ev.Type == ai.EventTextDelta {
 			break
@@ -945,7 +951,10 @@ func TestStream_ConsumerStopsAtUsage(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := New(Config{BaseURL: srv.URL, Model: "m"})
-	for ev := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		if ev.Type == ai.EventUsage {
 			return
 		}
@@ -962,7 +971,10 @@ func TestStream_ConsumerStopsAtStructured(t *testing.T) {
 	defer srv.Close()
 	p := New(Config{BaseURL: srv.URL, Model: "m"})
 	req := ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}, ResponseSchema: json.RawMessage(`{}`)}
-	for ev := range p.Stream(context.Background(), req) {
+	for ev, err := range p.Stream(context.Background(), req) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		if ev.Type == ai.EventStructured {
 			return
 		}
@@ -979,7 +991,10 @@ func TestStream_ConsumerStopsAtToolCall(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := New(Config{BaseURL: srv.URL, Model: "m"})
-	for ev := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+	for ev, err := range p.Stream(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: ai.RoleUser, Text: "hi"}}}) {
+		if err != nil {
+			t.Fatal(err)
+		}
 		if ev.Type == ai.EventToolCall {
 			return
 		}

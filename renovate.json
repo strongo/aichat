@@ -1,6 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "local>strongo/renovate-config"
+    "github>strongo/renovate-config",
+    "github>sneat-co/cicd"
   ]
 }
