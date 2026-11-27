@@ -1160,15 +1160,19 @@ func TestStream_EarlyBreakAfterStartedEvent(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := New(Config{BaseURL: srv.URL, Model: "m"})
-	n := 0
-	for range p.Stream(context.Background(), ai.ChatRequest{}) {
-		n++
-		if n == 1 {
-			break // stop right after EventStarted
+	started := false
+	for event, err := range p.Stream(context.Background(), ai.ChatRequest{}) {
+		if err != nil {
+			t.Fatalf("first stream event returned an error: %v", err)
 		}
+		if event.Type != ai.EventStarted {
+			t.Fatalf("first stream event type = %v, want %v", event.Type, ai.EventStarted)
+		}
+		started = true
+		break
 	}
-	if n != 1 {
-		t.Fatalf("n = %d, want 1 (consumer break must stop iteration promptly)", n)
+	if !started {
+		t.Fatal("expected a stream event")
 	}
 }
 
